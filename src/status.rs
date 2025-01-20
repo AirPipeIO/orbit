@@ -16,14 +16,14 @@ use uuid::Uuid;
 
 // status response
 #[derive(Debug, Serialize)]
-struct ServiceStatus {
+pub struct ServiceStatus {
     service_name: String,
     service_url: String,
     containers: Vec<ContainerInfo>,
 }
 
 #[derive(Debug, Serialize)]
-struct ContainerInfo {
+pub struct ContainerInfo {
     uuid: Uuid,
     exposed_port: u16,
     status: String,
@@ -70,7 +70,7 @@ pub async fn server_start() {
 }
 
 // Handle the `/status` endpoint
-async fn get_status() -> Json<Vec<ServiceStatus>> {
+pub async fn get_status() -> Json<Vec<ServiceStatus>> {
     let instance_store = INSTANCE_STORE_CACHE
         .get()
         .clone()

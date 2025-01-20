@@ -1,18 +1,20 @@
 pub mod config;
 pub mod container;
 pub mod logger;
+pub mod metrics;
 pub mod proxy;
 pub mod scale;
 pub mod status;
 
 use anyhow::Result;
+use axum::{routing::get, Router};
 use clap::Parser;
 use config::CONFIG_STORE;
 use container::{create_runtime, CONTAINER_STATS, INSTANCE_STORE, RUNTIME, SCALING_TASKS};
 use dashmap::DashMap;
 use logger::setup_logger;
 use status::CONTAINER_STATS_CACHE;
-use std::{path::PathBuf, process, sync::Arc};
+use std::{path::PathBuf, process, sync::Arc, time::Duration};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -77,8 +79,26 @@ async fn main() -> Result<()> {
         }
     });
 
-    status::server_start().await;
+    // Initialize metrics
+    let _ = metrics::setup_metrics();
 
+    // Start metrics collection task
+    tokio::spawn(async {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            interval.tick().await;
+            metrics::collect_service_metrics();
+        }
+    });
+
+    let app = Router::new()
+        .route("/status", get(status::get_status))
+        .route("/metrics", get(metrics::metrics_handler));
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:4112").await?;
+    slog::info!(log, "Status server running on http://0.0.0.0:4112");
+
+    axum::serve(listener, app).await?;
     // Keep the application running
     tokio::signal::ctrl_c().await?;
     slog::info!(log, "Shutting down");

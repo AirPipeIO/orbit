@@ -1,6 +1,7 @@
 // proxy.rs
 use crate::config::ServiceConfig;
 use crate::container::INSTANCE_STORE;
+use crate::metrics::{SERVICE_REQUEST_DURATION, SERVICE_REQUEST_TOTAL, TOTAL_REQUESTS};
 use crate::status::update_instance_store_cache;
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -12,11 +13,16 @@ use pingora::proxy::{http_proxy_service, ProxyHttp, Session};
 use pingora::server::Server;
 use pingora::services::background::background_service;
 use pingora::upstreams::peer::HttpPeer;
+use pingora_http::ResponseHeader;
 use pingora_load_balancing::health_check;
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use std::time::Instant;
 use tokio::task;
+
 pub struct Discovery(Arc<DashSet<Backend>>);
 
 #[async_trait]
@@ -32,29 +38,62 @@ impl ServiceDiscovery for Discovery {
 
 pub struct ProxyApp {
     pub loadbalancer: Arc<LoadBalancer<RoundRobin>>,
+    pub service_name: String,
 }
 
 #[async_trait]
 impl ProxyHttp for ProxyApp {
-    type CTX = ();
+    type CTX = Instant; // Use Instant for timing requests
 
-    fn new_ctx(&self) -> Self::CTX {}
+    fn new_ctx(&self) -> Self::CTX {
+        // Start timing the request
+        Instant::now()
+    }
 
     async fn upstream_peer(
         &self,
         _session: &mut Session,
-        _ctx: &mut (),
+        _ctx: &mut Instant,
     ) -> pingora::Result<Box<HttpPeer>> {
-        let upstream = self
-            .loadbalancer
-            .select(b"", 256) // Hashing is optional
-            .unwrap();
+        let upstream = self.loadbalancer.select(b"", 256).unwrap();
 
         Ok(Box::new(HttpPeer::new(
             upstream,
             false,
             "host.name".to_string(),
         )))
+    }
+
+    async fn response_filter(
+        &self,
+        session: &mut Session,
+        response: &mut ResponseHeader,
+        ctx: &mut Instant,
+    ) -> pingora::Result<()> {
+        // Get response status
+        let status = response.status.as_u16().to_string();
+
+        // Calculate request duration
+        let duration = ctx.elapsed().as_secs_f64();
+
+        // Update metrics
+        if let Some(total_requests) = TOTAL_REQUESTS.get() {
+            total_requests.inc();
+        }
+
+        if let Some(request_duration) = SERVICE_REQUEST_DURATION.get() {
+            request_duration
+                .with_label_values(&[&self.service_name, &status])
+                .observe(duration);
+        }
+
+        if let Some(request_total) = SERVICE_REQUEST_TOTAL.get() {
+            request_total
+                .with_label_values(&[&self.service_name, &status])
+                .inc();
+        }
+
+        Ok(())
     }
 }
 
@@ -142,6 +181,7 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
     // Configure proxy application
     let app = ProxyApp {
         loadbalancer: bg_service.task(),
+        service_name: service_name.clone(),
     };
 
     let mut router_service = http_proxy_service(&Server::new(None).unwrap().configuration, app);

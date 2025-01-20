@@ -12,3 +12,4 @@ Orbit is a simple, light weight solution to scaling containers, with inbuilt ser
 - Automatic service discovery
 - Simple scaling
 - Simple config definition
+- Prometheus metrics
