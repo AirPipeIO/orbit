@@ -11,7 +11,8 @@ use config::CONFIG_STORE;
 use container::{create_runtime, CONTAINER_STATS, INSTANCE_STORE, RUNTIME, SCALING_TASKS};
 use dashmap::DashMap;
 use logger::setup_logger;
-use std::{path::PathBuf, process};
+use status::CONTAINER_STATS_CACHE;
+use std::{path::PathBuf, process, sync::Arc};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -40,6 +41,7 @@ async fn main() -> Result<()> {
     INSTANCE_STORE.get_or_init(DashMap::new);
     SCALING_TASKS.get_or_init(DashMap::new);
     CONTAINER_STATS.get_or_init(|| DashMap::new());
+    CONTAINER_STATS_CACHE.get_or_init(|| Arc::new(DashMap::new()));
 
     // Parse command line arguments
     let args = Args::parse();
