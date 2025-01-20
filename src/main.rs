@@ -13,6 +13,7 @@ use config::CONFIG_STORE;
 use container::{create_runtime, CONTAINER_STATS, INSTANCE_STORE, RUNTIME, SCALING_TASKS};
 use dashmap::DashMap;
 use logger::setup_logger;
+use metrics::MetricsUpdate;
 use status::CONTAINER_STATS_CACHE;
 use std::{path::PathBuf, process, sync::Arc, time::Duration};
 
@@ -79,15 +80,28 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Initialize metrics
-    let _ = metrics::setup_metrics();
+    // Initialize metrics system
+    let _ = metrics::initialize_metrics();
 
     // Start metrics collection task
     tokio::spawn(async {
         let mut interval = tokio::time::interval(Duration::from_secs(15));
         loop {
             interval.tick().await;
-            metrics::collect_service_metrics();
+            let instance_store = INSTANCE_STORE
+                .get()
+                .expect("Instance store not initialized");
+
+            // Collect total counts without holding locks for long
+            let total_services = instance_store.len();
+            let total_instances: usize =
+                instance_store.iter().map(|entry| entry.value().len()).sum();
+
+            // Send updates asynchronously
+            let _ =
+                metrics::send_metrics_update(MetricsUpdate::TotalServices(total_services)).await;
+            let _ =
+                metrics::send_metrics_update(MetricsUpdate::TotalInstances(total_instances)).await;
         }
     });
 

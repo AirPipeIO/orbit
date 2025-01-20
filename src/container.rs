@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::config::{parse_cpu_limit, parse_memory_limit, ServiceConfig, CONFIG_STORE};
+use crate::metrics::{self, MetricsUpdate, ServiceStats};
 use crate::proxy::SERVER_BACKENDS;
 use crate::status::update_instance_store_cache;
 
@@ -253,7 +254,7 @@ impl ContainerRuntime for DockerRuntime {
             .and_then(|value| parse_cpu_limit(value).ok()); // Parse and handle Result -> Option
 
         // Update stats history and get CPU percentage
-        let cpu = update_container_stats(name, stats.clone(), nano_cpus);
+        let cpu = update_container_stats(name, stats.clone(), nano_cpus).await;
 
         let memory_usage = stats.memory_stats.usage.unwrap_or(0);
         let memory_limit = stats.memory_stats.limit.unwrap_or(0);
@@ -481,51 +482,46 @@ pub async fn clean_up(service_name: &str) {
     update_instance_store_cache();
 }
 
-// In container.rs, modify the update_container_stats function:
-
-pub fn update_container_stats(
+pub async fn update_container_stats(
     container_name: &str,
     stats: Stats,
     nano_cpus: Option<u64>,
 ) -> ContainerStats {
-    let stats_store = CONTAINER_STATS
-        .get()
-        .expect("Stats tracker not initialized");
-    let now = SystemTime::now();
+    let stats_store = match CONTAINER_STATS.get() {
+        Some(store) => store,
+        None => {
+            return ContainerStats {
+                id: stats.id,
+                cpu_percentage: 0.0,
+                cpu_percentage_relative: 0.0,
+                memory_usage: stats.memory_stats.usage.unwrap_or(0),
+                memory_limit: stats.memory_stats.limit.unwrap_or(0),
+            }
+        }
+    };
 
-    // Get current values
+    let now = SystemTime::now();
     let cpu_total = stats.cpu_stats.cpu_usage.total_usage;
     let system_cpu = stats.cpu_stats.system_cpu_usage.unwrap_or(0);
     let online_cpus = stats.cpu_stats.online_cpus.unwrap_or(1) as f64;
 
-    // Calculate CPU percentages
-    let (cpu_percentage, cpu_percentage_relative) =
-        if let Some(previous) = stats_store.get(container_name) {
-            let cpu_delta = cpu_total as f64 - previous.cpu_total_usage as f64;
-            let system_delta = system_cpu as f64 - previous.system_cpu_usage as f64;
+    // Get previous stats with minimal lock time
+    let previous = stats_store.get(container_name).map(|entry| StatsEntry {
+        timestamp: entry.timestamp,
+        cpu_total_usage: entry.cpu_total_usage,
+        system_cpu_usage: entry.system_cpu_usage,
+    });
 
-            if system_delta > 0.0 && cpu_delta > 0.0 {
-                let absolute_cpu = ((cpu_delta / system_delta) * online_cpus * 100.0)
-                    .max(0.0)
-                    .min(100.0 * online_cpus);
+    // Calculate CPU percentages without holding the lock
+    let (cpu_percentage, cpu_percentage_relative) = calculate_cpu_percentages(
+        previous.as_ref(),
+        cpu_total,
+        system_cpu,
+        online_cpus,
+        nano_cpus,
+    );
 
-                // Calculate relative CPU usage based on allocated CPU limit
-                let relative_cpu = if let Some(cpu_limit) = nano_cpus {
-                    let allocated_cpu = (cpu_limit as f64 / 1_000_000_000.0) * 100.0;
-                    (absolute_cpu / allocated_cpu * 100.0).min(100.0)
-                } else {
-                    absolute_cpu
-                };
-
-                (absolute_cpu, relative_cpu)
-            } else {
-                (0.0, 0.0)
-            }
-        } else {
-            (0.0, 0.0)
-        };
-
-    // Update the stats store with raw metrics for next calculation
+    // Update stats store with minimal lock time
     stats_store.insert(
         container_name.to_string(),
         StatsEntry {
@@ -535,18 +531,40 @@ pub fn update_container_stats(
         },
     );
 
-    // Create the container stats
     let container_stats = ContainerStats {
-        id: stats.id,
+        id: stats.id.clone(),
         cpu_percentage,
         cpu_percentage_relative,
         memory_usage: stats.memory_stats.usage.unwrap_or(0),
         memory_limit: stats.memory_stats.limit.unwrap_or(0),
     };
 
-    // Immediately update the stats cache for the status endpoint
+    // Update stats cache with minimal lock time
     if let Some(stats_cache) = crate::status::CONTAINER_STATS_CACHE.get() {
         stats_cache.insert(container_name.to_string(), container_stats.clone());
+    }
+
+    // Send metrics update asynchronously
+    if let Some(service_name) = container_name.split("__").next() {
+        let stats = ServiceStats {
+            instance_count: 1, // This will be aggregated later
+            cpu_usage: [(container_name.to_string(), cpu_percentage)]
+                .into_iter()
+                .collect(),
+            memory_usage: [(
+                container_name.to_string(),
+                stats.memory_stats.usage.unwrap_or(0),
+            )]
+            .into_iter()
+            .collect(),
+            active_connections: 0,
+        };
+
+        let _ = metrics::send_metrics_update(MetricsUpdate::ServiceStats(
+            service_name.to_string(),
+            stats,
+        ))
+        .await;
     }
 
     container_stats
@@ -555,5 +573,38 @@ pub fn update_container_stats(
 pub fn remove_container_stats(container_name: &str) {
     if let Some(stats_store) = CONTAINER_STATS.get() {
         stats_store.remove(container_name);
+    }
+}
+
+// Helper function to calculate CPU percentages
+fn calculate_cpu_percentages(
+    previous: Option<&StatsEntry>,
+    cpu_total: u64,
+    system_cpu: u64,
+    online_cpus: f64,
+    nano_cpus: Option<u64>,
+) -> (f64, f64) {
+    if let Some(previous) = previous {
+        let cpu_delta = cpu_total as f64 - previous.cpu_total_usage as f64;
+        let system_delta = system_cpu as f64 - previous.system_cpu_usage as f64;
+
+        if system_delta > 0.0 && cpu_delta > 0.0 {
+            let absolute_cpu = ((cpu_delta / system_delta) * online_cpus * 100.0)
+                .max(0.0)
+                .min(100.0 * online_cpus);
+
+            let relative_cpu = if let Some(cpu_limit) = nano_cpus {
+                let allocated_cpu = (cpu_limit as f64 / 1_000_000_000.0) * 100.0;
+                (absolute_cpu / allocated_cpu * 100.0).min(100.0)
+            } else {
+                absolute_cpu
+            };
+
+            (absolute_cpu, relative_cpu)
+        } else {
+            (0.0, 0.0)
+        }
+    } else {
+        (0.0, 0.0)
     }
 }

@@ -1,16 +1,40 @@
 // metrics.rs
 use axum::{
     http::{header, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use prometheus::{
-    Counter, CounterVec, GaugeVec, HistogramOpts, HistogramVec, IntGauge, IntGaugeVec, Opts,
-    Registry,
+    Counter, CounterVec, Encoder, GaugeVec, HistogramOpts, HistogramVec, IntGauge, IntGaugeVec,
+    Opts, Registry,
 };
 use rustc_hash::FxHashMap;
-use std::{error::Error, sync::OnceLock};
+use std::{error::Error, sync::OnceLock, time::Duration};
 
 use crate::{container::INSTANCE_STORE, status::CONTAINER_STATS_CACHE};
+
+use tokio::sync::mpsc;
+
+// Global channel for metrics updates
+pub static METRICS_SENDER: OnceLock<mpsc::Sender<MetricsUpdate>> = OnceLock::new();
+
+// Enum to represent different types of metrics updates
+#[derive(Debug)]
+pub enum MetricsUpdate {
+    ServiceStats(String, ServiceStats),
+    TotalServices(usize),
+    TotalInstances(usize),
+    ConfigReload,
+    Request(String, u16),              // service_name, status_code
+    RequestDuration(String, u16, f64), // service_name, status_code, duration
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ServiceStats {
+    pub instance_count: usize,
+    pub cpu_usage: FxHashMap<String, f64>,
+    pub memory_usage: FxHashMap<String, u64>,
+    pub active_connections: i64,
+}
 
 // Global registry
 pub static REGISTRY: OnceLock<Registry> = OnceLock::new();
@@ -29,7 +53,7 @@ pub static SERVICE_REQUEST_DURATION: OnceLock<HistogramVec> = OnceLock::new();
 pub static SERVICE_ACTIVE_CONNECTIONS: OnceLock<IntGaugeVec> = OnceLock::new();
 pub static SERVICE_REQUEST_TOTAL: OnceLock<CounterVec> = OnceLock::new();
 
-pub fn setup_metrics() -> Result<(), Box<dyn Error>> {
+pub fn initialize_metrics() -> Result<(), Box<dyn Error>> {
     let registry = Registry::new();
 
     // Initialize global metrics
@@ -121,16 +145,18 @@ pub fn setup_metrics() -> Result<(), Box<dyn Error>> {
     // Set the global registry
     REGISTRY.set(registry).unwrap();
 
-    Ok(())
-}
+    // Create channel for metrics updates
+    let (tx, mut rx) = mpsc::channel(1000); // Buffer size of 1000
+    METRICS_SENDER.set(tx).unwrap();
 
-// Helper struct for updating service metrics
-#[derive(Default)]
-pub struct ServiceStats {
-    pub instance_count: usize,
-    pub cpu_usage: FxHashMap<String, f64>,
-    pub memory_usage: FxHashMap<String, u64>,
-    pub active_connections: i64,
+    // Spawn metrics processing task
+    tokio::spawn(async move {
+        while let Some(update) = rx.recv().await {
+            process_metrics_update(update);
+        }
+    });
+
+    Ok(())
 }
 
 // Update metrics for a service
@@ -158,79 +184,120 @@ pub fn update_service_metrics(service_name: &str, stats: &ServiceStats) {
     }
 }
 
-// Handler for the metrics endpoint
-pub async fn metrics_handler() -> impl IntoResponse {
-    use prometheus::Encoder;
-    let encoder = prometheus::TextEncoder::new();
+// Handler for metrics endpoint with timeout
+pub async fn metrics_handler() -> axum::response::Response {
+    use tokio::time::timeout;
 
-    let mut buffer = Vec::new();
-    if let Some(registry) = REGISTRY.get() {
-        if let Err(e) = encoder.encode(&registry.gather(), &mut buffer) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to encode metrics: {}", e),
-            )
-                .into_response();
-        }
-    }
-
-    match String::from_utf8(buffer) {
-        Ok(metrics_text) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-            metrics_text,
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to convert metrics to UTF-8: {}", e),
+    match timeout(Duration::from_secs(5), collect_metrics()).await {
+        Ok(result) => result,
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "Metrics collection timed out".to_string(),
         )
             .into_response(),
     }
 }
 
-// Update function to collect metrics from container stats
-pub fn collect_service_metrics() {
-    let instance_store = INSTANCE_STORE
-        .get()
-        .expect("Instance store not initialized");
-    let stats_cache = CONTAINER_STATS_CACHE
-        .get()
-        .expect("Stats cache not initialized");
+// Collect metrics without holding locks
+async fn collect_metrics() -> axum::response::Response {
+    if let Some(registry) = REGISTRY.get() {
+        let encoder = prometheus::TextEncoder::new();
+        let mut buffer = Vec::new();
 
-    if let Some(total_instances) = TOTAL_INSTANCES.get() {
-        let count: i64 = instance_store
-            .iter()
-            .map(|entry| entry.value().len() as i64)
-            .sum();
-        total_instances.set(count);
+        match encoder.encode(&registry.gather(), &mut buffer) {
+            Ok(_) => match String::from_utf8(buffer) {
+                Ok(metrics_text) => (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+                    metrics_text,
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(header::CONTENT_TYPE, "text/plain")],
+                    format!("Failed to convert metrics to UTF-8: {}", e),
+                )
+                    .into_response(),
+            },
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "text/plain")],
+                format!("Failed to encode metrics: {}", e),
+            )
+                .into_response(),
+        }
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "Metrics registry not initialized".to_string(),
+        )
+            .into_response()
     }
+}
 
-    if let Some(total_services) = TOTAL_SERVICES.get() {
-        total_services.set(instance_store.len() as i64);
-    }
+// Process metrics updates without holding locks
+fn process_metrics_update(update: MetricsUpdate) {
+    match update {
+        MetricsUpdate::ServiceStats(service_name, stats) => {
+            if let Some(instances) = SERVICE_INSTANCES.get() {
+                instances
+                    .with_label_values(&[&service_name])
+                    .set(stats.instance_count as i64);
+            }
 
-    for entry in instance_store.iter() {
-        let service_name = entry.key();
-        let instances = entry.value();
+            if let Some(cpu_usage) = SERVICE_CPU_USAGE.get() {
+                for (instance_id, cpu) in &stats.cpu_usage {
+                    cpu_usage
+                        .with_label_values(&[&service_name, instance_id])
+                        .set(*cpu);
+                }
+            }
 
-        let mut stats = ServiceStats {
-            instance_count: instances.len(),
-            ..Default::default()
-        };
-
-        for (uuid, metadata) in instances {
-            let container_name = format!("{}_{}", service_name, uuid);
-            if let Some(container_stats) = stats_cache.get(&container_name) {
-                stats
-                    .cpu_usage
-                    .insert(uuid.to_string(), container_stats.cpu_percentage);
-                stats
-                    .memory_usage
-                    .insert(uuid.to_string(), container_stats.memory_usage);
+            if let Some(memory_usage) = SERVICE_MEMORY_USAGE.get() {
+                for (instance_id, mem) in &stats.memory_usage {
+                    memory_usage
+                        .with_label_values(&[&service_name, instance_id])
+                        .set(*mem as f64);
+                }
             }
         }
+        MetricsUpdate::TotalServices(count) => {
+            if let Some(total_services) = TOTAL_SERVICES.get() {
+                total_services.set(count as i64);
+            }
+        }
+        MetricsUpdate::TotalInstances(count) => {
+            if let Some(total_instances) = TOTAL_INSTANCES.get() {
+                total_instances.set(count as i64);
+            }
+        }
+        MetricsUpdate::ConfigReload => {
+            if let Some(config_reloads) = CONFIG_RELOADS.get() {
+                config_reloads.inc();
+            }
+        }
+        MetricsUpdate::Request(service_name, status_code) => {
+            if let Some(requests) = SERVICE_REQUEST_TOTAL.get() {
+                requests
+                    .with_label_values(&[&service_name, &status_code.to_string()])
+                    .inc();
+            }
+        }
+        MetricsUpdate::RequestDuration(service_name, status_code, duration) => {
+            if let Some(durations) = SERVICE_REQUEST_DURATION.get() {
+                durations
+                    .with_label_values(&[&service_name, &status_code.to_string()])
+                    .observe(duration);
+            }
+        }
+    }
+}
 
-        update_service_metrics(service_name, &stats);
+// Helper function to send metrics updates
+pub async fn send_metrics_update(update: MetricsUpdate) {
+    if let Some(sender) = METRICS_SENDER.get() {
+        let _ = sender.send(update).await;
     }
 }
