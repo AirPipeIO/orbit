@@ -1,0 +1,11 @@
+name: helloworld
+image: strm/helloworld-http:latest
+cpu_limit: 0.01
+memory_limit: 100M
+target_port: 80                 # Port the container's HTTP service listens on internally.
+exposed_port: 4333              # The port used by Pingora for external load-balanced traffic.
+instance_count:
+  min: 1                    # Number of instances to spawn at start.
+  max: 10                       # Maximum number of instances allowed.
+adopt_orphans: false
+interval_seconds: 10

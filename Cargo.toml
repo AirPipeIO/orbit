@@ -1,0 +1,39 @@
+[package]
+name = "orbit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1.85"
+clap = { version = "4.5.26", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.136"
+serde_yaml = "0.9"
+dashmap = "6.1.0"
+uuid = { version = "1.12.0", features = ["v4", "serde"] }
+validator = { version = "0.20", features = ["derive"] }
+validator_derive = "0.20.0"
+thiserror = "2.0.11"
+anyhow = "1.0.95"
+regex = "1.11.1"
+
+# fn
+bollard = { version = "0.18.1" }
+reqwest = { version = "0.12.12", features = ["json", "rustls-tls"], default-features = false }
+pingora = { version = "0.4.0", features = ["lb"] }
+pingora-http = "0.4.0"
+pingora-load-balancing = "0.4.0"
+pingora-proxy = "0.4.0"
+pingora-core = "0.4.0"
+notify = "8.0.0"
+notify-debouncer-full = "0.5.0"
+axum = "0.8.1"
+
+# logging
+slog = { version = "2.7.0" }
+slog-json = "2.6.1"
+slog-scope = "4.4.0"
+slog-async = "2.8"
+slog-term = "2.9.0"
