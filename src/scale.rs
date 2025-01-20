@@ -28,16 +28,7 @@ pub async fn auto_scale(service_name: String, initial_config: ServiceConfig) {
     let service_name = Arc::new(service_name);
 
     loop {
-        // Check for config updates without holding locks
-        if let Ok((_name, new_config)) = rx.try_recv() {
-            current_config = new_config;
-            slog::debug!(log, "Updated configuration";
-                "service" => service_name.as_str(),
-                "new_interval" => current_config.interval_seconds.unwrap_or(30)
-            );
-        }
-
-        // Get current instances safely
+        // Process resource thresholds only once per iteration
         let instances = match instance_store.get(&*service_name) {
             Some(entry) => entry.value().clone(),
             None => {
@@ -47,164 +38,90 @@ pub async fn auto_scale(service_name: String, initial_config: ServiceConfig) {
             }
         };
 
-        // Collect stats for all instances in parallel
+        // Collect stats for all instances
         let mut instance_stats = Vec::new();
         let mut missing_containers = Vec::new();
-        let mut stats_tasks = Vec::new();
 
+        // Process containers in a single batch
         for (&uuid, metadata) in &instances {
             let container_name = format!("{}__{}", service_name, uuid);
-            let runtime = runtime.clone();
-            let metadata = metadata.clone();
-            let service_name = service_name.clone();
-
-            let stats_task = tokio::spawn(async move {
-                match runtime.inspect_container(&container_name).await {
-                    Ok(stats) => Ok((uuid, metadata, stats)),
-                    Err(e) => {
-                        if e.to_string().contains("404")
-                            || e.to_string().contains("No such container")
-                        {
-                            Err((uuid, metadata, true))
-                        } else {
-                            // Other errors we might want to retry
-                            slog::warn!(slog_scope::logger(), "Failed to get container stats - will retry next cycle";
-                                "service" => service_name.as_str(),
-                                "container" => &container_name,
-                                "error" => e.to_string()
-                            );
-                            Err((uuid, metadata, false))
-                        }
-                    }
+            match runtime.inspect_container(&container_name).await {
+                Ok(stats) => {
+                    instance_stats.push((uuid, metadata.clone(), stats));
                 }
-            });
-            stats_tasks.push(stats_task);
-        }
-
-        // Process results with timeout
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            futures::future::join_all(stats_tasks),
-        )
-        .await
-        {
-            Ok(results) => {
-                for task_result in results {
-                    match task_result {
-                        Ok(Ok((uuid, metadata, stats))) => {
-                            instance_stats.push((uuid, metadata, stats));
-                        }
-                        Ok(Err((uuid, metadata, is_missing))) if is_missing => {
-                            // Container is confirmed missing - add to cleanup list
-                            missing_containers.push((uuid, metadata));
-                        }
-                        Ok(Err(_)) => {} // Already logged in the task
-                        Err(e) => {
-                            slog::error!(log, "Task failed";
-                                "service" => service_name.as_str(),
-                                "error" => %e
-                            );
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                slog::warn!(log, "Stats collection timed out";
-                    "service" => service_name.as_str()
-                );
-                continue; // Skip this cycle
-            }
-        }
-
-        // Clean up missing containers
-        if !missing_containers.is_empty() {
-            slog::info!(log, "Cleaning up missing containers";
-                "service" => service_name.as_str(),
-                "count" => missing_containers.len()
-            );
-
-            // Remove from instance store
-            if let Some(mut store) = instance_store.get_mut(&*service_name) {
-                for (uuid, _) in &missing_containers {
-                    store.remove(uuid);
-                }
-            }
-
-            // Remove from backends
-            if let Some(backends) = SERVER_BACKENDS.get().unwrap().get(service_name.as_str()) {
-                for (_, metadata) in &missing_containers {
-                    let addr = format!("127.0.0.1:{}", metadata.exposed_port);
-                    if let Ok(backend) = Backend::new(&addr) {
-                        backends.remove(&backend);
+                Err(e) => {
+                    if e.to_string().contains("404") || e.to_string().contains("No such container")
+                    {
+                        missing_containers.push((uuid, metadata.clone()));
                     }
                 }
             }
         }
 
-        slog::debug!(log, "Processing resource thresholds";
-            "service" => service_name.as_str(),
-            "instance_stats_count" => instance_stats.len()
-        );
-
+        // Process thresholds once
         let instances_exceeding = if let Some(thresholds) = &current_config.resource_thresholds {
-            // Collect exceeded thresholds in a single pass
             let mut exceeded_count = 0;
             for (_, _, stats) in &instance_stats {
-                // Only consider CPU metrics if they show significant usage
+                let memory_percentage = if stats.memory_limit > 0 {
+                    (stats.memory_usage as f64 / stats.memory_limit as f64 * 100.0)
+                } else {
+                    0.0
+                };
+
                 let cpu_exceeded = thresholds
                     .cpu_percentage
                     .map(|threshold| {
-                        stats.cpu_percentage >= 5.0 && // Minimum CPU threshold
-                        stats.cpu_percentage > threshold as f64
+                        stats.cpu_percentage >= 5.0 && stats.cpu_percentage > threshold as f64
                     })
                     .unwrap_or(false);
 
                 let cpu_relative_exceeded = thresholds
                     .cpu_percentage_relative
                     .map(|threshold| {
-                        stats.cpu_percentage_relative >= 5.0 && // Minimum relative CPU threshold
-                        stats.cpu_percentage_relative > threshold as f64
+                        stats.cpu_percentage_relative >= 5.0
+                            && stats.cpu_percentage_relative > threshold as f64
                     })
                     .unwrap_or(false);
 
                 let memory_exceeded = thresholds
                     .memory_percentage
                     .map(|threshold| {
-                        let memory_percentage = if stats.memory_limit > 0 {
-                            (stats.memory_usage as f64 / stats.memory_limit as f64 * 100.0)
-                        } else {
-                            0.0
-                        };
                         memory_percentage > threshold as f64 && memory_percentage >= 5.0
                     })
                     .unwrap_or(false);
 
-                let should_exceed = cpu_exceeded || cpu_relative_exceeded || memory_exceeded;
+                slog::info!(log, "Container metrics";
+                "service" => service_name.as_str(),
+                "container_id" => &stats.id,
+                "cpu_percentage" => stats.cpu_percentage,
+                "cpu_percentage_relative" => stats.cpu_percentage_relative,
+                "memory_percentage" => memory_percentage,
+                "memory_usage_mb" => stats.memory_usage as f64 / 1024.0 / 1024.0,
+                "memory_limit_mb" => stats.memory_limit as f64 / 1024.0 / 1024.0,
+                "thresholds_exceeded" => format!("cpu={} cpu_rel={} mem={}",
+                    cpu_exceeded,
+                    cpu_relative_exceeded,
+                    memory_exceeded
+                ));
 
-                if should_exceed {
+                if cpu_exceeded || cpu_relative_exceeded || memory_exceeded {
                     exceeded_count += 1;
-                    slog::debug!(log, "Container exceeding thresholds";
+                    slog::info!(log, "Container metrics";
                         "service" => service_name.as_str(),
+                        "container_id" => &stats.id,
                         "cpu_percentage" => stats.cpu_percentage,
                         "cpu_percentage_relative" => stats.cpu_percentage_relative,
-                        "memory_percentage" => if stats.memory_limit > 0 {
-                            (stats.memory_usage as f64 / stats.memory_limit as f64 * 100.0)
-                        } else {
-                            0.0
-                        }
+                        "memory_percentage" => memory_percentage,
+                        "memory_usage_mb" => stats.memory_usage as f64 / 1024.0 / 1024.0,
+                        "memory_limit_mb" => stats.memory_limit as f64 / 1024.0 / 1024.0,
+                        "thresholds_exceeded" => format!("cpu={} cpu_rel={} mem={}",
+                            cpu_exceeded,
+                            cpu_relative_exceeded,
+                            memory_exceeded
+                        )
                     );
                 }
             }
-
-            // Log resource check once per cycle
-            slog::debug!(log, "Resource threshold check";
-                "service" => service_name.as_str(),
-                "exceeding_count" => exceeded_count.to_string(),
-                "total_instances" => instance_stats.len().to_string(),
-                "cpu_threshold" => thresholds.cpu_percentage,
-                "cpu_relative_threshold" => thresholds.cpu_percentage_relative,
-                "memory_threshold" => thresholds.memory_percentage
-            );
 
             exceeded_count
         } else {
@@ -270,15 +187,100 @@ pub async fn auto_scale(service_name: String, initial_config: ServiceConfig) {
             }
         }
 
-        // Sleep with timeout
+        // Sleep with timeout or process config update
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(current_config.interval_seconds.unwrap_or(30))) => {},
-            _ = rx.recv() => {
-                // Config update received, skip sleep and process immediately
-                continue;
+            Some((name, new_config)) = rx.recv() => {
+                if name == *service_name {
+                    current_config = new_config;
+                    slog::debug!(log, "Updated configuration";
+                        "service" => service_name.as_str(),
+                        "new_interval" => current_config.interval_seconds.unwrap_or(30)
+                    );
+                }
             }
         }
     }
+}
+pub async fn scale_up(
+    service_name: &str,
+    config: ServiceConfig,
+    runtime: Arc<dyn ContainerRuntime>,
+) -> Result<()> {
+    let log = slog_scope::logger();
+    let instance_store = INSTANCE_STORE.get().unwrap();
+    let server_backends = SERVER_BACKENDS.get().unwrap();
+
+    // Get current instances without holding long-term lock
+    let current_instances = match instance_store.get(service_name) {
+        Some(entry) => entry.value().len(),
+        None => 0,
+    };
+
+    if current_instances >= config.instance_count.max as usize {
+        return Ok(());
+    }
+
+    let uuid = uuid::Uuid::new_v4();
+    let container_name = format!("{}__{}", service_name, uuid);
+    let port_range = config.exposed_port..config.exposed_port + 10;
+
+    // Step 1: Start the container
+    let exposed_port = runtime
+        .start_container(
+            &container_name,
+            &config.image,
+            config.target_port,
+            port_range,
+            config.memory_limit.clone(),
+            config.cpu_limit.clone(),
+        )
+        .await?;
+
+    slog::info!(log, "Container started";
+        "service" => service_name,
+        "container" => &container_name,
+        "port" => exposed_port
+    );
+
+    // Step 2: Wait for container to be healthy (implement health check)
+    let healthy = wait_for_container_health(&container_name, runtime.clone()).await;
+
+    if !healthy {
+        slog::error!(log, "Container failed health check, removing";
+            "service" => service_name,
+            "container" => &container_name
+        );
+        let _ = runtime.stop_container(&container_name).await;
+        return Err(anyhow::anyhow!("Container failed health check"));
+    }
+
+    // Step 3: Add to instance store
+    if let Some(mut instances) = instance_store.get_mut(service_name) {
+        instances.insert(
+            uuid,
+            InstanceMetadata {
+                uuid,
+                exposed_port,
+                status: "running".to_string(),
+            },
+        );
+    }
+
+    // Step 4: Add to load balancer after container is healthy
+    if let Some(backends) = server_backends.get(service_name) {
+        let addr = format!("127.0.0.1:{}", exposed_port);
+        if let Ok(backend) = Backend::new(&addr) {
+            backends.insert(backend);
+            slog::info!(log, "Added backend to load balancer";
+                "service" => service_name,
+                "container" => &container_name,
+                "address" => &addr
+            );
+        }
+    }
+
+    Ok(())
 }
 
 pub async fn scale_down(
@@ -309,22 +311,33 @@ pub async fn scale_down(
 
     let container_name = format!("{}__{}", service_name, target_uuid);
     let exposed_port = target_metadata.exposed_port;
+    let addr = format!("127.0.0.1:{}", exposed_port);
 
     // Step 1: Remove from load balancer first
     if let Some(backends) = server_backends.get(service_name) {
-        let addr = format!("127.0.0.1:{}", exposed_port);
-        backends.remove(&Backend::new(&addr).unwrap());
-        slog::trace!(log, "Removed backend from load balancer";
-            "service" => service_name,
-            "container" => container_name.clone(),
-            "address" => addr
-        );
+        if let Ok(backend) = Backend::new(&addr) {
+            backends.remove(&backend);
+            slog::info!(log, "Removed backend from load balancer";
+                "service" => service_name,
+                "container" => &container_name,
+                "address" => &addr
+            );
+        }
     }
 
     // Step 2: Wait for in-flight requests to complete
+    slog::info!(log, "Waiting for in-flight requests";
+        "service" => service_name,
+        "container" => &container_name
+    );
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    // Step 3: Stop the container
+    // Step 3: Remove from instance store
+    if let Some(mut instances) = instance_store.get_mut(service_name) {
+        instances.remove(&target_uuid);
+    }
+
+    // Step 4: Stop the container
     if let Err(e) = runtime.stop_container(&container_name).await {
         slog::error!(log, "Failed to stop container";
             "service" => service_name,
@@ -334,69 +347,45 @@ pub async fn scale_down(
         return Err(anyhow::anyhow!("Failed to stop container: {}", e));
     }
 
-    // Step 4: Remove from instance store
-    if let Some(mut instances) = instance_store.get_mut(service_name) {
-        instances.remove(&target_uuid);
-    }
-
-    slog::debug!(log, "Successfully scaled down container";
+    slog::info!(log, "Successfully scaled down container";
         "service" => service_name,
-        "container" => container_name
+        "container" => &container_name
     );
 
     Ok(())
 }
 
-pub async fn scale_up(
-    service_name: &str,
-    config: ServiceConfig,
+// Health check function
+async fn wait_for_container_health(
+    container_name: &str,
     runtime: Arc<dyn ContainerRuntime>,
-) -> Result<()> {
+) -> bool {
     let log = slog_scope::logger();
-    let instance_store = INSTANCE_STORE.get().unwrap();
 
-    // Get current instances without holding long-term lock
-    let current_instances = match instance_store.get(service_name) {
-        Some(entry) => entry.value().len(),
-        None => 0,
-    };
+    // Try up to 30 times with 1 second delay (30 seconds total)
+    for attempt in 1..=30 {
+        match runtime.inspect_container(container_name).await {
+            Ok(stats) => {
+                slog::debug!(log, "Container health check";
+                    "container" => container_name,
+                    "attempt" => attempt.to_string(),
+                    "cpu" => stats.cpu_percentage,
+                    "memory" => stats.memory_usage
+                );
 
-    if current_instances >= config.instance_count.max as usize {
-        return Ok(());
+                // Container is considered healthy if we can get stats
+                return true;
+            }
+            Err(e) => {
+                slog::debug!(log, "Container health check failed";
+                    "container" => container_name,
+                    "attempt" => attempt.to_string(),
+                    "error" => e.to_string()
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
     }
 
-    let uuid = Uuid::new_v4();
-    let container_name = format!("{}__{}", service_name, uuid);
-    let port_range = config.exposed_port..config.exposed_port + 10;
-
-    // Step 1: Start the container
-    let exposed_port = runtime
-        .start_container(
-            &container_name,
-            &config.image,
-            config.target_port,
-            port_range,
-            config.memory_limit.clone(),
-            config.cpu_limit.clone(),
-        )
-        .await?;
-
-    // Step 2: Add to instance store
-    if let Some(mut instances) = instance_store.get_mut(service_name) {
-        instances.insert(
-            uuid,
-            InstanceMetadata {
-                uuid,
-                exposed_port,
-                status: "running".to_string(),
-            },
-        );
-    }
-
-    slog::debug!(log, "Successfully scaled up container";
-        "service" => service_name,
-        "container" => container_name
-    );
-
-    Ok(())
+    false
 }

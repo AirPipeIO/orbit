@@ -626,7 +626,6 @@ pub fn remove_container_stats(container_name: &str) {
 }
 
 // Helper function to calculate CPU percentages
-// In container.rs, the calculate_cpu_percentages function needs fixing:
 fn calculate_cpu_percentages(
     previous: Option<&StatsEntry>,
     cpu_total: u64,
@@ -638,8 +637,8 @@ fn calculate_cpu_percentages(
         let cpu_delta = cpu_total as f64 - previous.cpu_total_usage as f64;
         let system_delta = system_cpu as f64 - previous.system_cpu_usage as f64;
 
-        if system_delta > 0.0 && cpu_delta > 0.0 {
-            // Calculate absolute CPU percentage
+        if system_delta > 0.0 && cpu_delta >= 0.0 {
+            // Calculate absolute CPU percentage (across all cores)
             let absolute_cpu = ((cpu_delta / system_delta) * online_cpus * 100.0)
                 .max(0.0)
                 .min(100.0 * online_cpus);
@@ -648,10 +647,17 @@ fn calculate_cpu_percentages(
             let relative_cpu = if let Some(cpu_limit) = nano_cpus {
                 // Convert nanocpus to CPU cores (1 CPU = 1_000_000_000 nanocpus)
                 let allocated_cpu = cpu_limit as f64 / 1_000_000_000.0;
-                // Calculate relative to allocated CPU
-                (absolute_cpu / (allocated_cpu * 100.0) * 100.0).min(100.0)
+                if allocated_cpu > 0.0 {
+                    // Calculate relative to allocated CPU
+                    // Since absolute_cpu is across all cores, we need to compare with allocated_cpu * 100
+                    let relative = (absolute_cpu / online_cpus) / allocated_cpu;
+                    // Convert to percentage and clamp between 0-100
+                    (relative * 100.0).max(0.0).min(100.0)
+                } else {
+                    0.0 // Avoid division by zero
+                }
             } else {
-                absolute_cpu
+                absolute_cpu / online_cpus // Normalize by number of CPUs if no limit
             };
 
             slog::trace!(slog_scope::logger(), "CPU calculation details";
@@ -659,14 +665,15 @@ fn calculate_cpu_percentages(
                 "system_delta" => system_delta,
                 "absolute_cpu" => absolute_cpu,
                 "relative_cpu" => relative_cpu,
+                "online_cpus" => online_cpus,
                 "allocated_cpu" => nano_cpus.map(|n| n as f64 / 1_000_000_000.0).unwrap_or(0.0)
             );
 
-            (absolute_cpu, relative_cpu)
+            (absolute_cpu / online_cpus, relative_cpu) // Normalize absolute CPU by cores
         } else {
             (0.0, 0.0)
         }
     } else {
-        (0.0, 0.0)
+        (0.0, 0.0) // First reading
     }
 }
