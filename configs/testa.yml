@@ -1,6 +1,6 @@
 name: helloworld
 image: strm/helloworld-http:latest
-cpu_limit: 0.01
+cpu_limit: 0.05
 memory_limit: 100M
 target_port: 80                 # Port the container's HTTP service listens on internally.
 exposed_port: 4333              # The port used by Pingora for external load-balanced traffic.

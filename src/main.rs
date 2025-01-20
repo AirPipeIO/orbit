@@ -80,6 +80,9 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Initialize background cache update
+    status::initialize_background_cache_update();
+
     // Initialize metrics system
     let _ = metrics::initialize_metrics();
 

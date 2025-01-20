@@ -314,81 +314,130 @@ pub fn create_runtime(runtime: &str) -> Result<Arc<dyn ContainerRuntime>> {
         _ => Err(anyhow!("Unsupported runtime: {}", runtime)),
     }
 }
+
 pub async fn manage(service_name: &str, config: ServiceConfig) {
     let log = slog_scope::logger();
-
     let instance_store = INSTANCE_STORE.get().unwrap();
     let runtime = RUNTIME.get().expect("Runtime not initialised").clone();
-    let cfg: ServiceConfig = config.clone();
 
-    let mut instances = instance_store.entry(service_name.to_string()).or_default();
-
-    // Start additional containers if necessary
-    for _ in instances.len()..(cfg.instance_count.min as usize) {
-        let uuid = uuid::Uuid::new_v4();
-        let container_name = format!("{}__{}", service_name, uuid);
-        let port_range = cfg.exposed_port..cfg.exposed_port + 10;
-
-        match runtime
-            .start_container(
-                &container_name,
-                &cfg.image,
-                cfg.target_port,
-                port_range,
-                cfg.memory_limit.clone(),
-                cfg.cpu_limit.clone(),
-            )
-            .await
-        {
-            Ok(exposed_port) => {
-                instances.insert(
-                    uuid,
-                    InstanceMetadata {
-                        uuid,
-                        exposed_port,
-                        status: "running".to_string(),
-                    },
-                );
-            }
-            Err(e) => {
-                slog::error!(log, "Failed to start container";
-                    "service" => service_name,
-                    "error" => e.to_string()
-                );
-            }
+    // Use try_entry to avoid deadlocks
+    let mut instances = match instance_store.try_entry(service_name.to_string()) {
+        Some(entry) => entry.or_default(),
+        None => {
+            slog::warn!(log, "Failed to acquire lock for instance store"; "service" => service_name);
+            return;
         }
-    }
+    };
 
-    // Stop extra containers if necessary
-    while instances.len() > cfg.instance_count.min as usize {
-        if let Some((&uuid, metadata)) = instances.iter().next() {
+    let cfg = config.clone();
+    let current_instances = instances.len();
+    let target_instances = cfg.instance_count.min as usize;
+
+    // Scale up logic (unchanged)
+    if current_instances < target_instances {
+        for _ in current_instances..target_instances {
+            let uuid = uuid::Uuid::new_v4();
             let container_name = format!("{}__{}", service_name, uuid);
-            let exposed_port = metadata.exposed_port;
+            let port_range = cfg.exposed_port..cfg.exposed_port + 10;
 
-            // Step 1: Remove backend from load balancer
-            let server_backends = SERVER_BACKENDS.get().unwrap();
-            if let Some(backends) = server_backends.get(service_name) {
-                let addr = format!("127.0.0.1:{}", exposed_port);
-                backends.remove(&Backend::new(&addr).unwrap());
-                slog::trace!(log, "Removed backend from load balancer";
-                    "service" => service_name,
-                    "container" => container_name.clone(),
-                    "address" => addr
-                );
-            }
-
-            // Step 2: Graceful wait (e.g., 5 seconds)
-            tokio::time::sleep(Duration::from_secs(5)).await;
-
-            // Step 3: Stop the container
-            if runtime.stop_container(&container_name).await.is_ok() {
-                instances.remove(&uuid);
+            match runtime
+                .start_container(
+                    &container_name,
+                    &cfg.image,
+                    cfg.target_port,
+                    port_range,
+                    cfg.memory_limit.clone(),
+                    cfg.cpu_limit.clone(),
+                )
+                .await
+            {
+                Ok(exposed_port) => {
+                    instances.insert(
+                        uuid,
+                        InstanceMetadata {
+                            uuid,
+                            exposed_port,
+                            status: "running".to_string(),
+                        },
+                    );
+                    tokio::task::yield_now().await;
+                }
+                Err(e) => {
+                    slog::error!(log, "Failed to start container";
+                        "service" => service_name,
+                        "error" => e.to_string()
+                    );
+                }
             }
         }
     }
 
-    // seems to lock if this enabled
-    // update_instance_store_cache();
+    // Optimized scale down logic
+    if current_instances > target_instances {
+        let instances_to_remove = current_instances - target_instances;
+        let server_backends = SERVER_BACKENDS.get().unwrap();
+
+        // Step 1: Prepare the list of instances to remove
+        let instances_for_removal: Vec<(Uuid, InstanceMetadata)> = instances
+            .iter()
+            .take(instances_to_remove)
+            .map(|(uuid, metadata)| (*uuid, metadata.clone()))
+            .collect();
+
+        // Step 2: First remove all instances from the load balancer
+        if let Some(backends) = server_backends.get(service_name) {
+            for (_, metadata) in &instances_for_removal {
+                let addr = format!("127.0.0.1:{}", metadata.exposed_port);
+                backends.remove(&Backend::new(&addr).unwrap());
+            }
+        }
+
+        // Step 3: Wait for connections to drain
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // Step 4: Stop containers in parallel
+        let mut stop_tasks = Vec::new();
+        for (uuid, _) in &instances_for_removal {
+            let container_name = format!("{}__{}", service_name, uuid);
+            let runtime = runtime.clone();
+            let service_name = service_name.to_string();
+
+            let stop_task = tokio::spawn(async move {
+                if let Err(e) = runtime.stop_container(&container_name).await {
+                    slog::error!(slog_scope::logger(), "Failed to stop container";
+                        "service" => service_name,
+                        "container" => container_name.clone(),
+                        "error" => e.to_string()
+                    );
+                    return Err(container_name);
+                }
+                Ok(container_name)
+            });
+            stop_tasks.push(stop_task);
+        }
+
+        // Step 5: Wait for all stop tasks to complete and update instance store
+        for (i, stop_task) in stop_tasks.into_iter().enumerate() {
+            match stop_task.await {
+                Ok(Ok(_)) => {
+                    let (uuid, _) = &instances_for_removal[i];
+                    instances.remove(uuid);
+                }
+                Ok(Err(container_name)) => {
+                    slog::error!(log, "Container stop task failed";
+                        "service" => service_name,
+                        "container" => container_name
+                    );
+                }
+                Err(e) => {
+                    slog::error!(log, "Container stop task panicked";
+                        "service" => service_name,
+                        "error" => e.to_string()
+                    );
+                }
+            }
+        }
+    }
 }
 
 pub async fn clean_up(service_name: &str) {
@@ -577,6 +626,7 @@ pub fn remove_container_stats(container_name: &str) {
 }
 
 // Helper function to calculate CPU percentages
+// In container.rs, the calculate_cpu_percentages function needs fixing:
 fn calculate_cpu_percentages(
     previous: Option<&StatsEntry>,
     cpu_total: u64,
@@ -589,16 +639,28 @@ fn calculate_cpu_percentages(
         let system_delta = system_cpu as f64 - previous.system_cpu_usage as f64;
 
         if system_delta > 0.0 && cpu_delta > 0.0 {
+            // Calculate absolute CPU percentage
             let absolute_cpu = ((cpu_delta / system_delta) * online_cpus * 100.0)
                 .max(0.0)
                 .min(100.0 * online_cpus);
 
+            // Calculate relative CPU percentage
             let relative_cpu = if let Some(cpu_limit) = nano_cpus {
-                let allocated_cpu = (cpu_limit as f64 / 1_000_000_000.0) * 100.0;
-                (absolute_cpu / allocated_cpu * 100.0).min(100.0)
+                // Convert nanocpus to CPU cores (1 CPU = 1_000_000_000 nanocpus)
+                let allocated_cpu = cpu_limit as f64 / 1_000_000_000.0;
+                // Calculate relative to allocated CPU
+                (absolute_cpu / (allocated_cpu * 100.0) * 100.0).min(100.0)
             } else {
                 absolute_cpu
             };
+
+            slog::trace!(slog_scope::logger(), "CPU calculation details";
+                "cpu_delta" => cpu_delta,
+                "system_delta" => system_delta,
+                "absolute_cpu" => absolute_cpu,
+                "relative_cpu" => relative_cpu,
+                "allocated_cpu" => nano_cpus.map(|n| n as f64 / 1_000_000_000.0).unwrap_or(0.0)
+            );
 
             (absolute_cpu, relative_cpu)
         } else {

@@ -2,6 +2,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, OnceLock},
+    time::Duration,
 };
 
 use crate::{
@@ -9,9 +10,11 @@ use crate::{
     container::{ContainerStats, InstanceMetadata, CONTAINER_STATS, INSTANCE_STORE},
     proxy::SERVER_BACKENDS,
 };
+use anyhow::Result;
 use axum::{routing::get, Json, Router};
 use dashmap::DashMap;
 use serde::Serialize;
+use tokio::time::timeout;
 use uuid::Uuid;
 
 // status response
@@ -57,28 +60,49 @@ pub fn update_instance_store_cache() {
     }
 }
 
-// Start the status server
-pub async fn server_start() {
-    let log: slog::Logger = slog_scope::logger();
+pub fn initialize_background_cache_update() {
+    let log = slog_scope::logger();
 
-    let app = Router::new().route("/status", get(get_status));
-
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:4112").await.unwrap();
-    slog::info!(log, "Status server running on http://0.0.0.0:4112");
-
-    axum::serve(listener, app).await.unwrap();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            interval.tick().await;
+            if let Err(e) = update_cache_with_timeout().await {
+                slog::warn!(log, "Cache update failed"; "error" => e.to_string());
+            }
+        }
+    });
 }
 
-// Handle the `/status` endpoint
+// Replace the existing update_instance_store_cache with this version
+async fn update_cache_with_timeout() -> Result<()> {
+    // Add timeout to prevent blocking
+    timeout(Duration::from_secs(5), async {
+        let instance_store = INSTANCE_STORE
+            .get()
+            .expect("Instance store not initialised");
+        let instance_cache = INSTANCE_STORE_CACHE.get_or_init(|| Arc::new(DashMap::new()));
+
+        // Clear existing instance cache
+        instance_cache.clear();
+
+        // Update instance cache in batches
+        for entry in instance_store.iter() {
+            instance_cache.insert(entry.key().clone(), entry.value().clone());
+            tokio::task::yield_now().await; // Allow other tasks to run
+        }
+    })
+    .await?;
+
+    Ok(())
+}
+
+// Modify the get_status handler to use cached data
 pub async fn get_status() -> Json<Vec<ServiceStatus>> {
-    let instance_store = INSTANCE_STORE_CACHE
+    let instance_cache = INSTANCE_STORE_CACHE
         .get()
-        .clone()
-        .expect("Instance store not initialized");
-    let config_store = CONFIG_STORE
-        .get()
-        .clone()
-        .expect("Config store not initialized");
+        .expect("Instance cache not initialized");
+    let config_store = CONFIG_STORE.get().expect("Config store not initialized");
     let server_backends = SERVER_BACKENDS
         .get()
         .expect("Server backends not initialized");
@@ -88,7 +112,7 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
 
     let mut services = Vec::new();
 
-    for entry in instance_store.iter() {
+    for entry in instance_cache.iter() {
         let service_name = entry.key();
         let instances = entry.value();
 
