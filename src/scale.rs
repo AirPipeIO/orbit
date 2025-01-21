@@ -72,11 +72,14 @@ pub async fn auto_scale(service_name: String) {
                                     backends.remove(&backend);
                                     slog::info!(log, "Removed missing container from load balancer";
                                         "service" => service_name.as_str(),
-                                        "container" => container_name,
+                                        "container" => &container_name,
                                         "address" => addr
                                     );
                                 }
                             }
+
+                            // Clean up stats separately after we're done with inspection
+                            // cleanup_container_stats(&container_name);
                         }
                     }
                 }

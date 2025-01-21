@@ -12,12 +12,12 @@ use clap::Parser;
 use config::CONFIG_STORE;
 use container::{
     create_runtime, CONTAINER_STATS, INSTANCE_STORE, PORT_RANGE, RUNTIME, SCALING_TASKS,
+    SERVICE_STATS,
 };
 use dashmap::DashMap;
 use logger::setup_logger;
 use metrics::MetricsUpdate;
 use proxy::{SERVER_BACKENDS, SERVER_TASKS};
-use status::CONTAINER_STATS_CACHE;
 use std::{path::PathBuf, process, sync::Arc, time::Duration};
 
 #[derive(Parser, Debug)]
@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
     INSTANCE_STORE.get_or_init(DashMap::new);
     SCALING_TASKS.get_or_init(DashMap::new);
     CONTAINER_STATS.get_or_init(|| DashMap::new());
-    CONTAINER_STATS_CACHE.get_or_init(|| Arc::new(DashMap::new()));
+    SERVICE_STATS.get_or_init(|| DashMap::new());
     SERVER_TASKS.get_or_init(DashMap::new);
     SERVER_BACKENDS.get_or_init(DashMap::new);
 

@@ -24,6 +24,109 @@ use crate::config::{get_config_by_service, parse_cpu_limit, parse_memory_limit, 
 use crate::proxy::SERVER_BACKENDS;
 use crate::status::update_instance_store_cache;
 
+#[derive(Clone, Debug)]
+pub struct ServiceStats {
+    container_stats: DashMap<String, ContainerStats>,
+}
+
+impl ServiceStats {
+    fn new() -> Self {
+        Self {
+            container_stats: DashMap::new(),
+        }
+    }
+
+    pub fn update_stats(&self, container_name: &str, stats: ContainerStats) {
+        self.container_stats
+            .insert(container_name.to_string(), stats);
+    }
+
+    pub fn remove_container(&self, container_name: &str) {
+        self.container_stats.remove(container_name);
+    }
+
+    pub fn get_container_stats(&self, container_name: &str) -> Option<ContainerStats> {
+        self.container_stats.get(container_name).map(|s| s.clone())
+    }
+}
+
+pub static SERVICE_STATS: OnceLock<DashMap<String, ServiceStats>> = OnceLock::new();
+
+// Update the update_container_stats function to use service-level stats
+pub async fn update_container_stats(
+    service_name: &str,
+    container_name: &str,
+    stats: Stats,
+    nano_cpus: Option<u64>,
+) -> ContainerStats {
+    let stats_store = CONTAINER_STATS.get().expect("Stats store not initialized");
+    let service_stats = SERVICE_STATS.get().expect("Service stats not initialized");
+
+    let now = SystemTime::now();
+    let cpu_total = stats.cpu_stats.cpu_usage.total_usage;
+    let system_cpu = stats.cpu_stats.system_cpu_usage.unwrap_or(0);
+    let online_cpus = stats.cpu_stats.online_cpus.unwrap_or(1) as f64;
+
+    // Get previous stats with minimal lock time
+    let previous = stats_store.get(container_name).map(|entry| StatsEntry {
+        timestamp: entry.timestamp,
+        cpu_total_usage: entry.cpu_total_usage,
+        system_cpu_usage: entry.system_cpu_usage,
+    });
+
+    let (cpu_percentage, cpu_percentage_relative) = calculate_cpu_percentages(
+        previous.as_ref(),
+        cpu_total,
+        system_cpu,
+        online_cpus,
+        nano_cpus,
+    );
+
+    // Update historical stats
+    let stats_entry = StatsEntry {
+        timestamp: now,
+        cpu_total_usage: cpu_total,
+        system_cpu_usage: system_cpu,
+    };
+    stats_store.insert(container_name.to_string(), stats_entry);
+
+    let container_stats = ContainerStats {
+        id: stats.id.clone(),
+        cpu_percentage,
+        cpu_percentage_relative,
+        memory_usage: stats.memory_stats.usage.unwrap_or(0),
+        memory_limit: stats.memory_stats.limit.unwrap_or(0),
+        timestamp: now,
+    };
+
+    // Update service-level stats
+    service_stats
+        .entry(service_name.to_string())
+        .or_insert_with(ServiceStats::new)
+        .update_stats(container_name, container_stats.clone());
+
+    container_stats
+}
+
+// Update remove_container_stats to handle service-level cleanup
+pub fn remove_container_stats(service_name: &str, container_name: &str) {
+    if let Some(stats_store) = CONTAINER_STATS.get() {
+        stats_store.remove(container_name);
+    }
+
+    if let Some(service_stats) = SERVICE_STATS.get() {
+        if let Some(stats) = service_stats.get(service_name) {
+            stats.remove_container(container_name);
+        }
+    }
+}
+
+// Initialize service stats in main.rs
+pub fn initialize_stats() {
+    SERVICE_STATS.get_or_init(DashMap::new);
+    CONTAINER_STATS.get_or_init(DashMap::new);
+}
+
 pub static RUNTIME: OnceLock<Arc<dyn ContainerRuntime>> = OnceLock::new();
 
 pub static RESERVED_PORTS: OnceLock<DashMap<u16, String>> = OnceLock::new();
@@ -93,6 +196,7 @@ pub struct ContainerStats {
     pub cpu_percentage_relative: f64,
     pub memory_usage: u64,
     pub memory_limit: u64,
+    timestamp: SystemTime,
 }
 
 pub fn update_reserved_ports(service_name: &str, exposed_port: u16) {
@@ -251,18 +355,10 @@ impl ContainerRuntime for DockerRuntime {
             .and_then(|value| parse_cpu_limit(value).ok()); // Parse and handle Result -> Option
 
         // Update stats history and get CPU percentage
-        let cpu = update_container_stats(name, stats.clone(), nano_cpus).await;
+        let container_stats =
+            update_container_stats(service_name, name, stats.clone(), nano_cpus).await;
 
-        let memory_usage = stats.memory_stats.usage.unwrap_or(0);
-        let memory_limit = stats.memory_stats.limit.unwrap_or(0);
-
-        Ok(ContainerStats {
-            id: stats.id,
-            cpu_percentage: cpu.cpu_percentage,
-            cpu_percentage_relative: cpu.cpu_percentage_relative,
-            memory_usage,
-            memory_limit,
-        })
+        Ok(container_stats)
     }
 
     async fn list_containers(&self, service_name: Option<&str>) -> Result<Vec<ContainerInfo>> {
@@ -317,38 +413,24 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
     let instance_store = INSTANCE_STORE.get().unwrap();
     let runtime = RUNTIME.get().expect("Runtime not initialised").clone();
 
-    slog::debug!(log, "Entering manage function";
-        "service" => service_name);
-
-    // Use try_entry to avoid deadlocks
-    let mut instances = match instance_store.try_entry(service_name.to_string()) {
-        Some(entry) => {
-            slog::debug!(log, "Acquired instance store entry";
-                "service" => service_name);
-            entry.or_default()
-        }
-        None => {
-            slog::warn!(log, "Failed to acquire lock for instance store";
-                "service" => service_name);
-            return;
-        }
+    // Calculate required containers outside the lock
+    let current_instances = {
+        let instances = instance_store
+            .get(service_name)
+            .map(|entry| entry.value().len())
+            .unwrap_or(0);
+        instances
     };
 
-    slog::debug!(log, "Calculating instance counts";
-        "service" => service_name,
-        "current_instances" => instances.len(),
-        "target_instances" => config.instance_count.min);
+    let target_instances = config.instance_count.min as usize;
 
-    let cfg = config.clone();
-    let current_instances = instances.len();
-    let target_instances = cfg.instance_count.min as usize;
-
-    // Scale up logic
+    // Scale up without holding the main lock
     if current_instances < target_instances {
         slog::debug!(log, "Starting scale up";
             "service" => service_name,
-            "current" => current_instances.clone(),
-            "target" => target_instances);
+            "current" => current_instances,
+            "target" => target_instances
+        );
 
         for _ in current_instances..target_instances {
             let uuid = uuid::Uuid::new_v4();
@@ -356,15 +438,16 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
 
             slog::debug!(log, "Starting new container";
                 "service" => service_name,
-                "container" => &container_name);
+                "container" => &container_name
+            );
 
             match runtime
                 .start_container(
                     &container_name,
-                    &cfg.image,
-                    cfg.target_port,
-                    cfg.memory_limit.clone(),
-                    cfg.cpu_limit.clone(),
+                    &config.image,
+                    config.target_port,
+                    config.memory_limit.clone(),
+                    config.cpu_limit.clone(),
                 )
                 .await
             {
@@ -372,146 +455,37 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
                     slog::debug!(log, "Container started successfully";
                         "service" => service_name,
                         "container" => &container_name,
-                        "port" => exposed_port.clone());
-
-                    instances.insert(
-                        uuid,
-                        InstanceMetadata {
-                            uuid,
-                            exposed_port,
-                            status: "running".to_string(),
-                        },
+                        "port" => exposed_port.to_string()
                     );
+
+                    // Only lock briefly to update the instance store
+                    if let Some(mut instances) = instance_store.get_mut(service_name) {
+                        instances.insert(
+                            uuid,
+                            InstanceMetadata {
+                                uuid,
+                                exposed_port,
+                                status: "running".to_string(),
+                            },
+                        );
+                    } else {
+                        // Create new entry if it doesn't exist
+                        let mut map = HashMap::new();
+                        map.insert(
+                            uuid,
+                            InstanceMetadata {
+                                uuid,
+                                exposed_port,
+                                status: "running".to_string(),
+                            },
+                        );
+                        instance_store.insert(service_name.to_string(), map);
+                    }
+
                     tokio::task::yield_now().await;
                 }
                 Err(e) => {
                     slog::error!(log, "Failed to start container";
-                        "service" => service_name,
-                        "error" => e.to_string()
-                    );
-                }
-            }
-        }
-    }
-
-    slog::debug!(log, "Completed instance management";
-        "service" => service_name);
-}
-
-pub async fn manage_old(service_name: &str, config: ServiceConfig) {
-    let log = slog_scope::logger();
-    let instance_store = INSTANCE_STORE.get().unwrap();
-    let runtime = RUNTIME.get().expect("Runtime not initialised").clone();
-
-    // Use try_entry to avoid deadlocks
-    let mut instances = match instance_store.try_entry(service_name.to_string()) {
-        Some(entry) => entry.or_default(),
-        None => {
-            slog::warn!(log, "Failed to acquire lock for instance store"; "service" => service_name);
-            return;
-        }
-    };
-
-    let cfg = config.clone();
-    let current_instances = instances.len();
-    let target_instances = cfg.instance_count.min as usize;
-
-    // Scale up logic (unchanged)
-    if current_instances < target_instances {
-        for _ in current_instances..target_instances {
-            let uuid = uuid::Uuid::new_v4();
-            let container_name = format!("{}__{}", service_name, uuid);
-
-            match runtime
-                .start_container(
-                    &container_name,
-                    &cfg.image,
-                    cfg.target_port,
-                    cfg.memory_limit.clone(),
-                    cfg.cpu_limit.clone(),
-                )
-                .await
-            {
-                Ok(exposed_port) => {
-                    instances.insert(
-                        uuid,
-                        InstanceMetadata {
-                            uuid,
-                            exposed_port,
-                            status: "running".to_string(),
-                        },
-                    );
-                    tokio::task::yield_now().await;
-                }
-                Err(e) => {
-                    slog::error!(log, "Failed to start container";
-                        "service" => service_name,
-                        "error" => e.to_string()
-                    );
-                }
-            }
-        }
-    }
-
-    // Optimized scale down logic
-    if current_instances > target_instances {
-        let instances_to_remove = current_instances - target_instances;
-        let server_backends = SERVER_BACKENDS.get().unwrap();
-
-        // Step 1: Prepare the list of instances to remove
-        let instances_for_removal: Vec<(Uuid, InstanceMetadata)> = instances
-            .iter()
-            .take(instances_to_remove)
-            .map(|(uuid, metadata)| (*uuid, metadata.clone()))
-            .collect();
-
-        // Step 2: First remove all instances from the load balancer
-        if let Some(backends) = server_backends.get(service_name) {
-            for (_, metadata) in &instances_for_removal {
-                let addr = format!("127.0.0.1:{}", metadata.exposed_port);
-                backends.remove(&Backend::new(&addr).unwrap());
-            }
-        }
-
-        // Step 3: Wait for connections to drain
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
-        // Step 4: Stop containers in parallel
-        let mut stop_tasks = Vec::new();
-        for (uuid, _) in &instances_for_removal {
-            let container_name = format!("{}__{}", service_name, uuid);
-            let runtime = runtime.clone();
-            let service_name = service_name.to_string();
-
-            let stop_task = tokio::spawn(async move {
-                if let Err(e) = runtime.stop_container(&container_name).await {
-                    slog::error!(slog_scope::logger(), "Failed to stop container";
-                        "service" => service_name,
-                        "container" => container_name.clone(),
-                        "error" => e.to_string()
-                    );
-                    return Err(container_name);
-                }
-                Ok(container_name)
-            });
-            stop_tasks.push(stop_task);
-        }
-
-        // Step 5: Wait for all stop tasks to complete and update instance store
-        for (i, stop_task) in stop_tasks.into_iter().enumerate() {
-            match stop_task.await {
-                Ok(Ok(_)) => {
-                    let (uuid, _) = &instances_for_removal[i];
-                    instances.remove(uuid);
-                }
-                Ok(Err(container_name)) => {
-                    slog::error!(log, "Container stop task failed";
-                        "service" => service_name,
-                        "container" => container_name
-                    );
-                }
-                Err(e) => {
-                    slog::error!(log, "Container stop task panicked";
                         "service" => service_name,
                         "error" => e.to_string()
                     );
@@ -527,179 +501,47 @@ pub async fn clean_up(service_name: &str) {
         .get()
         .expect("Instance store not initialised");
     let runtime = RUNTIME.get().expect("Runtime not initialised").clone();
-    let server_backends = SERVER_BACKENDS.get().unwrap();
-    let scaling_tasks = SCALING_TASKS.get().unwrap(); // Access the global scaling tasks
+    let scaling_tasks = SCALING_TASKS.get().unwrap();
 
     // Stop the auto-scaling task
     if let Some((_, handle)) = scaling_tasks.remove(service_name) {
-        handle.abort(); // Abort the scaling task
+        handle.abort();
         slog::trace!(log, "Scaling task aborted"; "service" => service_name);
     }
 
-    // Clone the instances to process outside of the DashMap
-    let instances = {
-        let mut instance_store = instance_store;
-        instance_store
-            .remove(service_name)
-            .map(|(_, instances)| instances)
-    };
+    if let Some((_, instances)) = instance_store.remove(service_name) {
+        for (uuid, metadata) in instances {
+            let container_name = format!("{}__{}", service_name, uuid);
 
-    // Stop and remove container instances
-    if let Some(instances) = instances {
-        let service_name_owned = service_name.to_string();
-        let backends = server_backends
-            .get(&service_name_owned)
-            .map(|entry| entry.clone()); // Clone the Arc<DashSet<Backend>>
+            // Remove from load balancer
+            if let Some(backends) = SERVER_BACKENDS.get().unwrap().get(service_name) {
+                let addr = format!("127.0.0.1:{}", metadata.exposed_port);
+                if let Ok(backend) = Backend::new(&addr) {
+                    backends.remove(&backend);
+                }
+            }
 
-        let tasks: Vec<_> = instances
-            .into_iter()
-            .map(|(uuid, metadata)| {
-                let container_name = format!("{}__{}", service_name_owned.clone(), uuid);
-                let runtime = runtime.clone();
-                let service_name_for_task = service_name_owned.clone();
-                let backends = backends.clone();
-                let exposed_port = metadata.exposed_port;
+            // Clean up stats first
+            remove_container_stats(service_name, &container_name);
 
-                // let container_name = format!("{}__{}", service_name, uuid);
-                // Remove container stats when cleaning up
-                remove_container_stats(&container_name);
-
-                tokio::spawn(async move {
-                    let log = slog_scope::logger();
-
-                    // Remove backend from the load balancer
-                    if let Some(backends) = backends {
-                        let addr = format!("127.0.0.1:{}", exposed_port);
-                        backends.remove(&Backend::new(&addr).unwrap());
-                        slog::trace!(log, "Removed backend from load balancer";
-                            "service" => service_name_for_task.clone(),
-                            "container" => container_name.clone(),
-                            "address" => addr
-                        );
-                    }
-
-                    // Graceful wait (e.g., 5 seconds) for active connections to complete
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-
-                    // Stop the container
-                    if let Err(e) = runtime.stop_container(&container_name).await {
-                        slog::error!(log, "Failed to stop container";
-                            "service" => service_name_for_task,
-                            "container" => container_name,
-                            "error" => e.to_string()
-                        );
-                    } else {
-                        slog::trace!(log, "Stopped container";
-                            "service" => service_name_for_task,
-                            "container" => container_name
-                        );
-                    }
-                })
-            })
-            .collect();
-
-        // Wait for all tasks to complete
-        for task in tasks {
-            if let Err(e) = task.await {
-                slog::error!(slog_scope::logger(), "Error in container stop task";
+            // Stop the container
+            let runtime = runtime.clone();
+            if let Err(e) = runtime.stop_container(&container_name).await {
+                slog::error!(log, "Failed to stop container";
+                    "service" => service_name,
+                    "container" => &container_name,
                     "error" => e.to_string()
                 );
             }
         }
-    }
 
-    // Update the instance store cache
-    update_instance_store_cache();
-}
-
-pub async fn update_container_stats(
-    container_name: &str,
-    stats: Stats,
-    nano_cpus: Option<u64>,
-) -> ContainerStats {
-    let stats_store = match CONTAINER_STATS.get() {
-        Some(store) => store,
-        None => {
-            return ContainerStats {
-                id: stats.id,
-                cpu_percentage: 0.0,
-                cpu_percentage_relative: 0.0,
-                memory_usage: stats.memory_stats.usage.unwrap_or(0),
-                memory_limit: stats.memory_stats.limit.unwrap_or(0),
-            }
+        // Clean up entire service stats after all containers are stopped
+        if let Some(service_stats) = SERVICE_STATS.get() {
+            service_stats.remove(service_name);
         }
-    };
-
-    let now = SystemTime::now();
-    let cpu_total = stats.cpu_stats.cpu_usage.total_usage;
-    let system_cpu = stats.cpu_stats.system_cpu_usage.unwrap_or(0);
-    let online_cpus = stats.cpu_stats.online_cpus.unwrap_or(1) as f64;
-
-    // Get previous stats with minimal lock time
-    let previous = stats_store.get(container_name).map(|entry| StatsEntry {
-        timestamp: entry.timestamp,
-        cpu_total_usage: entry.cpu_total_usage,
-        system_cpu_usage: entry.system_cpu_usage,
-    });
-
-    // Calculate CPU percentages without holding the lock
-    let (cpu_percentage, cpu_percentage_relative) = calculate_cpu_percentages(
-        previous.as_ref(),
-        cpu_total,
-        system_cpu,
-        online_cpus,
-        nano_cpus,
-    );
-
-    // Prepare data outside locks
-    let stats_entry = StatsEntry {
-        timestamp: now,
-        cpu_total_usage: cpu_total,
-        system_cpu_usage: system_cpu,
-    };
-
-    // Minimal lock time for update
-    if let Some(stats_store) = CONTAINER_STATS.get() {
-        stats_store.insert(container_name.to_string(), stats_entry);
     }
 
-    let container_stats = ContainerStats {
-        id: stats.id.clone(),
-        cpu_percentage,
-        cpu_percentage_relative,
-        memory_usage: stats.memory_stats.usage.unwrap_or(0),
-        memory_limit: stats.memory_stats.limit.unwrap_or(0),
-    };
-
-    // Update stats cache with minimal lock time
-    if let Some(stats_cache) = crate::status::CONTAINER_STATS_CACHE.get() {
-        stats_cache.insert(container_name.to_string(), container_stats.clone());
-    }
-
-    // Send metrics update asynchronously
-    // if let Some(service_name) = container_name.split("__").next() {
-    //     let stats = ServiceStats {
-    //         instance_count: 1, // This will be aggregated later
-    //         cpu_usage: [(container_name.to_string(), cpu_percentage)]
-    //             .into_iter()
-    //             .collect(),
-    //         memory_usage: [(
-    //             container_name.to_string(),
-    //             stats.memory_stats.usage.unwrap_or(0),
-    //         )]
-    //         .into_iter()
-    //         .collect(),
-    //         active_connections: 0,
-    //     };
-    // }
-
-    container_stats
-}
-
-pub fn remove_container_stats(container_name: &str) {
-    if let Some(stats_store) = CONTAINER_STATS.get() {
-        stats_store.remove(container_name);
-    }
+    update_instance_store_cache();
 }
 
 // Helper function to calculate CPU percentages

@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     config::get_config_by_service,
-    container::{ContainerStats, InstanceMetadata, INSTANCE_STORE},
+    container::{self, ContainerStats, InstanceMetadata, INSTANCE_STORE},
     proxy::SERVER_BACKENDS,
 };
 use anyhow::Result;
@@ -39,9 +39,6 @@ pub struct ContainerInfo {
 // Global cache for instance store data
 pub static INSTANCE_STORE_CACHE: OnceLock<Arc<DashMap<String, HashMap<Uuid, InstanceMetadata>>>> =
     OnceLock::new();
-
-// cache for container stats
-pub static CONTAINER_STATS_CACHE: OnceLock<Arc<DashMap<String, ContainerStats>>> = OnceLock::new();
 
 pub fn update_instance_store_cache() {
     let instance_store = INSTANCE_STORE
@@ -101,9 +98,9 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
     let server_backends = SERVER_BACKENDS
         .get()
         .expect("Server backends not initialized");
-    let stats_cache = CONTAINER_STATS_CACHE
+    let service_stats = container::SERVICE_STATS
         .get()
-        .expect("Stats cache not initialized");
+        .expect("Service stats not initialized");
 
     let mut services = Vec::new();
 
@@ -114,6 +111,8 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
         let service_config = get_config_by_service(service_name);
 
         if let Some(config) = service_config {
+            let service_stat = service_stats.get(service_name);
+
             let containers: Vec<ContainerInfo> = instances
                 .iter()
                 .map(|(uuid, metadata)| {
@@ -130,8 +129,10 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
                         "unknown".to_string()
                     };
 
-                    // Get cached stats
-                    let stats = stats_cache.get(&container_name);
+                    // Get stats from service-level stats
+                    let stats = service_stat
+                        .as_ref()
+                        .and_then(|s| s.get_container_stats(&container_name));
 
                     ContainerInfo {
                         uuid: *uuid,
