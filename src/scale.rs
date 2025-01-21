@@ -1,5 +1,5 @@
 // scale.rs
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use pingora_load_balancing::Backend;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc;
@@ -401,7 +401,21 @@ pub async fn scale_up(
         );
     }
 
-    // Step 4: Add to load balancer after container is healthy
+    // Step 4: Wait for application readiness
+    let app_ready =
+        check_application_readiness("127.0.0.1", exposed_port, Duration::from_secs(30)).await;
+
+    if !app_ready {
+        slog::error!(log, "Container application failed readiness check, removing";
+            "service" => service_name,
+            "container" => &container_name
+        );
+        // Clean up the unhealthy container
+        let _ = runtime.stop_container(&container_name).await;
+        return Err(anyhow!("Container application failed readiness check"));
+    }
+
+    // Step 5: Add to load balancer after container is healthy
     if let Some(backends) = server_backends.get(service_name) {
         let addr = format!("127.0.0.1:{}", exposed_port);
         if let Ok(backend) = Backend::new(&addr) {
@@ -521,5 +535,28 @@ async fn wait_for_container_health(
         }
     }
 
+    false
+}
+
+async fn check_application_readiness(addr: &str, port: u16, timeout: Duration) -> bool {
+    use tokio::net::TcpStream;
+
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        match tokio::time::timeout(
+            Duration::from_secs(1),
+            TcpStream::connect(format!("{}:{}", addr, port)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return true, // Successfully connected
+            _ => {
+                // Only sleep if we still have time remaining
+                if start.elapsed() < timeout {
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                }
+            }
+        }
+    }
     false
 }
