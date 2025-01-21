@@ -12,11 +12,13 @@ use validator::Validate;
 
 use crate::{
     container::{
-        self, clean_up, manage, remove_reserved_ports, update_reserved_ports, InstanceMetadata,
-        INSTANCE_STORE, RESERVED_PORTS, RUNTIME, SCALING_TASKS,
+        self, clean_up, manage, remove_container_stats, remove_reserved_ports,
+        update_reserved_ports, InstanceMetadata, INSTANCE_STORE, RESERVED_PORTS, RUNTIME,
+        SCALING_TASKS,
     },
-    proxy,
+    proxy::{self, SERVER_BACKENDS},
     scale::auto_scale,
+    status::update_instance_store_cache,
 };
 
 #[derive(Clone)]
@@ -121,34 +123,76 @@ pub async fn watch_directory(config_dir: PathBuf) -> notify::Result<()> {
     Ok(())
 }
 
+// In config.rs, update the process_event function
+
+// In config.rs
+
 async fn process_event(event: DebouncedEvent) {
     let log: slog::Logger = slog_scope::logger();
     let config_store = CONFIG_STORE.get().unwrap();
+    let scaling_tasks = SCALING_TASKS.get().unwrap();
 
+    // Process the immediate event
     for path in event.paths.iter() {
         match event.kind {
             EventKind::Create(_) | EventKind::Modify(_) => {
                 if path.exists() && path.is_file() {
+                    // Check if it's a YAML file
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                        if ext != "yml" && ext != "yaml" {
+                            slog::debug!(slog_scope::logger(), "Ignoring non-YAML file";
+                                "path" => path.to_str(),
+                                "extension" => ext
+                            );
+                            continue;
+                        }
+                    }
+
                     match read_yaml_config(path).await {
                         Ok(config) => {
                             let service_name = config.name.clone();
+
+                            slog::info!(slog_scope::logger(), "Processing YAML config";
+                                "service" => &service_name,
+                                "path" => path.to_str()
+                            );
+
+                            // Handle like initialization
                             update_reserved_ports(&service_name, config.exposed_port);
 
-                            // Store both path and config
+                            // Store config
                             config_store.insert(
                                 path.display().to_string(),
                                 (path.to_path_buf(), config.clone()),
                             );
 
-                            if let Err(e) = handle_config_update(&service_name, config).await {
-                                slog::error!(log, "Failed to handle config update";
-                                    "service" => service_name,
-                                    "error" => e.to_string()
+                            // Stop existing scaling task if it exists
+                            if let Some((_, handle)) = scaling_tasks.remove(&service_name) {
+                                handle.abort();
+                                slog::debug!(slog_scope::logger(), "Aborted existing scaling task";
+                                    "service" => &service_name
                                 );
                             }
+
+                            // Start containers and proxy
+                            container::manage(&service_name, config.clone()).await;
+                            proxy::run_proxy_for_service(service_name.clone(), config.clone())
+                                .await;
+
+                            let svc_name = service_name.clone();
+
+                            // Create new scaling task
+                            let handle = tokio::spawn(async move {
+                                auto_scale(svc_name).await;
+                            });
+                            scaling_tasks.insert(service_name.clone(), handle);
+
+                            slog::info!(slog_scope::logger(), "Service initialization complete";
+                                "service" => &service_name
+                            );
                         }
                         Err(e) => {
-                            slog::error!(log, "config issue";
+                            slog::error!(slog_scope::logger(), "Failed to parse YAML config";
                                 "file" => path.to_str(),
                                 "error" => e.to_string()
                             );
@@ -157,13 +201,78 @@ async fn process_event(event: DebouncedEvent) {
                 }
             }
             EventKind::Remove(_) => {
+                // Handle explicit removal events
                 if let Some((_, (_, config))) = config_store.remove(&path.display().to_string()) {
-                    remove_reserved_ports(&config.name);
-                    clean_up(&config.name).await;
+                    let service_name = config.name.clone();
+                    slog::info!(slog_scope::logger(), "Config file removed, cleaning up service";
+                        "service" => &service_name,
+                        "path" => path.to_str()
+                    );
+
+                    remove_reserved_ports(&service_name);
+
+                    // Stop scaling task
+                    if let Some((_, handle)) = scaling_tasks.remove(&service_name) {
+                        handle.abort();
+                    }
+
+                    tokio::spawn(async move {
+                        stop_service(&service_name).await;
+                        clean_up(&service_name).await;
+
+                        slog::info!(slog_scope::logger(), "Service cleanup completed";
+                            "service" => &service_name
+                        );
+                    });
                 }
             }
             _ => {}
         }
+    }
+
+    // After processing the event, verify all tracked configs still exist
+    let services_to_cleanup: Vec<_> = config_store
+        .iter()
+        .filter_map(|entry| {
+            let path = &entry.value().0;
+            let config = &entry.value().1;
+
+            if !path.exists()
+                || !matches!(
+                    path.extension().and_then(|e| e.to_str()),
+                    Some("yml") | Some("yaml")
+                )
+            {
+                Some((path.clone(), config.name.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for (path, service_name) in services_to_cleanup {
+        slog::info!(slog_scope::logger(), "Config file no longer valid, cleaning up service";
+            "service" => &service_name,
+            "path" => path.to_str()
+        );
+
+        config_store.remove(&path.display().to_string());
+        remove_reserved_ports(&service_name);
+
+        // Stop scaling task
+        if let Some((_, handle)) = scaling_tasks.remove(&service_name) {
+            handle.abort();
+        }
+
+        let service_name_clone = service_name.clone();
+        tokio::spawn(async move {
+            stop_service(&service_name_clone).await;
+            clean_up(&service_name_clone).await;
+
+            slog::info!(slog_scope::logger(), "Service cleanup completed";
+                "service" => &service_name_clone
+            );
+        });
     }
 }
 
@@ -338,31 +447,53 @@ fn extract_uuid_from_name(container_name: &str) -> Result<Uuid> {
     }
 }
 
+// Update the stop_service function to ensure complete cleanup
 pub async fn stop_service(service_name: &str) {
     let log = slog_scope::logger();
     let scaling_tasks = SCALING_TASKS.get().unwrap();
     let instance_store = INSTANCE_STORE.get().unwrap();
+    let server_backends = SERVER_BACKENDS.get().unwrap();
 
     // Stop the scaling task
     if let Some((_, handle)) = scaling_tasks.remove(service_name) {
         handle.abort(); // Cancel the task
-        slog::trace!(log, "Scaling task aborted"; "service" => service_name);
+        slog::debug!(log, "Scaling task aborted"; "service" => service_name);
     }
 
-    // Clean up instance store
+    // Remove from load balancer
+    server_backends.remove(service_name);
+
+    // Clean up instance store and stop containers
     if let Some((_, instances)) = instance_store.remove(service_name) {
-        for (uuid, _metadata) in instances {
+        for (uuid, metadata) in instances {
             let container_name = format!("{}__{}", service_name, uuid);
             let runtime = RUNTIME.get().unwrap().clone();
 
-            if runtime.stop_container(&container_name).await.is_ok() {
-                slog::trace!(log, "Stopped container"; "service" => service_name, "container" => container_name);
+            // Remove container stats
+            remove_container_stats(service_name, &container_name);
+
+            // Stop the container
+            if let Err(e) = runtime.stop_container(&container_name).await {
+                slog::error!(log, "Failed to stop container during service cleanup";
+                    "service" => service_name,
+                    "container" => &container_name,
+                    "error" => e.to_string()
+                );
+            } else {
+                slog::debug!(log, "Container stopped successfully";
+                    "service" => service_name,
+                    "container" => &container_name
+                );
             }
         }
     }
 
-    slog::info!(log, "Service stopped"; "service" => service_name);
+    // Update instance store cache
+    update_instance_store_cache();
+
+    slog::info!(log, "Service stopped and cleaned up"; "service" => service_name);
 }
+
 pub fn parse_memory_limit(memory_limit: &serde_json::Value) -> Result<u64> {
     match memory_limit {
         serde_json::Value::Number(num) => {
@@ -406,23 +537,39 @@ pub fn parse_cpu_limit(cpu_limit: &serde_json::Value) -> Result<u64> {
     }
 }
 
+// In config.rs, modify handle_config_update
+
 pub async fn handle_config_update(service_name: &str, config: ServiceConfig) -> Result<()> {
     let log = slog_scope::logger();
+    let scaling_tasks = SCALING_TASKS.get().unwrap();
 
     slog::debug!(log, "Starting config update process";
         "service" => service_name,
-        "thresholds" => format!("{:?}", config.resource_thresholds)); // Add logging for thresholds
+        "thresholds" => format!("{:?}", config.resource_thresholds));
 
-    // Send pause signal
-    if let Some(sender) = CONFIG_UPDATES.get() {
-        sender
-            .send((service_name.to_string(), ScaleMessage::ConfigUpdate))
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to send config update: {}", e))?;
+    // Check if this is a new service (no existing scaling task)
+    let is_new_service = !scaling_tasks.contains_key(service_name);
+
+    if is_new_service {
+        slog::info!(log, "Detected new service, initializing scaling task";
+            "service" => service_name
+        );
+
+        // Initialize like a new service
+        let service_name_clone = service_name.to_string();
+        let handle = tokio::spawn(async move {
+            auto_scale(service_name_clone).await;
+        });
+        scaling_tasks.insert(service_name.to_string(), handle);
+    } else {
+        // Existing service - send pause signal
+        if let Some(sender) = CONFIG_UPDATES.get() {
+            sender
+                .send((service_name.to_string(), ScaleMessage::ConfigUpdate))
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to send config update: {}", e))?;
+        }
     }
-
-    // Add a small delay to ensure scaling tasks receive the pause signal
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Update config in store
     if let Some(config_store) = CONFIG_STORE.get() {
@@ -438,12 +585,14 @@ pub async fn handle_config_update(service_name: &str, config: ServiceConfig) -> 
     manage(service_name, config.clone()).await;
     proxy::run_proxy_for_service(service_name.to_string(), config.clone()).await;
 
-    // Send resume signal
-    if let Some(sender) = CONFIG_UPDATES.get() {
-        sender
-            .send((service_name.to_string(), ScaleMessage::Resume))
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to send resume signal: {}", e))?;
+    // If it's an existing service, send resume signal
+    if !is_new_service {
+        if let Some(sender) = CONFIG_UPDATES.get() {
+            sender
+                .send((service_name.to_string(), ScaleMessage::Resume))
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to send resume signal: {}", e))?;
+        }
     }
 
     slog::debug!(log, "Completed config update process";
