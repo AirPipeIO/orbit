@@ -20,10 +20,7 @@ use std::time::SystemTime;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::config::{
-    get_config_by_service, parse_cpu_limit, parse_memory_limit, ServiceConfig, CONFIG_STORE,
-};
-use crate::metrics::ServiceStats;
+use crate::config::{get_config_by_service, parse_cpu_limit, parse_memory_limit, ServiceConfig};
 use crate::proxy::SERVER_BACKENDS;
 use crate::status::update_instance_store_cache;
 
