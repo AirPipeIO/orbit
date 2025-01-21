@@ -13,6 +13,7 @@ use pingora_load_balancing::Backend;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use std::time::SystemTime;
@@ -20,7 +21,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::config::{parse_cpu_limit, parse_memory_limit, ServiceConfig, CONFIG_STORE};
-use crate::metrics::{self, MetricsUpdate, ServiceStats};
+use crate::metrics::ServiceStats;
 use crate::proxy::SERVER_BACKENDS;
 use crate::status::update_instance_store_cache;
 
@@ -30,6 +31,8 @@ pub static RESERVED_PORTS: OnceLock<DashMap<u16, String>> = OnceLock::new();
 
 pub static INSTANCE_STORE: OnceLock<DashMap<String, HashMap<Uuid, InstanceMetadata>>> =
     OnceLock::new();
+
+pub static PORT_RANGE: OnceLock<Range<u16>> = OnceLock::new();
 
 // Global registry for scaling tasks
 pub static SCALING_TASKS: OnceLock<DashMap<String, JoinHandle<()>>> = OnceLock::new();
@@ -60,7 +63,6 @@ pub trait ContainerRuntime: Send + Sync + std::fmt::Debug {
         name: &str,
         image: &str,
         target_port: u16,
-        port_range: std::ops::Range<u16>,
         memory_limit: Option<Value>, // Human-readable memory limit (e.g., "512Mi")
         cpu_limit: Option<Value>,    // Human-readable CPU limit (e.g., "0.5")
     ) -> Result<u16>;
@@ -128,8 +130,11 @@ impl DockerRuntime {
         true
     }
 
-    fn find_available_port(mut port_range: std::ops::Range<u16>) -> Option<u16> {
-        port_range.find(|port: &u16| Self::is_port_available(*port))
+    fn find_available_port() -> Option<u16> {
+        let port_range = PORT_RANGE.get().expect("Port range not initialized");
+        port_range
+            .clone()
+            .find(|port| Self::is_port_available(*port))
     }
 }
 
@@ -140,13 +145,12 @@ impl ContainerRuntime for DockerRuntime {
         name: &str,
         image: &str,
         target_port: u16,
-        port_range: std::ops::Range<u16>,
         memory_limit: Option<Value>, // Human-readable memory limit (e.g., "512Mi")
         cpu_limit: Option<Value>,    // Human-readable CPU limit (e.g., "0.5")
     ) -> Result<u16> {
-        // Find an available port in the range
-        let available_port = Self::find_available_port(port_range)
-            .ok_or_else(|| anyhow!("No available ports found in the specified range"))?;
+        // Find an available port using the globally configured range
+        let available_port = Self::find_available_port()
+            .ok_or_else(|| anyhow!("No available ports found in the configured range"))?;
 
         // Container configuration
         // Parse the memory and CPU limits
@@ -338,14 +342,12 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
         for _ in current_instances..target_instances {
             let uuid = uuid::Uuid::new_v4();
             let container_name = format!("{}__{}", service_name, uuid);
-            let port_range = cfg.exposed_port..cfg.exposed_port + 10;
 
             match runtime
                 .start_container(
                     &container_name,
                     &cfg.image,
                     cfg.target_port,
-                    port_range,
                     cfg.memory_limit.clone(),
                     cfg.cpu_limit.clone(),
                 )

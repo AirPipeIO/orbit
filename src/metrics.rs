@@ -9,9 +9,6 @@ use prometheus::{
 };
 use rustc_hash::FxHashMap;
 use std::{error::Error, sync::OnceLock, time::Duration};
-
-use crate::{container::INSTANCE_STORE, status::CONTAINER_STATS_CACHE};
-
 use tokio::sync::mpsc;
 
 // Global channel for metrics updates

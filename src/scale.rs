@@ -233,7 +233,6 @@ pub async fn scale_up(
 
     let uuid = uuid::Uuid::new_v4();
     let container_name = format!("{}__{}", service_name, uuid);
-    let port_range = config.exposed_port..config.exposed_port + 10;
 
     // Step 1: Start the container
     let exposed_port = runtime
@@ -241,7 +240,6 @@ pub async fn scale_up(
             &container_name,
             &config.image,
             config.target_port,
-            port_range,
             config.memory_limit.clone(),
             config.cpu_limit.clone(),
         )

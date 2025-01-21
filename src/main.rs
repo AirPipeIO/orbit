@@ -10,7 +10,9 @@ use anyhow::Result;
 use axum::{routing::get, Router};
 use clap::Parser;
 use config::CONFIG_STORE;
-use container::{create_runtime, CONTAINER_STATS, INSTANCE_STORE, RUNTIME, SCALING_TASKS};
+use container::{
+    create_runtime, CONTAINER_STATS, INSTANCE_STORE, PORT_RANGE, RUNTIME, SCALING_TASKS,
+};
 use dashmap::DashMap;
 use logger::setup_logger;
 use metrics::MetricsUpdate;
@@ -35,6 +37,22 @@ pub struct Args {
         help = "Log Levels: info, debug, warning, error, trace, critical"
     )]
     log_level: String,
+
+    /// Minimum port number for dynamic port allocation
+    #[arg(
+        long,
+        default_value = "32768",
+        help = "Minimum port number for dynamic port allocation"
+    )]
+    port_min: u16,
+
+    /// Maximum port number for dynamic port allocation
+    #[arg(
+        long,
+        default_value = "61000",
+        help = "Maximum port number for dynamic port allocation"
+    )]
+    port_max: u16,
 }
 
 #[tokio::main]
@@ -48,6 +66,11 @@ async fn main() -> Result<()> {
 
     // Parse command line arguments
     let args = Args::parse();
+
+    // Initialize port range
+    PORT_RANGE
+        .set(args.port_min..args.port_max)
+        .expect("Failed to set port range");
 
     setup_logger(args.log_level);
     let log = slog_scope::logger();

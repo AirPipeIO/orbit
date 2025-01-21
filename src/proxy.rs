@@ -16,8 +16,6 @@ use pingora::upstreams::peer::HttpPeer;
 use pingora_http::ResponseHeader;
 use pingora_load_balancing::health_check;
 use std::collections::{BTreeSet, HashMap};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
@@ -66,7 +64,7 @@ impl ProxyHttp for ProxyApp {
 
     async fn response_filter(
         &self,
-        session: &mut Session,
+        _session: &mut Session,
         response: &mut ResponseHeader,
         ctx: &mut Instant,
     ) -> pingora::Result<()> {

@@ -5,8 +5,8 @@ memory_limit: 100M
 target_port: 80                 # Port the container's HTTP service listens on internally.
 exposed_port: 4333              # The port used by Pingora for external load-balanced traffic.
 resource_thresholds:
-  cpu_percentage: 80
-  cpu_percentage_relative: 20            # Threshold for CPU utilisation percentage.
+  cpu_percentage: 80            # Threshold for CPU percent
+  # cpu_percentage_relative: 20   # Threshold for CPU perc relative to the cpu_limit
   memory_percentage: 10         # Threshold for memory utilisation percentage.
 instance_count:
   min: 1                    # Number of instances to spawn at start.
