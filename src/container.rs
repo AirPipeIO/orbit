@@ -324,6 +324,92 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
     let instance_store = INSTANCE_STORE.get().unwrap();
     let runtime = RUNTIME.get().expect("Runtime not initialised").clone();
 
+    slog::debug!(log, "Entering manage function";
+        "service" => service_name);
+
+    // Use try_entry to avoid deadlocks
+    let mut instances = match instance_store.try_entry(service_name.to_string()) {
+        Some(entry) => {
+            slog::debug!(log, "Acquired instance store entry";
+                "service" => service_name);
+            entry.or_default()
+        }
+        None => {
+            slog::warn!(log, "Failed to acquire lock for instance store";
+                "service" => service_name);
+            return;
+        }
+    };
+
+    slog::debug!(log, "Calculating instance counts";
+        "service" => service_name,
+        "current_instances" => instances.len(),
+        "target_instances" => config.instance_count.min);
+
+    let cfg = config.clone();
+    let current_instances = instances.len();
+    let target_instances = cfg.instance_count.min as usize;
+
+    // Scale up logic
+    if current_instances < target_instances {
+        slog::debug!(log, "Starting scale up";
+            "service" => service_name,
+            "current" => current_instances.clone(),
+            "target" => target_instances);
+
+        for _ in current_instances..target_instances {
+            let uuid = uuid::Uuid::new_v4();
+            let container_name = format!("{}__{}", service_name, uuid);
+
+            slog::debug!(log, "Starting new container";
+                "service" => service_name,
+                "container" => &container_name);
+
+            match runtime
+                .start_container(
+                    &container_name,
+                    &cfg.image,
+                    cfg.target_port,
+                    cfg.memory_limit.clone(),
+                    cfg.cpu_limit.clone(),
+                )
+                .await
+            {
+                Ok(exposed_port) => {
+                    slog::debug!(log, "Container started successfully";
+                        "service" => service_name,
+                        "container" => &container_name,
+                        "port" => exposed_port.clone());
+
+                    instances.insert(
+                        uuid,
+                        InstanceMetadata {
+                            uuid,
+                            exposed_port,
+                            status: "running".to_string(),
+                        },
+                    );
+                    tokio::task::yield_now().await;
+                }
+                Err(e) => {
+                    slog::error!(log, "Failed to start container";
+                        "service" => service_name,
+                        "error" => e.to_string()
+                    );
+                }
+            }
+        }
+    }
+
+    slog::debug!(log, "Completed instance management";
+        "service" => service_name);
+}
+
+pub async fn manage_old(service_name: &str, config: ServiceConfig) {
+    let log = slog_scope::logger();
+    let instance_store = INSTANCE_STORE.get().unwrap();
+    let runtime = RUNTIME.get().expect("Runtime not initialised").clone();
+
     // Use try_entry to avoid deadlocks
     let mut instances = match instance_store.try_entry(service_name.to_string()) {
         Some(entry) => entry.or_default(),
@@ -572,15 +658,17 @@ pub async fn update_container_stats(
         nano_cpus,
     );
 
-    // Update stats store with minimal lock time
-    stats_store.insert(
-        container_name.to_string(),
-        StatsEntry {
-            timestamp: now,
-            cpu_total_usage: cpu_total,
-            system_cpu_usage: system_cpu,
-        },
-    );
+    // Prepare data outside locks
+    let stats_entry = StatsEntry {
+        timestamp: now,
+        cpu_total_usage: cpu_total,
+        system_cpu_usage: system_cpu,
+    };
+
+    // Minimal lock time for update
+    if let Some(stats_store) = CONTAINER_STATS.get() {
+        stats_store.insert(container_name.to_string(), stats_entry);
+    }
 
     let container_stats = ContainerStats {
         id: stats.id.clone(),
@@ -610,12 +698,6 @@ pub async fn update_container_stats(
             .collect(),
             active_connections: 0,
         };
-
-        // let _ = metrics::send_metrics_update(MetricsUpdate::ServiceStats(
-        //     service_name.to_string(),
-        //     stats,
-        // ))
-        // .await;
     }
 
     container_stats

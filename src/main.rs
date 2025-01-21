@@ -9,7 +9,7 @@ pub mod status;
 use anyhow::Result;
 use axum::{routing::get, Router};
 use clap::Parser;
-use config::CONFIG_STORE;
+use config::{CONFIG_STORE, SERVICE_CONFIGS};
 use container::{
     create_runtime, CONTAINER_STATS, INSTANCE_STORE, PORT_RANGE, RUNTIME, SCALING_TASKS,
 };
@@ -59,6 +59,8 @@ pub struct Args {
 async fn main() -> Result<()> {
     // Initialize the global stores
     CONFIG_STORE.get_or_init(DashMap::new);
+    SERVICE_CONFIGS.get_or_init(DashMap::new);
+
     INSTANCE_STORE.get_or_init(DashMap::new);
     SCALING_TASKS.get_or_init(DashMap::new);
     CONTAINER_STATS.get_or_init(|| DashMap::new());

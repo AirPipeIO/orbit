@@ -19,7 +19,15 @@ use crate::{
     scale::auto_scale,
 };
 
-pub static CONFIG_UPDATES: OnceLock<mpsc::Sender<(String, ServiceConfig)>> = OnceLock::new();
+#[derive(Clone)]
+pub enum ScaleMessage {
+    ConfigUpdate, // Added version number
+    Resume,       // Resume with version to ensure matching
+}
+// Change CONFIG_UPDATES to use ScaleMessage
+pub static CONFIG_UPDATES: OnceLock<mpsc::Sender<(String, ScaleMessage)>> = OnceLock::new();
+
+pub static SERVICE_CONFIGS: OnceLock<DashMap<String, ServiceConfig>> = OnceLock::new();
 
 // Global configuration store
 pub static CONFIG_STORE: OnceLock<DashMap<String, ServiceConfig>> = OnceLock::new();
@@ -122,15 +130,14 @@ async fn process_event(event: DebouncedEvent) {
                             // Insert or update the configuration
                             config_store.insert(path.display().to_string(), config.clone());
 
-                            // Send config update to running task
-                            if let Some(sender) = CONFIG_UPDATES.get() {
-                                let _ = sender.send((service_name.clone(), config.clone())).await;
+                            // Handle the config update
+                            if let Err(e) = handle_config_update(service_name, config.clone()).await
+                            {
+                                slog::error!(log, "Failed to handle config update";
+                                    "service" => service_name,
+                                    "error" => e.to_string()
+                                );
                             }
-
-                            // Handle containers for this configuration
-                            manage(service_name, config.clone()).await;
-                            proxy::run_proxy_for_service(service_name.to_string(), config.clone())
-                                .await;
                         }
                         Err(e) => {
                             slog::error!(log, "config issue";
@@ -162,10 +169,22 @@ async fn process_event(event: DebouncedEvent) {
 }
 
 pub async fn read_yaml_config(path: &PathBuf) -> Result<ServiceConfig> {
+    let log = slog_scope::logger();
+
     let path_str = path.to_str().unwrap();
     if path_str.ends_with(".yml") || path_str.ends_with(".yaml") {
         let contents = tokio::fs::read_to_string(path).await?;
         let config: ServiceConfig = serde_yaml::from_str(&contents)?;
+
+        // Debug log the parsed thresholds
+        if let Some(thresholds) = &config.resource_thresholds {
+            slog::debug!(log, "Parsed config thresholds";
+                    "service" => &config.name,
+                    "cpu_percentage" => thresholds.cpu_percentage,
+                    "cpu_relative" => thresholds.cpu_percentage_relative,
+                    "memory_percentage" => thresholds.memory_percentage);
+        }
+
         return Ok(config);
     }
 
@@ -387,25 +406,40 @@ pub fn parse_cpu_limit(cpu_limit: &serde_json::Value) -> Result<u64> {
     }
 }
 
-// use bollard::{container::Config, secret::HostConfig};
+pub async fn handle_config_update(service_name: &str, config: ServiceConfig) -> Result<()> {
+    let log = slog_scope::logger();
+    let service_configs = SERVICE_CONFIGS.get().unwrap();
 
-// fn to_bollard_config(service_config: &ServiceConfig) -> Config<String> {
-//     let memory_limit = service_config
-//         .memory_limit
-//         .as_deref()
-//         .and_then(parse_memory_limit);
-//     let cpu_limit = service_config
-//         .cpu_limit
-//         .as_deref()
-//         .and_then(parse_cpu_limit);
+    slog::debug!(log, "Starting config update process";
+        "service" => service_name);
 
-//     Config {
-//         image: Some(service_config.image.clone()),
-//         host_config: Some(HostConfig {
-//             memory: memory_limit,
-//             nano_cpus: cpu_limit,
-//             ..Default::default()
-//         }),
-//         ..Default::default()
-//     }
-// }
+    // Send pause signal
+    if let Some(sender) = CONFIG_UPDATES.get() {
+        sender
+            .send((service_name.to_string(), ScaleMessage::ConfigUpdate))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to send config update: {}", e))?;
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Update central config store
+    service_configs.insert(service_name.to_string(), config.clone());
+
+    // Handle containers and proxy
+    manage(service_name, config.clone()).await;
+    proxy::run_proxy_for_service(service_name.to_string(), config.clone()).await;
+
+    // Send resume signal
+    if let Some(sender) = CONFIG_UPDATES.get() {
+        sender
+            .send((service_name.to_string(), ScaleMessage::Resume))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to send resume signal: {}", e))?;
+    }
+
+    slog::debug!(log, "Completed config update process";
+        "service" => service_name);
+
+    Ok(())
+}

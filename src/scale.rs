@@ -6,207 +6,261 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
-    config::{ServiceConfig, CONFIG_UPDATES},
+    config::{ScaleMessage, ServiceConfig, CONFIG_UPDATES, SERVICE_CONFIGS},
     container::{ContainerRuntime, InstanceMetadata, INSTANCE_STORE, RUNTIME},
     proxy::{run_proxy_for_service, SERVER_BACKENDS},
 };
 
 pub async fn auto_scale(service_name: String, initial_config: ServiceConfig) {
     let log = slog_scope::logger();
-
-    // Add initial delay to allow containers to stabilize
-    tokio::time::sleep(Duration::from_secs(30)).await;
-
     let instance_store = INSTANCE_STORE.get().unwrap();
     let runtime = RUNTIME.get().unwrap().clone();
+    let service_configs = SERVICE_CONFIGS.get().unwrap();
 
     // Channel for config updates
     let (tx, mut rx) = mpsc::channel(100);
     CONFIG_UPDATES.get_or_init(|| tx);
 
-    let mut current_config = initial_config;
+    // Initialize the service config
+    service_configs.insert(service_name.clone(), initial_config.clone());
+    let mut scaling_paused = false;
     let service_name = Arc::new(service_name);
 
     loop {
-        // Process resource thresholds only once per iteration
-        let instances = match instance_store.get(&*service_name) {
-            Some(entry) => entry.value().clone(),
-            None => {
-                slog::debug!(log, "Service removed, stopping auto_scale"; 
+        // Only perform scaling operations if not paused
+        if !scaling_paused {
+            // Get latest config from shared store
+            let current_config = if let Some(cfg) = service_configs.get(service_name.as_str()) {
+                cfg.value().clone()
+            } else {
+                slog::error!(log, "Service config not found, stopping auto_scale";
                     "service" => service_name.as_str());
                 break;
-            }
-        };
-
-        // Collect stats for all instances
-        let mut instance_stats = Vec::new();
-        let mut missing_containers = Vec::new();
-
-        // Process containers in a single batch
-        for (&uuid, metadata) in &instances {
-            let container_name = format!("{}__{}", service_name, uuid);
-            match runtime.inspect_container(&container_name).await {
-                Ok(stats) => {
-                    instance_stats.push((uuid, metadata.clone(), stats));
+            };
+            // Process resource thresholds only once per iteration
+            let instances = match instance_store.get(&*service_name) {
+                Some(entry) => entry.value().clone(),
+                None => {
+                    slog::debug!(log, "Service removed, stopping auto_scale"; 
+                        "service" => service_name.as_str());
+                    break;
                 }
-                Err(e) => {
-                    if e.to_string().contains("404") || e.to_string().contains("No such container")
-                    {
-                        missing_containers.push((uuid, metadata.clone()));
+            };
+
+            // Collect stats for all instances
+            let mut instance_stats = Vec::new();
+            let mut missing_containers = Vec::new();
+
+            // Process containers in a single batch
+            for (&uuid, metadata) in &instances {
+                let container_name = format!("{}__{}", service_name, uuid);
+                match runtime.inspect_container(&container_name).await {
+                    Ok(stats) => {
+                        instance_stats.push((uuid, metadata.clone(), stats));
+                    }
+                    Err(e) => {
+                        if e.to_string().contains("404")
+                            || e.to_string().contains("No such container")
+                        {
+                            missing_containers.push((uuid, metadata.clone()));
+                        }
                     }
                 }
             }
-        }
 
-        let should_scale = if let Some(thresholds) = &current_config.resource_thresholds {
-            // Count how many instances exceed thresholds
-            let mut instances_exceeding = 0;
-            let mut total_instances = 0;
+            slog::debug!(log, "Completed collecting instance stats";
+    "service" => service_name.as_str(),
+    "stats_count" => instance_stats.len());
 
-            for (_, _, stats) in &instance_stats {
-                total_instances += 1;
-                let memory_percentage = if stats.memory_limit > 0 {
-                    (stats.memory_usage as f64 / stats.memory_limit as f64 * 100.0)
+            let should_scale = if let Some(thresholds) = &current_config.resource_thresholds {
+                slog::debug!(log, "Starting threshold evaluation";
+        "service" => service_name.as_str(),
+        "config_address" => format!("{:p}", &current_config),
+        "threshold_address" => format!("{:p}", thresholds),
+        "cpu_relative" => thresholds.cpu_percentage_relative);
+
+                // Count how many instances exceed thresholds
+                let mut instances_exceeding = 0;
+                let mut total_instances = 0;
+
+                for (_, _, stats) in &instance_stats {
+                    total_instances += 1;
+                    let memory_percentage = if stats.memory_limit > 0 {
+                        (stats.memory_usage as f64 / stats.memory_limit as f64 * 100.0)
+                    } else {
+                        0.0
+                    };
+
+                    let cpu_exceeded = thresholds
+                        .cpu_percentage
+                        .map(|threshold| {
+                            stats.cpu_percentage >= 5.0 && stats.cpu_percentage > threshold as f64
+                        })
+                        .unwrap_or(false);
+
+                    // let cpu_relative_exceeded = thresholds
+                    //     .cpu_percentage_relative
+                    //     .map(|threshold| {
+                    //         stats.cpu_percentage_relative >= 5.0
+                    //             && stats.cpu_percentage_relative > threshold as f64
+                    //     })
+                    //     .unwrap_or(false);
+
+                    let cpu_relative_exceeded = match thresholds.cpu_percentage_relative {
+                        Some(threshold) => {
+                            stats.cpu_percentage_relative >= 5.0
+                                && stats.cpu_percentage_relative > threshold as f64
+                        }
+                        None => false,
+                    };
+
+                    // Log the actual check
+                    slog::debug!(log, "Individual threshold check";
+                        "service" => service_name.as_str(),
+                        "cpu_relative_exists" => thresholds.cpu_percentage_relative.is_some(),
+                        "cpu_relative_value" => stats.cpu_percentage_relative,
+                        "exceeded" => cpu_relative_exceeded);
+
+                    let memory_exceeded = thresholds
+                        .memory_percentage
+                        .map(|threshold| {
+                            memory_percentage > threshold as f64 && memory_percentage >= 5.0
+                        })
+                        .unwrap_or(false);
+
+                    // Log metrics for each container
+                    // slog::info!(log, "Container metrics";
+                    //     "service" => service_name.as_str(),
+                    //     "container_id" => &stats.id,
+                    //     "cpu_percentage" => stats.cpu_percentage,
+                    //     "cpu_percentage_relative" => stats.cpu_percentage_relative,
+                    //     "memory_percentage" => memory_percentage,
+                    //     "memory_usage_mb" => stats.memory_usage as f64 / 1024.0 / 1024.0,
+                    //     "memory_limit_mb" => stats.memory_limit as f64 / 1024.0 / 1024.0,
+                    //     "thresholds_exceeded" => format!("cpu={} cpu_rel={} mem={}",
+                    //         cpu_exceeded,
+                    //         cpu_relative_exceeded,
+                    //         memory_exceeded
+                    //     )
+                    // );
+
+                    if cpu_exceeded || cpu_relative_exceeded || memory_exceeded {
+                        instances_exceeding += 1;
+                    }
+                }
+
+                // Calculate the percentage of instances that are exceeding thresholds
+                let percentage_exceeding = if total_instances > 0 {
+                    (instances_exceeding as f64 / total_instances as f64) * 100.0
                 } else {
                     0.0
                 };
 
-                let cpu_exceeded = thresholds
-                    .cpu_percentage
-                    .map(|threshold| {
-                        stats.cpu_percentage >= 5.0 && stats.cpu_percentage > threshold as f64
-                    })
-                    .unwrap_or(false);
+                // Scale if at least 75% of instances are exceeding thresholds
+                let should_scale = percentage_exceeding >= 75.0;
 
-                let cpu_relative_exceeded = thresholds
-                    .cpu_percentage_relative
-                    .map(|threshold| {
-                        stats.cpu_percentage_relative >= 5.0
-                            && stats.cpu_percentage_relative > threshold as f64
-                    })
-                    .unwrap_or(false);
-
-                let memory_exceeded = thresholds
-                    .memory_percentage
-                    .map(|threshold| {
-                        memory_percentage > threshold as f64 && memory_percentage >= 5.0
-                    })
-                    .unwrap_or(false);
-
-                // Log metrics for each container
-                slog::info!(log, "Container metrics";
-                    "service" => service_name.as_str(),
-                    "container_id" => &stats.id,
-                    "cpu_percentage" => stats.cpu_percentage,
-                    "cpu_percentage_relative" => stats.cpu_percentage_relative,
-                    "memory_percentage" => memory_percentage,
-                    "memory_usage_mb" => stats.memory_usage as f64 / 1024.0 / 1024.0,
-                    "memory_limit_mb" => stats.memory_limit as f64 / 1024.0 / 1024.0,
-                    "thresholds_exceeded" => format!("cpu={} cpu_rel={} mem={}",
-                        cpu_exceeded,
-                        cpu_relative_exceeded,
-                        memory_exceeded
-                    )
-                );
-
-                if cpu_exceeded || cpu_relative_exceeded || memory_exceeded {
-                    instances_exceeding += 1;
+                if should_scale {
+                    slog::info!(log, "High load detected across instances";
+                        "service" => service_name.as_str(),
+                        "instances_exceeding" => instances_exceeding.to_string(),
+                        "total_instances" => total_instances.to_string(),
+                        "percentage_exceeding" => percentage_exceeding.to_string()
+                    );
                 }
-            }
 
-            // Calculate the percentage of instances that are exceeding thresholds
-            let percentage_exceeding = if total_instances > 0 {
-                (instances_exceeding as f64 / total_instances as f64) * 100.0
+                should_scale
             } else {
-                0.0
+                false
             };
 
-            // Scale if at least 75% of instances are exceeding thresholds
-            let should_scale = percentage_exceeding >= 75.0;
+            slog::debug!(log, "Completed threshold check";
+    "service" => service_name.as_str(),
+    "should_scale" => should_scale);
 
-            if should_scale {
-                slog::info!(log, "High load detected across instances";
-                    "service" => service_name.as_str(),
-                    "instances_exceeding" => instances_exceeding.to_string(),
-                    "total_instances" => total_instances.to_string(),
-                    "percentage_exceeding" => percentage_exceeding.to_string()
-                );
-            }
-
-            should_scale
-        } else {
-            false
-        };
-
-        // Scale up if needed
-        if ((current_config.resource_thresholds.is_some() && should_scale)
-            && instances.len() < current_config.instance_count.max as usize)
-            || (instances.len() < current_config.instance_count.min as usize)
-        {
-            slog::debug!(log, "Scaling up service";
-                "service" => service_name.as_str(),
-                "current_instances" => instances.len(),
-                // "instances_exceeding" => instances_exceeding.to_string()
-            );
-
-            if let Err(e) = scale_up(&service_name, current_config.clone(), runtime.clone()).await {
-                slog::error!(log, "Failed to scale up service";
-                    "service" => service_name.as_str(),
-                    "error" => e.to_string()
-                );
-            }
-
-            // Update proxy configuration after scale up
-            run_proxy_for_service(service_name.to_string(), current_config.clone()).await;
-        }
-        // Scale down if needed
-        else if (current_config.resource_thresholds.is_none() || !should_scale)
-            && instances.len() > current_config.instance_count.min as usize
-        {
-            if let Some((uuid, _, _)) =
-                instance_stats
-                    .iter()
-                    .min_by(|(_, _, stats_a), (_, _, stats_b)| {
-                        stats_a
-                            .cpu_percentage
-                            .partial_cmp(&stats_b.cpu_percentage)
-                            .unwrap()
-                    })
+            // Scale up if needed
+            if ((current_config.resource_thresholds.is_some() && should_scale)
+                && instances.len() < current_config.instance_count.max as usize)
+                || (instances.len() < current_config.instance_count.min as usize)
             {
-                slog::debug!(log, "Scaling down service";
+                slog::debug!(log, "Scaling up service";
                     "service" => service_name.as_str(),
-                    "current_instances" => instances.len()
+                    "current_instances" => instances.len(),
+                    // "instances_exceeding" => instances_exceeding.to_string()
                 );
 
-                if let Err(e) = scale_down(
-                    &service_name,
-                    *uuid,
-                    current_config.clone(),
-                    runtime.clone(),
-                )
-                .await
+                if let Err(e) =
+                    scale_up(&service_name, current_config.clone(), runtime.clone()).await
                 {
-                    slog::error!(log, "Failed to scale down service";
+                    slog::error!(log, "Failed to scale up service";
                         "service" => service_name.as_str(),
                         "error" => e.to_string()
                     );
                 }
 
-                // Update proxy configuration after scale down
+                // Update proxy configuration after scale up
                 run_proxy_for_service(service_name.to_string(), current_config.clone()).await;
+            }
+            // Scale down if needed
+            else if (current_config.resource_thresholds.is_none() || !should_scale)
+                && instances.len() > current_config.instance_count.min as usize
+            {
+                if let Some((uuid, _, _)) =
+                    instance_stats
+                        .iter()
+                        .min_by(|(_, _, stats_a), (_, _, stats_b)| {
+                            stats_a
+                                .cpu_percentage
+                                .partial_cmp(&stats_b.cpu_percentage)
+                                .unwrap()
+                        })
+                {
+                    slog::debug!(log, "Scaling down service";
+                        "service" => service_name.as_str(),
+                        "current_instances" => instances.len()
+                    );
+
+                    if let Err(e) = scale_down(
+                        &service_name,
+                        *uuid,
+                        current_config.clone(),
+                        runtime.clone(),
+                    )
+                    .await
+                    {
+                        slog::error!(log, "Failed to scale down service";
+                            "service" => service_name.as_str(),
+                            "error" => e.to_string()
+                        );
+                    }
+
+                    // Update proxy configuration after scale down
+                    run_proxy_for_service(service_name.to_string(), current_config.clone()).await;
+                }
             }
         }
 
-        // Sleep with timeout or process config update
+        // Update message handling to be simpler
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(current_config.interval_seconds.unwrap_or(30))) => {},
-            Some((name, new_config)) = rx.recv() => {
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                if scaling_paused {
+                    slog::debug!(log, "Scaling is paused, skipping iteration";
+                        "service" => service_name.as_str());
+                }
+            },
+            Some((name, message)) = rx.recv() => {
                 if name == *service_name {
-                    current_config = new_config;
-                    slog::debug!(log, "Updated configuration";
-                        "service" => service_name.as_str(),
-                        "new_interval" => current_config.interval_seconds.unwrap_or(30)
-                    );
+                    match message {
+                        ScaleMessage::ConfigUpdate => {
+                            scaling_paused = true;
+                            slog::debug!(log, "Scaling paused for config update";
+                                "service" => service_name.as_str());
+                        },
+                        ScaleMessage::Resume => {
+                            scaling_paused = false;
+                            slog::debug!(log, "Scaling resumed";
+                                "service" => service_name.as_str());
+                        }
+                    }
                 }
             }
         }
