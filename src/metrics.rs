@@ -17,17 +17,6 @@ use tokio::sync::mpsc;
 // Global channel for metrics updates
 pub static METRICS_SENDER: OnceLock<mpsc::Sender<MetricsUpdate>> = OnceLock::new();
 
-// Enum to represent different types of metrics updates
-#[derive(Debug)]
-pub enum MetricsUpdate {
-    ServiceStats(String, ServiceStats),
-    TotalServices(usize),
-    TotalInstances(usize),
-    ConfigReload,
-    Request(String, u16),              // service_name, status_code
-    RequestDuration(String, u16, f64), // service_name, status_code, duration
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct ServiceStats {
     pub instance_count: usize,
@@ -35,6 +24,13 @@ pub struct ServiceStats {
     pub memory_usage: FxHashMap<String, u64>,
     pub active_connections: i64,
 }
+
+// Global metrics
+
+// Per-service metrics
+pub static SERVICE_CPU_USAGE: OnceLock<GaugeVec> = OnceLock::new();
+pub static SERVICE_MEMORY_USAGE: OnceLock<GaugeVec> = OnceLock::new();
+pub static SERVICE_ACTIVE_CONNECTIONS: OnceLock<IntGaugeVec> = OnceLock::new();
 
 // Global registry
 pub static REGISTRY: OnceLock<Registry> = OnceLock::new();
@@ -45,13 +41,21 @@ pub static TOTAL_SERVICES: OnceLock<IntGauge> = OnceLock::new();
 pub static TOTAL_INSTANCES: OnceLock<IntGauge> = OnceLock::new();
 pub static CONFIG_RELOADS: OnceLock<Counter> = OnceLock::new();
 
-// Per-service metrics
+// Service-level metrics (no container-specific labels)
 pub static SERVICE_INSTANCES: OnceLock<IntGaugeVec> = OnceLock::new();
-pub static SERVICE_CPU_USAGE: OnceLock<GaugeVec> = OnceLock::new();
-pub static SERVICE_MEMORY_USAGE: OnceLock<GaugeVec> = OnceLock::new();
 pub static SERVICE_REQUEST_DURATION: OnceLock<HistogramVec> = OnceLock::new();
-pub static SERVICE_ACTIVE_CONNECTIONS: OnceLock<IntGaugeVec> = OnceLock::new();
 pub static SERVICE_REQUEST_TOTAL: OnceLock<CounterVec> = OnceLock::new();
+
+// Enum to represent different types of metrics updates
+#[derive(Debug)]
+pub enum MetricsUpdate {
+    TotalServices(usize),
+    TotalInstances(usize),
+    ConfigReload,
+    ServiceInstances(String, usize),   // service_name, instance_count
+    Request(String, u16),              // service_name, status_code
+    RequestDuration(String, u16, f64), // service_name, status_code, duration
+}
 
 pub fn initialize_metrics() -> Result<(), Box<dyn Error>> {
     let registry = Registry::new();
@@ -83,33 +87,13 @@ pub fn initialize_metrics() -> Result<(), Box<dyn Error>> {
     registry.register(Box::new(config_reloads.clone()))?;
     CONFIG_RELOADS.set(config_reloads).unwrap();
 
-    // Initialize per-service metrics
+    // Initialize service-level metrics
     let service_instances = IntGaugeVec::new(
         Opts::new("orbit_service_instances", "Number of instances per service"),
         &["service"],
     )?;
     registry.register(Box::new(service_instances.clone()))?;
     SERVICE_INSTANCES.set(service_instances).unwrap();
-
-    let service_cpu_usage = GaugeVec::new(
-        Opts::new(
-            "orbit_service_cpu_usage_percent",
-            "CPU usage percentage per service instance",
-        ),
-        &["service", "instance"],
-    )?;
-    registry.register(Box::new(service_cpu_usage.clone()))?;
-    SERVICE_CPU_USAGE.set(service_cpu_usage).unwrap();
-
-    let service_memory_usage = GaugeVec::new(
-        Opts::new(
-            "orbit_service_memory_bytes",
-            "Memory usage in bytes per service instance",
-        ),
-        &["service", "instance"],
-    )?;
-    registry.register(Box::new(service_memory_usage.clone()))?;
-    SERVICE_MEMORY_USAGE.set(service_memory_usage).unwrap();
 
     let service_request_duration = HistogramVec::new(
         HistogramOpts::new(
@@ -123,18 +107,6 @@ pub fn initialize_metrics() -> Result<(), Box<dyn Error>> {
         .set(service_request_duration)
         .unwrap();
 
-    let service_active_connections = IntGaugeVec::new(
-        Opts::new(
-            "orbit_service_active_connections",
-            "Number of active connections per service",
-        ),
-        &["service"],
-    )?;
-    registry.register(Box::new(service_active_connections.clone()))?;
-    SERVICE_ACTIVE_CONNECTIONS
-        .set(service_active_connections)
-        .unwrap();
-
     let service_request_total = CounterVec::new(
         Opts::new("orbit_service_requests_total", "Total requests per service"),
         &["service", "status"],
@@ -146,7 +118,7 @@ pub fn initialize_metrics() -> Result<(), Box<dyn Error>> {
     REGISTRY.set(registry).unwrap();
 
     // Create channel for metrics updates
-    let (tx, mut rx) = mpsc::channel(1000); // Buffer size of 1000
+    let (tx, mut rx) = mpsc::channel(1000);
     METRICS_SENDER.set(tx).unwrap();
 
     // Spawn metrics processing task
@@ -159,33 +131,57 @@ pub fn initialize_metrics() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// Update metrics for a service
-pub fn update_service_metrics(service_name: &str, stats: &ServiceStats) {
-    if let Some(instances) = SERVICE_INSTANCES.get() {
-        instances
-            .with_label_values(&[service_name])
-            .set(stats.instance_count as i64);
-    }
-
-    if let Some(cpu_usage) = SERVICE_CPU_USAGE.get() {
-        for (instance_id, cpu) in &stats.cpu_usage {
-            cpu_usage
-                .with_label_values(&[service_name, instance_id])
-                .set(*cpu);
+// Process metrics updates without holding locks
+fn process_metrics_update(update: MetricsUpdate) {
+    match update {
+        MetricsUpdate::TotalServices(count) => {
+            if let Some(total_services) = TOTAL_SERVICES.get() {
+                total_services.set(count as i64);
+            }
         }
-    }
-
-    if let Some(memory_usage) = SERVICE_MEMORY_USAGE.get() {
-        for (instance_id, mem) in &stats.memory_usage {
-            memory_usage
-                .with_label_values(&[service_name, instance_id])
-                .set(*mem as f64);
+        MetricsUpdate::TotalInstances(count) => {
+            if let Some(total_instances) = TOTAL_INSTANCES.get() {
+                total_instances.set(count as i64);
+            }
+        }
+        MetricsUpdate::ConfigReload => {
+            if let Some(config_reloads) = CONFIG_RELOADS.get() {
+                config_reloads.inc();
+            }
+        }
+        MetricsUpdate::ServiceInstances(service_name, count) => {
+            if let Some(instances) = SERVICE_INSTANCES.get() {
+                instances
+                    .with_label_values(&[&service_name])
+                    .set(count as i64);
+            }
+        }
+        MetricsUpdate::Request(service_name, status_code) => {
+            if let Some(requests) = SERVICE_REQUEST_TOTAL.get() {
+                requests
+                    .with_label_values(&[&service_name, &status_code.to_string()])
+                    .inc();
+            }
+        }
+        MetricsUpdate::RequestDuration(service_name, status_code, duration) => {
+            if let Some(durations) = SERVICE_REQUEST_DURATION.get() {
+                durations
+                    .with_label_values(&[&service_name, &status_code.to_string()])
+                    .observe(duration);
+            }
         }
     }
 }
 
+// Helper function to send metrics updates
+pub async fn send_metrics_update(update: MetricsUpdate) {
+    if let Some(sender) = METRICS_SENDER.get() {
+        let _ = sender.send(update).await;
+    }
+}
+
 // Handler for metrics endpoint with timeout
-pub async fn metrics_handler() -> axum::response::Response {
+pub async fn metrics_handler() -> Response {
     use tokio::time::timeout;
 
     match timeout(Duration::from_secs(5), collect_metrics()).await {
@@ -200,7 +196,7 @@ pub async fn metrics_handler() -> axum::response::Response {
 }
 
 // Collect metrics without holding locks
-async fn collect_metrics() -> axum::response::Response {
+async fn collect_metrics() -> Response {
     if let Some(registry) = REGISTRY.get() {
         let encoder = prometheus::TextEncoder::new();
         let mut buffer = Vec::new();
@@ -234,70 +230,5 @@ async fn collect_metrics() -> axum::response::Response {
             "Metrics registry not initialized".to_string(),
         )
             .into_response()
-    }
-}
-
-// Process metrics updates without holding locks
-fn process_metrics_update(update: MetricsUpdate) {
-    match update {
-        MetricsUpdate::ServiceStats(service_name, stats) => {
-            if let Some(instances) = SERVICE_INSTANCES.get() {
-                instances
-                    .with_label_values(&[&service_name])
-                    .set(stats.instance_count as i64);
-            }
-
-            if let Some(cpu_usage) = SERVICE_CPU_USAGE.get() {
-                for (instance_id, cpu) in &stats.cpu_usage {
-                    cpu_usage
-                        .with_label_values(&[&service_name, instance_id])
-                        .set(*cpu);
-                }
-            }
-
-            if let Some(memory_usage) = SERVICE_MEMORY_USAGE.get() {
-                for (instance_id, mem) in &stats.memory_usage {
-                    memory_usage
-                        .with_label_values(&[&service_name, instance_id])
-                        .set(*mem as f64);
-                }
-            }
-        }
-        MetricsUpdate::TotalServices(count) => {
-            if let Some(total_services) = TOTAL_SERVICES.get() {
-                total_services.set(count as i64);
-            }
-        }
-        MetricsUpdate::TotalInstances(count) => {
-            if let Some(total_instances) = TOTAL_INSTANCES.get() {
-                total_instances.set(count as i64);
-            }
-        }
-        MetricsUpdate::ConfigReload => {
-            if let Some(config_reloads) = CONFIG_RELOADS.get() {
-                config_reloads.inc();
-            }
-        }
-        MetricsUpdate::Request(service_name, status_code) => {
-            if let Some(requests) = SERVICE_REQUEST_TOTAL.get() {
-                requests
-                    .with_label_values(&[&service_name, &status_code.to_string()])
-                    .inc();
-            }
-        }
-        MetricsUpdate::RequestDuration(service_name, status_code, duration) => {
-            if let Some(durations) = SERVICE_REQUEST_DURATION.get() {
-                durations
-                    .with_label_values(&[&service_name, &status_code.to_string()])
-                    .observe(duration);
-            }
-        }
-    }
-}
-
-// Helper function to send metrics updates
-pub async fn send_metrics_update(update: MetricsUpdate) {
-    if let Some(sender) = METRICS_SENDER.get() {
-        let _ = sender.send(update).await;
     }
 }

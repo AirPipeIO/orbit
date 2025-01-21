@@ -609,11 +609,11 @@ pub async fn update_container_stats(
             active_connections: 0,
         };
 
-        let _ = metrics::send_metrics_update(MetricsUpdate::ServiceStats(
-            service_name.to_string(),
-            stats,
-        ))
-        .await;
+        // let _ = metrics::send_metrics_update(MetricsUpdate::ServiceStats(
+        //     service_name.to_string(),
+        //     stats,
+        // ))
+        // .await;
     }
 
     container_stats

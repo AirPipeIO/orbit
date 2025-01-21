@@ -58,10 +58,13 @@ pub async fn auto_scale(service_name: String, initial_config: ServiceConfig) {
             }
         }
 
-        // Process thresholds once
-        let instances_exceeding = if let Some(thresholds) = &current_config.resource_thresholds {
-            let mut exceeded_count = 0;
+        let should_scale = if let Some(thresholds) = &current_config.resource_thresholds {
+            // Count how many instances exceed thresholds
+            let mut instances_exceeding = 0;
+            let mut total_instances = 0;
+
             for (_, _, stats) in &instance_stats {
+                total_instances += 1;
                 let memory_percentage = if stats.memory_limit > 0 {
                     (stats.memory_usage as f64 / stats.memory_limit as f64 * 100.0)
                 } else {
@@ -90,53 +93,60 @@ pub async fn auto_scale(service_name: String, initial_config: ServiceConfig) {
                     })
                     .unwrap_or(false);
 
+                // Log metrics for each container
                 slog::info!(log, "Container metrics";
-                "service" => service_name.as_str(),
-                "container_id" => &stats.id,
-                "cpu_percentage" => stats.cpu_percentage,
-                "cpu_percentage_relative" => stats.cpu_percentage_relative,
-                "memory_percentage" => memory_percentage,
-                "memory_usage_mb" => stats.memory_usage as f64 / 1024.0 / 1024.0,
-                "memory_limit_mb" => stats.memory_limit as f64 / 1024.0 / 1024.0,
-                "thresholds_exceeded" => format!("cpu={} cpu_rel={} mem={}",
-                    cpu_exceeded,
-                    cpu_relative_exceeded,
-                    memory_exceeded
-                ));
+                    "service" => service_name.as_str(),
+                    "container_id" => &stats.id,
+                    "cpu_percentage" => stats.cpu_percentage,
+                    "cpu_percentage_relative" => stats.cpu_percentage_relative,
+                    "memory_percentage" => memory_percentage,
+                    "memory_usage_mb" => stats.memory_usage as f64 / 1024.0 / 1024.0,
+                    "memory_limit_mb" => stats.memory_limit as f64 / 1024.0 / 1024.0,
+                    "thresholds_exceeded" => format!("cpu={} cpu_rel={} mem={}",
+                        cpu_exceeded,
+                        cpu_relative_exceeded,
+                        memory_exceeded
+                    )
+                );
 
                 if cpu_exceeded || cpu_relative_exceeded || memory_exceeded {
-                    exceeded_count += 1;
-                    slog::info!(log, "Container metrics";
-                        "service" => service_name.as_str(),
-                        "container_id" => &stats.id,
-                        "cpu_percentage" => stats.cpu_percentage,
-                        "cpu_percentage_relative" => stats.cpu_percentage_relative,
-                        "memory_percentage" => memory_percentage,
-                        "memory_usage_mb" => stats.memory_usage as f64 / 1024.0 / 1024.0,
-                        "memory_limit_mb" => stats.memory_limit as f64 / 1024.0 / 1024.0,
-                        "thresholds_exceeded" => format!("cpu={} cpu_rel={} mem={}",
-                            cpu_exceeded,
-                            cpu_relative_exceeded,
-                            memory_exceeded
-                        )
-                    );
+                    instances_exceeding += 1;
                 }
             }
 
-            exceeded_count
+            // Calculate the percentage of instances that are exceeding thresholds
+            let percentage_exceeding = if total_instances > 0 {
+                (instances_exceeding as f64 / total_instances as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            // Scale if at least 75% of instances are exceeding thresholds
+            let should_scale = percentage_exceeding >= 75.0;
+
+            if should_scale {
+                slog::info!(log, "High load detected across instances";
+                    "service" => service_name.as_str(),
+                    "instances_exceeding" => instances_exceeding.to_string(),
+                    "total_instances" => total_instances.to_string(),
+                    "percentage_exceeding" => percentage_exceeding.to_string()
+                );
+            }
+
+            should_scale
         } else {
-            0
+            false
         };
 
         // Scale up if needed
-        if ((current_config.resource_thresholds.is_some() && instances_exceeding > 0)
+        if ((current_config.resource_thresholds.is_some() && should_scale)
             && instances.len() < current_config.instance_count.max as usize)
             || (instances.len() < current_config.instance_count.min as usize)
         {
             slog::debug!(log, "Scaling up service";
                 "service" => service_name.as_str(),
                 "current_instances" => instances.len(),
-                "instances_exceeding" => instances_exceeding.to_string()
+                // "instances_exceeding" => instances_exceeding.to_string()
             );
 
             if let Err(e) = scale_up(&service_name, current_config.clone(), runtime.clone()).await {
@@ -150,7 +160,7 @@ pub async fn auto_scale(service_name: String, initial_config: ServiceConfig) {
             run_proxy_for_service(service_name.to_string(), current_config.clone()).await;
         }
         // Scale down if needed
-        else if (current_config.resource_thresholds.is_none() || instances_exceeding == 0)
+        else if (current_config.resource_thresholds.is_none() || !should_scale)
             && instances.len() > current_config.instance_count.min as usize
         {
             if let Some((uuid, _, _)) =
