@@ -242,7 +242,6 @@ impl ContainerRuntime for DockerRuntime {
         let stats = stats?;
 
         let service_name = name.splitn(2, "__").next().unwrap_or("");
-        let config_store = CONFIG_STORE.get().unwrap();
 
         let service_cfg = get_config_by_service(service_name).unwrap();
 
@@ -678,21 +677,21 @@ pub async fn update_container_stats(
     }
 
     // Send metrics update asynchronously
-    if let Some(service_name) = container_name.split("__").next() {
-        let stats = ServiceStats {
-            instance_count: 1, // This will be aggregated later
-            cpu_usage: [(container_name.to_string(), cpu_percentage)]
-                .into_iter()
-                .collect(),
-            memory_usage: [(
-                container_name.to_string(),
-                stats.memory_stats.usage.unwrap_or(0),
-            )]
-            .into_iter()
-            .collect(),
-            active_connections: 0,
-        };
-    }
+    // if let Some(service_name) = container_name.split("__").next() {
+    //     let stats = ServiceStats {
+    //         instance_count: 1, // This will be aggregated later
+    //         cpu_usage: [(container_name.to_string(), cpu_percentage)]
+    //             .into_iter()
+    //             .collect(),
+    //         memory_usage: [(
+    //             container_name.to_string(),
+    //             stats.memory_stats.usage.unwrap_or(0),
+    //         )]
+    //         .into_iter()
+    //         .collect(),
+    //         active_connections: 0,
+    //     };
+    // }
 
     container_stats
 }

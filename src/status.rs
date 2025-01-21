@@ -6,8 +6,8 @@ use std::{
 };
 
 use crate::{
-    config::{get_config_by_service, CONFIG_STORE},
-    container::{ContainerStats, InstanceMetadata, CONTAINER_STATS, INSTANCE_STORE},
+    config::get_config_by_service,
+    container::{ContainerStats, InstanceMetadata, INSTANCE_STORE},
     proxy::SERVER_BACKENDS,
 };
 use anyhow::Result;
@@ -47,11 +47,7 @@ pub fn update_instance_store_cache() {
     let instance_store = INSTANCE_STORE
         .get()
         .expect("Instance store not initialised");
-    let container_stats = CONTAINER_STATS
-        .get()
-        .expect("Container stats not initialised");
     let instance_cache = INSTANCE_STORE_CACHE.get_or_init(|| Arc::new(DashMap::new()));
-    let stats_cache = CONTAINER_STATS_CACHE.get_or_init(|| Arc::new(DashMap::new()));
 
     // Update instance cache
     instance_cache.clear();
@@ -102,7 +98,6 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
     let instance_cache = INSTANCE_STORE_CACHE
         .get()
         .expect("Instance cache not initialized");
-    let config_store = CONFIG_STORE.get().expect("Config store not initialized");
     let server_backends = SERVER_BACKENDS
         .get()
         .expect("Server backends not initialized");

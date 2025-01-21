@@ -11,7 +11,7 @@ use crate::{
     proxy::{run_proxy_for_service, SERVER_BACKENDS},
 };
 
-pub async fn auto_scale(service_name: String, initial_config: ServiceConfig) {
+pub async fn auto_scale(service_name: String) {
     let log = slog_scope::logger();
     let instance_store = INSTANCE_STORE.get().unwrap();
     let runtime = RUNTIME.get().unwrap().clone();

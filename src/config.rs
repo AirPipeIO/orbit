@@ -62,8 +62,6 @@ pub struct ServiceConfig {
     pub interval_seconds: Option<u64>,
 }
 
-use std::collections::HashMap;
-
 pub static CONFIG_STORE: OnceLock<DashMap<String, (PathBuf, ServiceConfig)>> = OnceLock::new();
 
 // Helper functions to access configs
@@ -225,10 +223,9 @@ pub async fn initialize_configs(config_dir: &PathBuf) -> Result<()> {
 
                     // Start auto-scaling task
                     let service_name = config.name.clone();
-                    let config_clone = config.clone();
 
                     let handle = tokio::spawn(async move {
-                        auto_scale(service_name.clone(), config_clone).await;
+                        auto_scale(service_name.clone()).await;
                     });
 
                     // Store the task handle
