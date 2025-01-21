@@ -53,13 +53,23 @@ impl ProxyHttp for ProxyApp {
         _session: &mut Session,
         _ctx: &mut Instant,
     ) -> pingora::Result<Box<HttpPeer>> {
-        let upstream = self.loadbalancer.select(b"", 256).unwrap();
-
-        Ok(Box::new(HttpPeer::new(
-            upstream,
-            false,
-            "host.name".to_string(),
-        )))
+        match self.loadbalancer.select(b"", 256) {
+            Some(upstream) => Ok(Box::new(HttpPeer::new(
+                upstream,
+                false,
+                "host.name".to_string(),
+            ))),
+            None => {
+                let error = pingora::Error {
+                    etype: pingora::ErrorType::CustomCode("no_upstream", 503),
+                    esource: pingora::ErrorSource::Unset,
+                    retry: pingora::RetryType::Decided(false),
+                    cause: None,
+                    context: Some(pingora::ImmutStr::Static("No upstream available")),
+                };
+                Err(Box::new(error))
+            }
+        }
     }
 
     async fn response_filter(

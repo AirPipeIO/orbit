@@ -238,7 +238,10 @@ impl ContainerRuntime for DockerRuntime {
 
         let stats = stats?;
 
-        let service_name = name.splitn(2, "__").next().unwrap_or("");
+        let service_name = name
+            .splitn(2, "__")
+            .next()
+            .expect("Split always returns at least one element");
 
         let service_cfg = get_config_by_service(service_name).unwrap();
 

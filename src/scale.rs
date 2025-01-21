@@ -203,7 +203,7 @@ pub async fn auto_scale(service_name: String) {
 
                 // Calculate the percentage of instances that are exceeding thresholds
                 let percentage_exceeding = if total_instances > 0 {
-                    (instances_exceeding as f64 / total_instances as f64) * 100.0
+                    (f64::from(instances_exceeding) / f64::from(total_instances)) * 100.0
                 } else {
                     0.0
                 };

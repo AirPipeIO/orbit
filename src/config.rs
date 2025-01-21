@@ -393,6 +393,9 @@ pub fn parse_cpu_limit(cpu_limit: &serde_json::Value) -> Result<u64> {
     match cpu_limit {
         serde_json::Value::Number(num) => {
             let value = num.as_f64().ok_or_else(|| anyhow!("Invalid CPU number"))?;
+            if value <= 0.0 || value > ((u64::MAX as f64) / 1_000_000_000.0) {
+                return Err(anyhow!("CPU limit out of valid range"));
+            }
             Ok((value * 1_000_000_000.0) as u64)
         }
         serde_json::Value::String(s) => {

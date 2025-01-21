@@ -16,6 +16,7 @@ use container::{
 use dashmap::DashMap;
 use logger::setup_logger;
 use metrics::MetricsUpdate;
+use proxy::{SERVER_BACKENDS, SERVER_TASKS};
 use status::CONTAINER_STATS_CACHE;
 use std::{path::PathBuf, process, sync::Arc, time::Duration};
 
@@ -63,6 +64,8 @@ async fn main() -> Result<()> {
     SCALING_TASKS.get_or_init(DashMap::new);
     CONTAINER_STATS.get_or_init(|| DashMap::new());
     CONTAINER_STATS_CACHE.get_or_init(|| Arc::new(DashMap::new()));
+    SERVER_TASKS.get_or_init(DashMap::new);
+    SERVER_BACKENDS.get_or_init(DashMap::new);
 
     // Parse command line arguments
     let args = Args::parse();
