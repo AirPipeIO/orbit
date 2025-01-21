@@ -410,7 +410,8 @@ pub async fn handle_config_update(service_name: &str, config: ServiceConfig) -> 
     let log = slog_scope::logger();
 
     slog::debug!(log, "Starting config update process";
-        "service" => service_name);
+        "service" => service_name,
+        "thresholds" => format!("{:?}", config.resource_thresholds)); // Add logging for thresholds
 
     // Send pause signal
     if let Some(sender) = CONFIG_UPDATES.get() {
@@ -420,7 +421,18 @@ pub async fn handle_config_update(service_name: &str, config: ServiceConfig) -> 
             .map_err(|e| anyhow::anyhow!("Failed to send config update: {}", e))?;
     }
 
+    // Add a small delay to ensure scaling tasks receive the pause signal
     tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Update config in store
+    if let Some(config_store) = CONFIG_STORE.get() {
+        for mut entry in config_store.iter_mut() {
+            if entry.value().1.name == service_name {
+                entry.value_mut().1 = config.clone();
+                break;
+            }
+        }
+    }
 
     // Handle containers and proxy
     manage(service_name, config.clone()).await;

@@ -18,7 +18,7 @@ use dashmap::DashMap;
 use logger::setup_logger;
 use metrics::MetricsUpdate;
 use proxy::{SERVER_BACKENDS, SERVER_TASKS};
-use std::{path::PathBuf, process, sync::Arc, time::Duration};
+use std::{path::PathBuf, process, time::Duration};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]

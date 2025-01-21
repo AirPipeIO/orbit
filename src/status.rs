@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     config::get_config_by_service,
-    container::{self, ContainerStats, InstanceMetadata, INSTANCE_STORE},
+    container::{self, InstanceMetadata, INSTANCE_STORE},
     proxy::SERVER_BACKENDS,
 };
 use anyhow::Result;
