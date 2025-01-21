@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
-    config::{ScaleMessage, ServiceConfig, CONFIG_UPDATES, SERVICE_CONFIGS},
+    config::{get_config_by_service, ScaleMessage, ServiceConfig, CONFIG_UPDATES},
     container::{ContainerRuntime, InstanceMetadata, INSTANCE_STORE, RUNTIME},
     proxy::{run_proxy_for_service, SERVER_BACKENDS},
 };
@@ -15,14 +15,12 @@ pub async fn auto_scale(service_name: String, initial_config: ServiceConfig) {
     let log = slog_scope::logger();
     let instance_store = INSTANCE_STORE.get().unwrap();
     let runtime = RUNTIME.get().unwrap().clone();
-    let service_configs = SERVICE_CONFIGS.get().unwrap();
 
     // Channel for config updates
     let (tx, mut rx) = mpsc::channel(100);
     CONFIG_UPDATES.get_or_init(|| tx);
 
     // Initialize the service config
-    service_configs.insert(service_name.clone(), initial_config.clone());
     let mut scaling_paused = false;
     let service_name = Arc::new(service_name);
 
@@ -30,12 +28,13 @@ pub async fn auto_scale(service_name: String, initial_config: ServiceConfig) {
         // Only perform scaling operations if not paused
         if !scaling_paused {
             // Get latest config from shared store
-            let current_config = if let Some(cfg) = service_configs.get(service_name.as_str()) {
-                cfg.value().clone()
-            } else {
-                slog::error!(log, "Service config not found, stopping auto_scale";
-                    "service" => service_name.as_str());
-                break;
+            let current_config = match get_config_by_service(&service_name) {
+                Some(cfg) => cfg,
+                None => {
+                    slog::error!(log, "Service config not found, stopping auto_scale";
+                        "service" => service_name.as_str());
+                    break;
+                }
             };
             // Process resource thresholds only once per iteration
             let instances = match instance_store.get(&*service_name) {
@@ -241,7 +240,7 @@ pub async fn auto_scale(service_name: String, initial_config: ServiceConfig) {
 
         // Update message handling to be simpler
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {
                 if scaling_paused {
                     slog::debug!(log, "Scaling is paused, skipping iteration";
                         "service" => service_name.as_str());

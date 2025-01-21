@@ -20,7 +20,9 @@ use std::time::SystemTime;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::config::{parse_cpu_limit, parse_memory_limit, ServiceConfig, CONFIG_STORE};
+use crate::config::{
+    get_config_by_service, parse_cpu_limit, parse_memory_limit, ServiceConfig, CONFIG_STORE,
+};
 use crate::metrics::ServiceStats;
 use crate::proxy::SERVER_BACKENDS;
 use crate::status::update_instance_store_cache;
@@ -241,16 +243,8 @@ impl ContainerRuntime for DockerRuntime {
 
         let service_name = name.splitn(2, "__").next().unwrap_or("");
         let config_store = CONFIG_STORE.get().unwrap();
-        let config_file = config_store.iter().find_map(|entry| {
-            let service_config = entry.value();
-            if service_config.name == service_name {
-                Some(entry.key().clone())
-            } else {
-                None
-            }
-        });
 
-        let service_cfg = config_store.get(&config_file.unwrap()).unwrap();
+        let service_cfg = get_config_by_service(service_name).unwrap();
 
         let nano_cpus = service_cfg
             .cpu_limit

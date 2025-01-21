@@ -6,12 +6,12 @@ use std::{
 };
 
 use crate::{
-    config::{ServiceConfig, CONFIG_STORE},
+    config::{get_config_by_service, CONFIG_STORE},
     container::{ContainerStats, InstanceMetadata, CONTAINER_STATS, INSTANCE_STORE},
     proxy::SERVER_BACKENDS,
 };
 use anyhow::Result;
-use axum::{routing::get, Json, Router};
+use axum::Json;
 use dashmap::DashMap;
 use serde::Serialize;
 use tokio::time::timeout;
@@ -116,10 +116,7 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
         let service_name = entry.key();
         let instances = entry.value();
 
-        let service_config = config_store
-            .iter()
-            .find(|cfg_entry| cfg_entry.value().name == *service_name)
-            .map(|cfg_entry| cfg_entry.value().clone());
+        let service_config = get_config_by_service(service_name);
 
         if let Some(config) = service_config {
             let containers: Vec<ContainerInfo> = instances

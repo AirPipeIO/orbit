@@ -27,11 +27,6 @@ pub enum ScaleMessage {
 // Change CONFIG_UPDATES to use ScaleMessage
 pub static CONFIG_UPDATES: OnceLock<mpsc::Sender<(String, ScaleMessage)>> = OnceLock::new();
 
-pub static SERVICE_CONFIGS: OnceLock<DashMap<String, ServiceConfig>> = OnceLock::new();
-
-// Global configuration store
-pub static CONFIG_STORE: OnceLock<DashMap<String, ServiceConfig>> = OnceLock::new();
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PortRange {
     pub start: u16,
@@ -65,6 +60,29 @@ pub struct ServiceConfig {
     pub instance_count: InstanceCount,
     pub adopt_orphans: bool,
     pub interval_seconds: Option<u64>,
+}
+
+use std::collections::HashMap;
+
+pub static CONFIG_STORE: OnceLock<DashMap<String, (PathBuf, ServiceConfig)>> = OnceLock::new();
+
+// Helper functions to access configs
+pub fn get_config_by_path(path: &str) -> Option<ServiceConfig> {
+    CONFIG_STORE
+        .get()
+        .and_then(|store| store.get(path).map(|entry| entry.value().1.clone()))
+}
+
+pub fn get_config_by_service(service_name: &str) -> Option<ServiceConfig> {
+    CONFIG_STORE.get().and_then(|store| {
+        store.iter().find_map(|entry| {
+            if entry.value().1.name == service_name {
+                Some(entry.value().1.clone())
+            } else {
+                None
+            }
+        })
+    })
 }
 
 pub async fn watch_directory(config_dir: PathBuf) -> notify::Result<()> {
@@ -113,26 +131,18 @@ async fn process_event(event: DebouncedEvent) {
         match event.kind {
             EventKind::Create(_) | EventKind::Modify(_) => {
                 if path.exists() && path.is_file() {
-                    slog::debug!(log, "config update"; "file" => path.to_str());
-
                     match read_yaml_config(path).await {
                         Ok(config) => {
-                            let service_name = &config.name;
+                            let service_name = config.name.clone();
+                            update_reserved_ports(&service_name, config.exposed_port);
 
-                            slog::debug!(log, "Updated config file";
-                                "service" => service_name,
-                                "path" => path.display().to_string()
+                            // Store both path and config
+                            config_store.insert(
+                                path.display().to_string(),
+                                (path.to_path_buf(), config.clone()),
                             );
 
-                            // Reserve the port
-                            update_reserved_ports(service_name, config.exposed_port);
-
-                            // Insert or update the configuration
-                            config_store.insert(path.display().to_string(), config.clone());
-
-                            // Handle the config update
-                            if let Err(e) = handle_config_update(service_name, config.clone()).await
-                            {
+                            if let Err(e) = handle_config_update(&service_name, config).await {
                                 slog::error!(log, "Failed to handle config update";
                                     "service" => service_name,
                                     "error" => e.to_string()
@@ -146,22 +156,13 @@ async fn process_event(event: DebouncedEvent) {
                             );
                         }
                     }
-                } else {
-                    // Clean up containers for this removed config
-                    if let Some((_, config)) = config_store.remove(&path.display().to_string()) {
-                        remove_reserved_ports(&config.name);
-                        clean_up(&config.name).await;
-                    }
-                    slog::debug!(log, "config deleted"; "file" => path.to_str());
                 }
             }
             EventKind::Remove(_) => {
-                // Clean up containers for this removed config
-                if let Some((_, config)) = config_store.remove(&path.display().to_string()) {
+                if let Some((_, (_, config))) = config_store.remove(&path.display().to_string()) {
                     remove_reserved_ports(&config.name);
                     clean_up(&config.name).await;
                 }
-                slog::debug!(log, "config deleted"; "file" => path.to_str());
             }
             _ => {}
         }
@@ -215,8 +216,7 @@ pub async fn initialize_configs(config_dir: &PathBuf) -> Result<()> {
                     // Reserve the port
                     reserved_ports.insert(config.exposed_port, config.name.clone());
 
-                    config_store.insert(path.display().to_string(), config.clone());
-
+                    config_store.insert(path.display().to_string(), (path.clone(), config.clone()));
                     // Handle orphaned containers based on the adopt_orphans flag
                     handle_orphans(&config).await?;
 
@@ -408,7 +408,6 @@ pub fn parse_cpu_limit(cpu_limit: &serde_json::Value) -> Result<u64> {
 
 pub async fn handle_config_update(service_name: &str, config: ServiceConfig) -> Result<()> {
     let log = slog_scope::logger();
-    let service_configs = SERVICE_CONFIGS.get().unwrap();
 
     slog::debug!(log, "Starting config update process";
         "service" => service_name);
@@ -422,9 +421,6 @@ pub async fn handle_config_update(service_name: &str, config: ServiceConfig) -> 
     }
 
     tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Update central config store
-    service_configs.insert(service_name.to_string(), config.clone());
 
     // Handle containers and proxy
     manage(service_name, config.clone()).await;
