@@ -62,7 +62,60 @@ pub async fn auto_scale(service_name: String) {
                             || e.to_string().contains("No such container")
                         {
                             missing_containers.push((uuid, metadata.clone()));
+
+                            // Remove from load balancer
+                            if let Some(backends) =
+                                SERVER_BACKENDS.get().unwrap().get(&*service_name)
+                            {
+                                let addr = format!("127.0.0.1:{}", metadata.exposed_port);
+                                if let Ok(backend) = Backend::new(&addr) {
+                                    backends.remove(&backend);
+                                    slog::info!(log, "Removed missing container from load balancer";
+                                        "service" => service_name.as_str(),
+                                        "container" => container_name,
+                                        "address" => addr
+                                    );
+                                }
+                            }
                         }
+                    }
+                }
+            }
+
+            // Handle missing containers without holding long-term locks
+            if !missing_containers.is_empty() {
+                // Remove missing containers from instance store
+                use dashmap::try_result::TryResult;
+                if let TryResult::Present(mut instances_entry) =
+                    instance_store.try_get_mut(&*service_name)
+                {
+                    for (uuid, _) in &missing_containers {
+                        instances_entry.remove(uuid);
+                    }
+
+                    // Check if we need to replace containers
+                    let current_count = instances_entry.len();
+                    drop(instances_entry); // Release the lock before scaling
+
+                    if current_count < current_config.instance_count.min as usize {
+                        slog::info!(log, "Replacing terminated containers to maintain minimum count";
+                            "service" => service_name.as_str(),
+                            "current_count" => current_count,
+                            "min_count" => current_config.instance_count.min
+                        );
+
+                        if let Err(e) =
+                            scale_up(&service_name, current_config.clone(), runtime.clone()).await
+                        {
+                            slog::error!(log, "Failed to replace terminated containers";
+                                "service" => service_name.as_str(),
+                                "error" => e.to_string()
+                            );
+                        }
+
+                        // Update proxy configuration after scaling up
+                        run_proxy_for_service(service_name.to_string(), current_config.clone())
+                            .await;
                     }
                 }
             }
