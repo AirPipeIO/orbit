@@ -457,8 +457,11 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
         let mut pod_containers: HashMap<Uuid, Vec<ContainerInfo>> = HashMap::new();
 
         for container in orphaned_containers {
-            if let Ok(uuid) = extract_uuid_from_name(&container.name) {
-                pod_containers.entry(uuid).or_default().push(container);
+            if let Ok(parts) = parse_container_name(&container.name) {
+                pod_containers
+                    .entry(parts.uuid)
+                    .or_default()
+                    .push(container);
             }
         }
 
@@ -567,17 +570,6 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
     }
 
     Ok(())
-}
-
-pub fn extract_uuid_from_name(container_name: &str) -> Result<Uuid> {
-    if let Some(uuid_str) = container_name.split("__").nth(1) {
-        Uuid::parse_str(uuid_str).map_err(|e| anyhow!("Invalid UUID in container name: {}", e))
-    } else {
-        Err(anyhow!(
-            "Container name does not contain UUID: {}",
-            container_name
-        ))
-    }
 }
 
 #[derive(Debug)]

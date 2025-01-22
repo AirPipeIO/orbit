@@ -16,4 +16,4 @@ instance_count:
   min: 1                        # Number of instances to spawn at start.
   max: 10                       # Maximum number of instances allowed.
 interval_seconds: 10
-adopt_orphans: false            # Adopt or destroy orphaned containers
+adopt_orphans: true            # Adopt or destroy orphaned containers

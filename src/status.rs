@@ -32,17 +32,23 @@ pub struct ContainerInfo {
 pub static INSTANCE_STORE_CACHE: OnceLock<Arc<DashMap<String, HashMap<Uuid, InstanceMetadata>>>> =
     OnceLock::new();
 
-pub fn update_instance_store_cache() {
+pub fn update_instance_store_cache() -> Result<()> {
     let instance_store = INSTANCE_STORE
         .get()
         .expect("Instance store not initialised");
-    let instance_cache = INSTANCE_STORE_CACHE.get_or_init(|| Arc::new(DashMap::new()));
 
-    // Update instance cache
-    instance_cache.clear();
+    // Create new DashMap
+    let new_cache = Arc::new(DashMap::new());
+
+    // Fill new cache
     for entry in instance_store.iter() {
-        instance_cache.insert(entry.key().clone(), entry.value().clone());
+        new_cache.insert(entry.key().clone(), entry.value().clone());
     }
+
+    // Replace old cache with new one atomically
+    INSTANCE_STORE_CACHE.get_or_init(|| new_cache);
+
+    Ok(())
 }
 
 pub fn initialize_background_cache_update() {
