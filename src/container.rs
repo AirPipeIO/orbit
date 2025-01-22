@@ -158,6 +158,7 @@ pub async fn update_container_stats(
         cpu_percentage_relative,
         memory_usage: stats.memory_stats.usage.unwrap_or(0),
         memory_limit: stats.memory_stats.limit.unwrap_or(0),
+        port_mappings: HashMap::new(), // Initialize empty, will be populated by inspect_container
         timestamp: now,
     };
 
@@ -168,6 +169,10 @@ pub async fn update_container_stats(
         .update_stats(container_name, container_stats.clone());
 
     container_stats
+}
+
+pub fn find_host_port(stats: &ContainerStats, container_port: u16) -> Option<u16> {
+    stats.port_mappings.get(&container_port).copied()
 }
 
 // Update remove_container_stats to handle service-level cleanup
@@ -278,6 +283,7 @@ pub struct ContainerStats {
     pub cpu_percentage_relative: f64,
     pub memory_usage: u64,
     pub memory_limit: u64,
+    pub port_mappings: HashMap<u16, u16>, // container_port -> host_port
     timestamp: SystemTime,
 }
 
@@ -463,6 +469,34 @@ impl ContainerRuntime for DockerRuntime {
 
         let stats = stats?;
 
+        // Get container inspection data for port mappings
+        let container_data = self.client.inspect_container(name, None).await?;
+
+        // Extract port mappings from container data
+        let mut port_mappings = HashMap::new();
+        if let Some(network_settings) = container_data.network_settings {
+            if let Some(ports) = network_settings.ports {
+                for (container_port_proto, host_bindings) in ports {
+                    if let Some(host_bindings) = host_bindings {
+                        for binding in host_bindings {
+                            if let Some(host_port) = binding.host_port {
+                                // Parse "80/tcp" to get just the port number
+                                if let Some(container_port) = container_port_proto
+                                    .split('/')
+                                    .next()
+                                    .and_then(|p| p.parse::<u16>().ok())
+                                {
+                                    if let Ok(host_port) = host_port.parse::<u16>() {
+                                        port_mappings.insert(container_port, host_port);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let service_name = name
             .splitn(2, "__")
             .next()
@@ -476,8 +510,9 @@ impl ContainerRuntime for DockerRuntime {
             .and_then(|value| parse_cpu_limit(value).ok()); // Parse and handle Result -> Option
 
         // Update stats history and get CPU percentage
-        let container_stats =
+        let mut container_stats =
             update_container_stats(service_name, name, stats.clone(), nano_cpus).await;
+        container_stats.port_mappings = port_mappings;
 
         Ok(container_stats)
     }

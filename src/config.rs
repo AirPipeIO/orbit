@@ -12,9 +12,7 @@ use validator::Validate;
 
 use crate::{
     container::{
-        self, clean_up, manage, remove_container_stats, remove_reserved_ports,
-        update_reserved_ports, ContainerInfo, ContainerMetadata, ContainerPortMetadata,
-        ContainerStats, InstanceMetadata, INSTANCE_STORE, RUNTIME, SCALING_TASKS,
+        self, clean_up, find_host_port, manage, remove_container_stats, remove_reserved_ports, update_reserved_ports, ContainerInfo, ContainerMetadata, ContainerPortMetadata, ContainerStats, InstanceMetadata, INSTANCE_STORE, RUNTIME, SCALING_TASKS
     },
     proxy::{self, SERVER_BACKENDS},
     scale::auto_scale,
@@ -431,6 +429,170 @@ pub async fn initialize_configs(config_dir: &PathBuf) -> Result<()> {
 }
 
 pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
+    let log = slog_scope::logger();
+    let instance_store = INSTANCE_STORE.get().unwrap();
+    let runtime = RUNTIME.get().expect("Runtime not initialised").clone();
+    let service_name = &config.name;
+
+    let orphaned_containers = runtime
+        .list_containers(Some(service_name))
+        .await
+        .map_err(|e| anyhow!("Failed to list containers: {:?}", e))?;
+
+    if orphaned_containers.is_empty() {
+        return Ok(());
+    }
+
+    let orphan_count = orphaned_containers.len();
+    slog::info!(log, "Found orphaned containers";
+        "service" => service_name,
+        "count" => orphan_count
+    );
+
+    if config.adopt_orphans {
+        let mut pod_containers: HashMap<Uuid, Vec<ContainerInfo>> = HashMap::new();
+
+        for container in orphaned_containers {
+            if let Ok(parts) = parse_container_name(&container.name) {
+                pod_containers
+                    .entry(parts.uuid)
+                    .or_default()
+                    .push(container);
+            }
+        }
+
+        let mut instances = instance_store.entry(service_name.to_string()).or_default();
+        let mut adopted_count = 0;
+
+        for (uuid, containers) in &pod_containers {
+            let mut pod_metadata = Vec::new();
+
+            for container in containers {
+                // Parse container name to get service information
+                match parse_container_name(&container.name) {
+                    Ok(parts) => {
+                        // Look up service config
+                        if let Some(config) = get_config_by_service(&parts.service_name) {
+                            // Find the container config that matches this container name
+                            if let Some(container_config) = config
+                                .spec
+                                .containers
+                                .iter()
+                                .find(|c| c.name == parts.container_name)
+                            {
+                                // If we find port configuration, inspect container to get actual port mappings
+                                if let Some(port_configs) = &container_config.ports {
+                                    // Inspect the container to get actual port mappings
+                                    match runtime.inspect_container(&container.name).await {
+                                        Ok(stats) => {
+                                            // Map the configured ports to actual host ports
+                                            let port_metadata: Vec<ContainerPortMetadata> = port_configs
+                                                .iter()
+                                                .filter_map(|p| {
+                                                    // Container port we're looking for
+                                                    let container_port = p.target_port.unwrap_or(p.port);
+                                                    
+                                                    // Find the corresponding host port from container inspection
+                                                    if let Some(host_port) = find_host_port(&stats, container_port) {
+                                                        Some(ContainerPortMetadata {
+                                                            port: host_port, // Use the actual host port
+                                                            node_port: p.node_port.unwrap_or(p.port),
+                                                        })
+                                                    } else {
+                                                        slog::warn!(log, "Could not find host port mapping";
+                                                            "service" => service_name,
+                                                            "container" => &container.name,
+                                                            "container_port" => container_port
+                                                        );
+                                                        None
+                                                    }
+                                                })
+                                                .collect();
+
+                                            if !port_metadata.is_empty() {
+                                                pod_metadata.push(ContainerMetadata {
+                                                    name: container.name.clone(),
+                                                    ports: port_metadata,
+                                                    status: "adopted".to_string(),
+                                                });
+                                                adopted_count += 1;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            slog::error!(log, "Failed to inspect container";
+                                                "service" => service_name,
+                                                "container" => &container.name,
+                                                "error" => e.to_string()
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            slog::warn!(log, "Could not find service config for orphaned container";
+                                "service" => parts.service_name,
+                                "container" => &container.name
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        slog::warn!(log, "Failed to parse container name";
+                            "container" => &container.name,
+                            "error" => e.to_string()
+                        );
+                    }
+                }
+            }
+
+            if !pod_metadata.is_empty() {
+                instances.insert(
+                    *uuid,
+                    InstanceMetadata {
+                        uuid: *uuid,
+                        containers: pod_metadata,
+                    },
+                );
+            }
+        }
+
+        slog::info!(log, "Adopted orphaned containers";
+            "service" => service_name,
+            "adopted_pods" => pod_containers.len().to_string(),
+            "adopted_containers" => adopted_count.to_string()
+        );
+    } else {
+        let mut futures = Vec::new();
+        let containers_to_remove = orphaned_containers.clone();
+
+        for container in containers_to_remove {
+            let runtime = runtime.clone();
+            let container_name = container.name.clone();
+            let service_name = service_name.to_string();
+
+            futures.push(tokio::spawn(async move {
+                if let Err(e) = runtime.stop_container(&container_name).await {
+                    slog::error!(slog_scope::logger(), "Failed to remove orphaned container";
+                        "service" => %service_name,
+                        "container" => %container_name,
+                        "error" => %e
+                    );
+                }
+            }));
+        }
+
+        let _ = tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(futures)).await;
+
+        slog::info!(log, "Removed orphaned containers";
+            "service" => %service_name,
+            "count" => orphan_count
+        );
+    }
+
+    Ok(())
+}
+
+
+pub async fn handle_orphans_old(config: &ServiceConfig) -> Result<()> {
     let log = slog_scope::logger();
     let instance_store = INSTANCE_STORE.get().unwrap();
     let runtime = RUNTIME.get().expect("Runtime not initialised").clone();
