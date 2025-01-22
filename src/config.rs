@@ -14,7 +14,7 @@ use crate::{
     container::{
         self, clean_up, manage, remove_container_stats, remove_reserved_ports,
         update_reserved_ports, ContainerInfo, ContainerMetadata, ContainerPortMetadata,
-        ContainerStats, InstanceMetadata, INSTANCE_STORE, RESERVED_PORTS, RUNTIME, SCALING_TASKS,
+        ContainerStats, InstanceMetadata, INSTANCE_STORE, RUNTIME, SCALING_TASKS,
     },
     proxy::{self, SERVER_BACKENDS},
     scale::auto_scale,
@@ -41,7 +41,7 @@ pub struct InstanceCount {
     pub max: u8,
 }
 
-use crate::container::{Container, ContainerPort};
+use crate::container::Container;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Validate)]
 pub struct ServiceConfig {
@@ -203,12 +203,7 @@ pub async fn watch_directory(config_dir: PathBuf) -> notify::Result<()> {
     Ok(())
 }
 
-// In config.rs, update the process_event function
-
-// In config.rs
-
 async fn process_event(event: DebouncedEvent) {
-    let log: slog::Logger = slog_scope::logger();
     let config_store = CONFIG_STORE.get().unwrap();
     let scaling_tasks = SCALING_TASKS.get().unwrap();
 
@@ -640,7 +635,7 @@ pub async fn stop_service(service_name: &str) {
 
     // Clean up instance store and stop containers
     if let Some((_, instances)) = instance_store.remove(service_name) {
-        for (uuid, metadata) in instances {
+        for (uuid, _metadata) in instances {
             let container_name = format!("{}__{}", service_name, uuid);
             let runtime = RUNTIME.get().unwrap().clone();
 

@@ -47,7 +47,7 @@ pub async fn auto_scale(service_name: String) {
             );
 
             // Only proceed with threshold evaluation if thresholds are configured
-            if let Some(thresholds) = &current_config.resource_thresholds {
+            if let Some(_thresholds) = &current_config.resource_thresholds {
                 // Process resource thresholds only once per iteration
                 let instances = match instance_store.get(&*service_name) {
                     Some(entry) => entry.value().clone(),

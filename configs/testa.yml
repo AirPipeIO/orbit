@@ -10,7 +10,7 @@ cpu_limit: 0.5
 memory_limit: 100M
 resource_thresholds:
   cpu_percentage: 80            # Threshold for CPU percent
-  # cpu_percentage_relative: 20   # Threshold for CPU perc relative to the cpu_limit
+  cpu_percentage_relative: 20   # Threshold for CPU perc relative to the cpu_limit
   memory_percentage: 10         # Threshold for memory utilisation percentage.
 instance_count:
   min: 1                        # Number of instances to spawn at start.

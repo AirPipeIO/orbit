@@ -27,7 +27,6 @@ use crate::status::update_instance_store_cache;
 
 const MAX_SERVICE_NAME_LENGTH: usize = 60; // Common k8s practice
 const MAX_CONTAINER_NAME_LENGTH: usize = 60; // This gives us plenty of room
-const SEPARATOR: &str = "__";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Container {
@@ -646,7 +645,7 @@ pub async fn clean_up(service_name: &str) {
     }
 
     if let Some((_, instances)) = instance_store.remove(service_name) {
-        for (uuid, metadata) in instances {
+        for (_uuid, metadata) in instances {
             // For each container in the pod
             for container in metadata.containers {
                 // Remove from load balancer for each port
