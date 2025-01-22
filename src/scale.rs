@@ -1,13 +1,16 @@
 // scale.rs
 use anyhow::{anyhow, Result};
 use pingora_load_balancing::Backend;
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
-    config::{get_config_by_service, ScaleMessage, ServiceConfig, CONFIG_UPDATES},
-    container::{ContainerRuntime, InstanceMetadata, INSTANCE_STORE, RUNTIME},
+    config::{
+        aggregate_pod_stats, get_config_by_service, parse_container_name, PodMetricsStrategy,
+        ScaleMessage, ServiceConfig, CONFIG_UPDATES,
+    },
+    container::{ContainerMetadata, ContainerRuntime, InstanceMetadata, INSTANCE_STORE, RUNTIME},
     proxy::{run_proxy_for_service, SERVER_BACKENDS},
 };
 
@@ -56,41 +59,66 @@ pub async fn auto_scale(service_name: String) {
                 };
 
                 // Collect stats for all instances
-                let mut instance_stats = Vec::new();
                 let mut missing_containers = Vec::new();
+
+                let mut pod_stats = HashMap::new();
 
                 // Process containers in a single batch
                 for (&uuid, metadata) in &instances {
-                    let container_name = format!("{}__{}", service_name, uuid);
-                    match runtime.inspect_container(&container_name).await {
-                        Ok(stats) => {
-                            instance_stats.push((uuid, metadata.clone(), stats));
-                        }
-                        Err(e) => {
-                            if e.to_string().contains("404")
-                                || e.to_string().contains("No such container")
-                            {
-                                missing_containers.push((uuid, metadata.clone()));
+                    let mut container_stats = Vec::new();
+                    let mut pod_failed = false;
 
-                                // Remove from load balancer
-                                if let Some(backends) =
-                                    SERVER_BACKENDS.get().unwrap().get(&*service_name)
+                    // Collect stats for all containers in the pod
+                    for container in &metadata.containers {
+                        match runtime.inspect_container(&container.name).await {
+                            Ok(stats) => {
+                                container_stats.push((uuid, metadata.clone(), stats));
+                            }
+                            Err(e) => {
+                                if e.to_string().contains("404")
+                                    || e.to_string().contains("No such container")
                                 {
-                                    let addr = format!("127.0.0.1:{}", metadata.exposed_port);
-                                    if let Ok(backend) = Backend::new(&addr) {
-                                        backends.remove(&backend);
-                                        slog::info!(log, "Removed missing container from load balancer";
-                                            "service" => service_name.as_str(),
-                                            "container" => &container_name,
-                                            "address" => addr
-                                        );
-                                    }
-                                }
+                                    pod_failed = true;
+                                    missing_containers.push((uuid, metadata.clone()));
 
-                                // Clean up stats separately after we're done with inspection
-                                // cleanup_container_stats(&container_name);
+                                    // Remove all pod's containers from load balancer
+                                    for container in &metadata.containers {
+                                        for port_info in &container.ports {
+                                            // Get the specific backend set for this node_port
+                                            let proxy_key =
+                                                format!("{}_{}", service_name, port_info.node_port);
+                                            if let Some(backends) =
+                                                SERVER_BACKENDS.get().unwrap().get(&proxy_key)
+                                            {
+                                                let addr = format!("127.0.0.1:{}", port_info.port);
+                                                if let Ok(backend) = Backend::new(&addr) {
+                                                    backends.remove(&backend);
+                                                    slog::debug!(log, "Removed missing container backend";
+                                                        "service" => %service_name,
+                                                        "container" => &container.name,
+                                                        "container_port" => port_info.port,
+                                                        "node_port" => port_info.node_port,
+                                                        "address" => &addr
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    break; // Exit container loop as pod has failed
+                                }
                             }
                         }
+                    }
+
+                    if !pod_failed && !container_stats.is_empty() {
+                        let strategy = &current_config
+                            .resource_thresholds
+                            .as_ref()
+                            .map(|t| &t.metrics_strategy)
+                            .unwrap_or(&PodMetricsStrategy::Maximum);
+
+                        let aggregated_stats = aggregate_pod_stats(&container_stats, strategy);
+                        pod_stats.insert(uuid, aggregated_stats);
                     }
                 }
 
@@ -133,23 +161,18 @@ pub async fn auto_scale(service_name: String) {
                     }
                 }
 
-                slog::debug!(log, "Completed collecting instance stats";
-    "service" => service_name.as_str(),
-    "stats_count" => instance_stats.len());
-
                 let should_scale = if let Some(thresholds) = &current_config.resource_thresholds {
                     slog::debug!(log, "Starting threshold evaluation";
-        "service" => service_name.as_str(),
-        "config_address" => format!("{:p}", &current_config),
-        "threshold_address" => format!("{:p}", thresholds),
-        "cpu_relative" => thresholds.cpu_percentage_relative);
+            "service" => service_name.as_str(),
+            "config_address" => format!("{:p}", &current_config),
+            "threshold_address" => format!("{:p}", thresholds),
+            "cpu_relative" => thresholds.cpu_percentage_relative);
 
-                    // Count how many instances exceed thresholds
-                    let mut instances_exceeding = 0;
-                    let mut total_instances = 0;
+                    // Count how many pods exceed thresholds
+                    let mut pods_exceeding = 0;
+                    let total_pods = pod_stats.len();
 
-                    for (_, _, stats) in &instance_stats {
-                        total_instances += 1;
+                    for (_, stats) in &pod_stats {
                         let memory_percentage = if stats.memory_limit > 0 {
                             (stats.memory_usage as f64 / stats.memory_limit as f64 * 100.0)
                         } else {
@@ -164,14 +187,6 @@ pub async fn auto_scale(service_name: String) {
                             })
                             .unwrap_or(false);
 
-                        // let cpu_relative_exceeded = thresholds
-                        //     .cpu_percentage_relative
-                        //     .map(|threshold| {
-                        //         stats.cpu_percentage_relative >= 5.0
-                        //             && stats.cpu_percentage_relative > threshold as f64
-                        //     })
-                        //     .unwrap_or(false);
-
                         let cpu_relative_exceeded = match thresholds.cpu_percentage_relative {
                             Some(threshold) => {
                                 stats.cpu_percentage_relative >= 5.0
@@ -180,12 +195,11 @@ pub async fn auto_scale(service_name: String) {
                             None => false,
                         };
 
-                        // Log the actual check
-                        slog::debug!(log, "Individual threshold check";
-                        "service" => service_name.as_str(),
-                        "cpu_relative_exists" => thresholds.cpu_percentage_relative.is_some(),
-                        "cpu_relative_value" => stats.cpu_percentage_relative,
-                        "exceeded" => cpu_relative_exceeded);
+                        slog::debug!(log, "Pod threshold check";
+                "service" => service_name.as_str(),
+                "cpu_relative_exists" => thresholds.cpu_percentage_relative.is_some(),
+                "cpu_relative_value" => stats.cpu_percentage_relative,
+                "exceeded" => cpu_relative_exceeded);
 
                         let memory_exceeded = thresholds
                             .memory_percentage
@@ -194,42 +208,25 @@ pub async fn auto_scale(service_name: String) {
                             })
                             .unwrap_or(false);
 
-                        // Log metrics for each container
-                        // slog::info!(log, "Container metrics";
-                        //     "service" => service_name.as_str(),
-                        //     "container_id" => &stats.id,
-                        //     "cpu_percentage" => stats.cpu_percentage,
-                        //     "cpu_percentage_relative" => stats.cpu_percentage_relative,
-                        //     "memory_percentage" => memory_percentage,
-                        //     "memory_usage_mb" => stats.memory_usage as f64 / 1024.0 / 1024.0,
-                        //     "memory_limit_mb" => stats.memory_limit as f64 / 1024.0 / 1024.0,
-                        //     "thresholds_exceeded" => format!("cpu={} cpu_rel={} mem={}",
-                        //         cpu_exceeded,
-                        //         cpu_relative_exceeded,
-                        //         memory_exceeded
-                        //     )
-                        // );
-
                         if cpu_exceeded || cpu_relative_exceeded || memory_exceeded {
-                            instances_exceeding += 1;
+                            pods_exceeding += 1;
                         }
                     }
 
-                    // Calculate the percentage of instances that are exceeding thresholds
-                    let percentage_exceeding = if total_instances > 0 {
-                        (f64::from(instances_exceeding) / f64::from(total_instances)) * 100.0
+                    // Calculate the percentage of pods that are exceeding thresholds
+                    let percentage_exceeding = if total_pods > 0 {
+                        (pods_exceeding as f64 / total_pods as f64) * 100.0
                     } else {
                         0.0
                     };
 
-                    // Scale if at least 75% of instances are exceeding thresholds
                     let should_scale = percentage_exceeding >= 75.0;
 
                     if should_scale {
-                        slog::info!(log, "High load detected across instances";
+                        slog::info!(log, "High load detected across pods";
                             "service" => service_name.as_str(),
-                            "instances_exceeding" => instances_exceeding.to_string(),
-                            "total_instances" => total_instances.to_string(),
+                            "pods_exceeding" => pods_exceeding.to_string(),
+                            "total_pods" => total_pods.to_string(),
                             "percentage_exceeding" => percentage_exceeding.to_string()
                         );
                     }
@@ -270,28 +267,22 @@ pub async fn auto_scale(service_name: String) {
                 else if (current_config.resource_thresholds.is_none() || !should_scale)
                     && instances.len() > current_config.instance_count.min as usize
                 {
-                    if let Some((uuid, _, _)) =
-                        instance_stats
-                            .iter()
-                            .min_by(|(_, _, stats_a), (_, _, stats_b)| {
-                                stats_a
-                                    .cpu_percentage
-                                    .partial_cmp(&stats_b.cpu_percentage)
-                                    .unwrap()
-                            })
+                    if let Some((&uuid, _)) =
+                        pod_stats.iter().min_by(|(_, stats_a), (_, stats_b)| {
+                            stats_a
+                                .cpu_percentage
+                                .partial_cmp(&stats_b.cpu_percentage)
+                                .unwrap()
+                        })
                     {
                         slog::debug!(log, "Scaling down service";
                             "service" => service_name.as_str(),
                             "current_instances" => instances.len()
                         );
 
-                        if let Err(e) = scale_down(
-                            &service_name,
-                            *uuid,
-                            current_config.clone(),
-                            runtime.clone(),
-                        )
-                        .await
+                        if let Err(e) =
+                            scale_down(&service_name, uuid, current_config.clone(), runtime.clone())
+                                .await
                         {
                             slog::error!(log, "Failed to scale down service";
                                 "service" => service_name.as_str(),
@@ -338,6 +329,7 @@ pub async fn auto_scale(service_name: String) {
         }
     }
 }
+
 pub async fn scale_up(
     service_name: &str,
     config: ServiceConfig,
@@ -357,37 +349,51 @@ pub async fn scale_up(
         return Ok(());
     }
 
-    let uuid = uuid::Uuid::new_v4();
-    let container_name = format!("{}__{}", service_name, uuid);
+    let pod_number = current_instances as u8;
 
-    // Step 1: Start the container
-    let exposed_port = runtime
-        .start_container(
-            &container_name,
-            &config.image,
-            config.target_port,
+    // Step 1: Start all containers in the pod
+    let started_containers = runtime
+        .start_containers(
+            service_name,
+            pod_number,
+            &config.spec.containers,
             config.memory_limit.clone(),
             config.cpu_limit.clone(),
         )
         .await?;
 
-    slog::info!(log, "Container started";
+    slog::info!(log, "Pod containers started";
         "service" => service_name,
-        "container" => &container_name,
-        "port" => exposed_port
+        "pod_number" => pod_number,
+        "container_count" => started_containers.len()
     );
 
-    // Step 2: Wait for container to be healthy (implement health check)
-    let healthy = wait_for_container_health(&container_name, runtime.clone()).await;
-
-    if !healthy {
-        slog::error!(log, "Container failed health check, removing";
-            "service" => service_name,
-            "container" => &container_name
-        );
-        let _ = runtime.stop_container(&container_name).await;
-        return Err(anyhow::anyhow!("Container failed health check"));
+    // Step 2: Wait for all containers to be healthy
+    let mut all_healthy = true;
+    for (container_name, _) in &started_containers {
+        if !wait_for_container_health(container_name, runtime.clone()).await {
+            slog::error!(log, "Container failed health check, removing pod";
+                "service" => service_name,
+                "container" => container_name
+            );
+            all_healthy = false;
+            break;
+        }
     }
+
+    if !all_healthy {
+        // Clean up all containers in the pod
+        for (container_name, _) in started_containers {
+            let _ = runtime.stop_container(&container_name).await;
+        }
+        return Err(anyhow::anyhow!(
+            "One or more containers failed health check"
+        ));
+    }
+
+    // Extract UUID from any container name (they all share the same UUID)
+    let container_parts = parse_container_name(&started_containers[0].0)?;
+    let uuid = container_parts.uuid;
 
     // Step 3: Add to instance store
     if let Some(mut instances) = instance_store.get_mut(service_name) {
@@ -395,36 +401,76 @@ pub async fn scale_up(
             uuid,
             InstanceMetadata {
                 uuid,
-                exposed_port,
-                status: "running".to_string(),
+                containers: started_containers
+                    .iter()
+                    .map(|(name, ports)| ContainerMetadata {
+                        name: name.clone(),
+                        ports: ports.clone(),
+                        status: "running".to_string(),
+                    })
+                    .collect(),
             },
         );
     }
 
-    // Step 4: Wait for application readiness
-    let app_ready =
-        check_application_readiness("127.0.0.1", exposed_port, Duration::from_secs(30)).await;
-
-    if !app_ready {
-        slog::error!(log, "Container application failed readiness check, removing";
-            "service" => service_name,
-            "container" => &container_name
-        );
-        // Clean up the unhealthy container
-        let _ = runtime.stop_container(&container_name).await;
-        return Err(anyhow!("Container application failed readiness check"));
+    // Step 4: Wait for application readiness for each container
+    let mut all_ready = true;
+    for (container_name, port_metadata) in &started_containers {
+        for port_info in port_metadata {
+            // Check readiness using the container's actual port
+            if !check_application_readiness("127.0.0.1", port_info.port, Duration::from_secs(30))
+                .await
+            {
+                slog::error!(log, "Container application failed readiness check";
+                    "service" => service_name,
+                    "container" => container_name,
+                    "container_port" => port_info.port,
+                    "node_port" => port_info.node_port
+                );
+                all_ready = false;
+                break;
+            }
+        }
+        if !all_ready {
+            break;
+        }
     }
 
-    // Step 5: Add to load balancer after container is healthy
-    if let Some(backends) = server_backends.get(service_name) {
-        let addr = format!("127.0.0.1:{}", exposed_port);
-        if let Ok(backend) = Backend::new(&addr) {
-            backends.insert(backend);
-            slog::info!(log, "Added backend to load balancer";
-                "service" => service_name,
-                "container" => &container_name,
-                "address" => &addr
-            );
+    if !all_ready {
+        // Clean up all containers in the pod
+        for (container_name, _) in started_containers {
+            let _ = runtime.stop_container(&container_name).await;
+        }
+        return Err(anyhow!(
+            "One or more container applications failed readiness check"
+        ));
+    }
+
+    // Step 5: Add all containers to load balancer after they're healthy
+    for (container_name, port_metadata) in started_containers {
+        for port_info in port_metadata {
+            // Get the specific backend set for this node_port
+            let proxy_key = format!("{}_{}", service_name, port_info.node_port);
+            if let Some(backends) = server_backends.get(&proxy_key) {
+                // Use the container's actual port for the backend
+                let addr = format!("127.0.0.1:{}", port_info.port);
+                if let Ok(backend) = Backend::new(&addr) {
+                    backends.insert(backend);
+                    slog::info!(log, "Added backend to load balancer";
+                        "service" => service_name,
+                        "container" => &container_name,
+                        "container_port" => port_info.port,
+                        "node_port" => port_info.node_port,
+                        "address" => &addr
+                    );
+                }
+            } else {
+                slog::warn!(log, "No backend set found for node_port";
+                    "service" => service_name,
+                    "container" => &container_name,
+                    "node_port" => port_info.node_port
+                );
+            }
         }
     }
 
@@ -451,32 +497,43 @@ pub async fn scale_down(
         return Ok(());
     }
 
-    // Get target instance metadata
+    // Get target pod metadata
     let target_metadata = match instance_data.get(&target_uuid) {
         Some(metadata) => metadata.clone(),
         None => return Ok(()),
     };
 
-    let container_name = format!("{}__{}", service_name, target_uuid);
-    let exposed_port = target_metadata.exposed_port;
-    let addr = format!("127.0.0.1:{}", exposed_port);
-
-    // Step 1: Remove from load balancer first
-    if let Some(backends) = server_backends.get(service_name) {
-        if let Ok(backend) = Backend::new(&addr) {
-            backends.remove(&backend);
-            slog::info!(log, "Removed backend from load balancer";
-                "service" => service_name,
-                "container" => &container_name,
-                "address" => &addr
-            );
+    // Step 1: Remove all pod's containers from load balancer first
+    for container in &target_metadata.containers {
+        for port_info in &container.ports {
+            // Get the specific backend set for this node_port
+            let proxy_key = format!("{}_{}", service_name, port_info.node_port);
+            if let Some(backends) = server_backends.get(&proxy_key) {
+                let addr = format!("127.0.0.1:{}", port_info.port);
+                if let Ok(backend) = Backend::new(&addr) {
+                    backends.remove(&backend);
+                    slog::info!(log, "Removed backend from load balancer";
+                        "service" => service_name,
+                        "container" => &container.name,
+                        "container_port" => port_info.port,
+                        "node_port" => port_info.node_port,
+                        "address" => &addr
+                    );
+                }
+            } else {
+                slog::warn!(log, "No backend set found for node_port during removal";
+                    "service" => service_name,
+                    "container" => &container.name,
+                    "node_port" => port_info.node_port
+                );
+            }
         }
     }
 
     // Step 2: Wait for in-flight requests to complete
     slog::info!(log, "Waiting for in-flight requests";
         "service" => service_name,
-        "container" => &container_name
+        "pod_uuid" => %target_uuid
     );
     tokio::time::sleep(Duration::from_secs(10)).await;
 
@@ -485,19 +542,28 @@ pub async fn scale_down(
         instances.remove(&target_uuid);
     }
 
-    // Step 4: Stop the container
-    if let Err(e) = runtime.stop_container(&container_name).await {
-        slog::error!(log, "Failed to stop container";
+    // Step 4: Stop all containers in the pod
+    for container in &target_metadata.containers {
+        if let Err(e) = runtime.stop_container(&container.name).await {
+            slog::error!(log, "Failed to stop container";
+                "service" => service_name,
+                "container" => &container.name,
+                "error" => e.to_string()
+            );
+            // Continue trying to stop other containers even if one fails
+            continue;
+        }
+
+        slog::info!(log, "Stopped container";
             "service" => service_name,
-            "container" => &container_name,
-            "error" => e.to_string()
+            "container" => &container.name
         );
-        return Err(anyhow::anyhow!("Failed to stop container: {}", e));
     }
 
-    slog::info!(log, "Successfully scaled down container";
+    slog::info!(log, "Successfully scaled down pod";
         "service" => service_name,
-        "container" => &container_name
+        "pod_uuid" => %target_uuid,
+        "container_count" => target_metadata.containers.len()
     );
 
     Ok(())

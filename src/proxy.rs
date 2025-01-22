@@ -11,11 +11,11 @@ use pingora::lb::{Backend, Backends, LoadBalancer};
 use pingora::prelude::RoundRobin;
 use pingora::proxy::{http_proxy_service, ProxyHttp, Session};
 use pingora::server::Server;
-use pingora::services::background::background_service;
+use pingora::services::background::{background_service, GenBackgroundService};
 use pingora::upstreams::peer::HttpPeer;
 use pingora_http::ResponseHeader;
 use pingora_load_balancing::health_check;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
@@ -114,119 +114,302 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
     let server_tasks = SERVER_TASKS.get_or_init(DashMap::new);
     let server_backends = SERVER_BACKENDS.get_or_init(DashMap::new);
 
-    // Check if the server already exists
-    if let Some(backends) = server_backends.get(&service_name) {
-        slog::debug!(
-            log,
-            "Updating backends for existing server: {}",
-            service_name
-        );
+    // Keep track of all node_ports for this service
+    let mut service_ports = HashSet::new();
+    for container in &config.spec.containers {
+        if let Some(ports) = &container.ports {
+            for port_config in ports {
+                if let Some(node_port) = port_config.node_port {
+                    service_ports.insert((node_port, port_config.port));
+                }
+            }
+        }
+    }
 
+    // For each port, ensure we have a proxy running
+    for (node_port, container_port) in service_ports {
+        let proxy_key = format!("{}_{}", service_name, node_port);
+
+        // Check if the server already exists for this port
+        if let Some(backends) = server_backends.get(&proxy_key) {
+            slog::debug!(
+                log,
+                "Updating backends for existing server";
+                "service" => &service_name,
+                "node_port" => node_port,
+                "container_port" => container_port
+            );
+
+            if let Some(instances) = INSTANCE_STORE
+                .get()
+                .expect("Instance store not initialised")
+                .get(&service_name)
+            {
+                // Update backends for this port
+                for (_, metadata) in instances.value().iter() {
+                    for container in &metadata.containers {
+                        for port_info in &container.ports {
+                            // Match the container port (not the node_port) with container_port
+                            if port_info.node_port == node_port {
+                                // Match on node_port instead
+                                let addr = format!("127.0.0.1:{}", port_info.port); // Use random port
+                                let backend =
+                                    Backend::new(&addr).expect("Failed to create backend");
+                                backends.insert(backend);
+                                slog::debug!(log, "Added backend";
+                                    "service" => &service_name,
+                                    "container" => &container.name,
+                                    "container_port" => port_info.port,
+                                    "node_port" => port_info.node_port,
+                                    "address" => &addr
+                                );
+                            }
+                        }
+                    }
+
+                    // Collect valid addresses for this port
+                    let valid_addresses: Vec<_> = instances
+                        .value()
+                        .iter()
+                        .flat_map(|(_, metadata)| {
+                            metadata.containers.iter().flat_map(|container| {
+                                container
+                                    .ports
+                                    .iter()
+                                    .filter(|p| p.node_port == node_port)
+                                    .map(|p| format!("127.0.0.1:{}", p.port))
+                            })
+                        })
+                        .collect();
+
+                    backends.retain(|backend| valid_addresses.contains(&backend.addr.to_string()));
+                }
+            }
+
+            continue; // Skip to next port
+        }
+
+        // Initialize backends store for this service-port combination
+        let backends = Arc::new(DashSet::new());
+        server_backends.insert(proxy_key.clone(), backends.clone());
+
+        // Populate initial backends from instance store
         if let Some(instances) = INSTANCE_STORE
             .get()
             .expect("Instance store not initialised")
             .get(&service_name)
         {
             for (_, metadata) in instances.value().iter() {
-                if metadata.exposed_port > 0 {
-                    let addr = format!("127.0.0.1:{}", metadata.exposed_port);
-                    let backend = Backend::new(&addr).expect("Failed to create backend");
-                    backends.insert(backend);
+                for container in &metadata.containers {
+                    for port_info in &container.ports {
+                        if port_info.node_port == node_port {
+                            // Match on node_port instead
+                            let addr = format!("127.0.0.1:{}", port_info.port); // Use random port
+                            let backend = Backend::new(&addr).expect("Failed to create backend");
+                            backends.insert(backend);
+                        }
+                    }
                 }
-
-                let valid_addresses: Vec<_> = instances
-                    .value()
-                    .iter()
-                    .map(|(_, metadata)| format!("127.0.0.1:{}", metadata.exposed_port))
-                    .collect();
-                backends.retain(|backend| valid_addresses.contains(&backend.addr.to_string()));
             }
         }
 
-        update_instance_store_cache();
+        slog::debug!(
+            log,
+            "Initial upstreams configured";
+            "service" => &service_name,
+            "node_port" => node_port,
+            "container_port" => container_port,
+            "upstreams" => ?backends.iter().map(|b| b.addr.clone()).collect::<Vec<_>>()
+        );
 
-        return;
+        // Create discovery and load balancer
+        let discovery = Discovery(backends.clone());
+        let mut loadbalancer = LoadBalancer::from_backends(Backends::new(Box::new(discovery)));
+        loadbalancer.update_frequency = Some(Duration::from_secs(1));
+
+        let hc = health_check::TcpHealthCheck::new();
+        loadbalancer.set_health_check(hc);
+        loadbalancer.health_check_frequency = Some(Duration::from_secs(1));
+
+        // Create background service for load balancer
+        let bg_service = background_service("lb service", loadbalancer);
+
+        // Configure proxy application
+        let app = ProxyApp {
+            loadbalancer: bg_service.task(),
+            service_name: proxy_key.clone(),
+        };
+
+        let mut router_service = http_proxy_service(&Server::new(None).unwrap().configuration, app);
+        router_service.add_tcp(&format!("0.0.0.0:{}", node_port));
+
+        let mut server = Server::new(None).expect("Failed to initialise Pingora server");
+        server.bootstrap();
+        server.add_service(router_service);
+        server.add_service(bg_service);
+
+        // Run server
+        let handle = task::spawn_blocking(move || {
+            server.run_forever();
+        });
+
+        // Store server task
+        server_tasks.insert(proxy_key.clone(), handle);
+
+        slog::debug!(
+            log,
+            "Proxy running";
+            "service" => &service_name,
+            "node_port" => node_port,
+            "container_port" => container_port
+        );
     }
 
-    // Initialise backends store for this service
-    let backends = Arc::new(DashSet::new());
-    server_backends.insert(service_name.clone(), backends.clone());
-
-    // Populate initial backends from instance store
-    if let Some(instances) = INSTANCE_STORE
-        .get()
-        .expect("Instance store not initialised")
-        .get(&service_name)
-    {
-        for (_, metadata) in instances.value().iter() {
-            if metadata.exposed_port > 0 {
-                let addr = format!("127.0.0.1:{}", metadata.exposed_port);
-                let backend = Backend::new(&addr).expect("Failed to create backend");
-                backends.insert(backend);
-            }
-        }
-    }
-
-    slog::debug!(
-        log,
-        "Initial upstreams for {}: {:?}",
-        service_name,
-        backends.iter().map(|b| b.addr.clone()).collect::<Vec<_>>()
-    );
-
-    // Create discovery and load balancer
-    let discovery = Discovery(backends.clone());
-    let mut loadbalancer = LoadBalancer::from_backends(Backends::new(Box::new(discovery)));
-    loadbalancer.update_frequency = Some(Duration::from_secs(1));
-
-    let hc = health_check::TcpHealthCheck::new();
-    loadbalancer.set_health_check(hc);
-    loadbalancer.health_check_frequency = Some(Duration::from_secs(1));
-
-    // Create background service for load balancer
-    let bg_service = background_service("lb service", loadbalancer);
-
-    // Configure proxy application
-    let app = ProxyApp {
-        loadbalancer: bg_service.task(),
-        service_name: service_name.clone(),
-    };
-
-    let mut router_service = http_proxy_service(&Server::new(None).unwrap().configuration, app);
-    router_service.add_tcp(&format!("0.0.0.0:{}", config.exposed_port));
-
-    let mut server = Server::new(None).expect("Failed to initialise Pingora server");
-    server.bootstrap();
-    server.add_service(router_service);
-    server.add_service(bg_service);
-
-    // Log updates to upstreams periodically
-    // task::spawn({
-    //     let service_name = service_name.clone();
-    //     async move {
-    //         loop {
-    //             sleep(Duration::from_secs(5)).await;
-    //             let upstreams: Vec<_> = backends.iter().map(|b| b.addr.clone()).collect();
-    //             println!("Updated upstreams for {}: {:?}", service_name, upstreams);
-    //         }
-    //     }
-    // });
-
-    // Run server
-    let handle = task::spawn_blocking(move || {
-        server.run_forever();
-        // println!("Server for {} stopped", service_name);
-    });
-
-    // Store server task
-    server_tasks.insert(service_name.clone(), handle);
     // Update the instance store cache
     update_instance_store_cache();
-
-    slog::debug!(
-        log,
-        "Proxy for {} is running on port {}",
-        service_name,
-        config.exposed_port
-    );
 }
+
+// pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) {
+//     let log: slog::Logger = slog_scope::logger();
+//     let server_tasks = SERVER_TASKS.get_or_init(DashMap::new);
+//     let server_backends = SERVER_BACKENDS.get_or_init(DashMap::new);
+
+//     // Keep track of all exposed ports for this service
+//     let mut service_ports = HashSet::new();
+//     for container in &config.spec.containers {
+//         if let Some(ports) = &container.ports {
+//             for port_config in ports {
+//                 service_ports.insert(port_config.port);
+//             }
+//         }
+//     }
+
+//     // For each port, ensure we have a proxy running
+//     for exposed_port in service_ports {
+//         let proxy_key = format!("{}_{}", service_name, exposed_port);
+
+//         // Check if the server already exists for this port
+//         if let Some(backends) = server_backends.get(&proxy_key) {
+//             slog::debug!(
+//                 log,
+//                 "Updating backends for existing server";
+//                 "service" => &service_name,
+//                 "port" => exposed_port
+//             );
+
+//             if let Some(instances) = INSTANCE_STORE
+//                 .get()
+//                 .expect("Instance store not initialised")
+//                 .get(&service_name)
+//             {
+//                 // Update backends for this port
+//                 for (_, metadata) in instances.value().iter() {
+//                     for container in &metadata.containers {
+//                         for &port in &container.ports {
+//                             if port == exposed_port {
+//                                 let addr = format!("127.0.0.1:{}", port);
+//                                 let backend =
+//                                     Backend::new(&addr).expect("Failed to create backend");
+//                                 backends.insert(backend);
+//                             }
+//                         }
+//                     }
+
+//                     // Collect valid addresses for this port
+//                     let valid_addresses: Vec<_> = instances
+//                         .value()
+//                         .iter()
+//                         .flat_map(|(_, metadata)| {
+//                             metadata.containers.iter().flat_map(|container| {
+//                                 container
+//                                     .ports
+//                                     .iter()
+//                                     .filter(|&&p| p == exposed_port)
+//                                     .map(|&p| format!("127.0.0.1:{}", p))
+//                             })
+//                         })
+//                         .collect();
+
+//                     backends.retain(|backend| valid_addresses.contains(&backend.addr.to_string()));
+//                 }
+//             }
+
+//             continue; // Skip to next port
+//         }
+
+//         // Initialize backends store for this service-port combination
+//         let backends = Arc::new(DashSet::new());
+//         server_backends.insert(proxy_key.clone(), backends.clone());
+
+//         // Populate initial backends from instance store
+//         if let Some(instances) = INSTANCE_STORE
+//             .get()
+//             .expect("Instance store not initialised")
+//             .get(&service_name)
+//         {
+//             for (_, metadata) in instances.value().iter() {
+//                 for container in &metadata.containers {
+//                     for &port in &container.ports {
+//                         if port == exposed_port {
+//                             let addr = format!("127.0.0.1:{}", port);
+//                             let backend = Backend::new(&addr).expect("Failed to create backend");
+//                             backends.insert(backend);
+//                         }
+//                     }
+//                 }
+//             }
+//         }
+
+//         slog::debug!(
+//             log,
+//             "Initial upstreams configured";
+//             "service" => &service_name,
+//             "port" => exposed_port,
+//             "upstreams" => ?backends.iter().map(|b| b.addr.clone()).collect::<Vec<_>>()
+//         );
+
+//         // Create discovery and load balancer
+//         let discovery = Discovery(backends.clone());
+//         let mut loadbalancer = LoadBalancer::from_backends(Backends::new(Box::new(discovery)));
+//         loadbalancer.update_frequency = Some(Duration::from_secs(1));
+
+//         let hc = health_check::TcpHealthCheck::new();
+//         loadbalancer.set_health_check(hc);
+//         loadbalancer.health_check_frequency = Some(Duration::from_secs(1));
+
+//         // Create background service for load balancer
+//         let bg_service = background_service("lb service", loadbalancer);
+
+//         // Configure proxy application
+//         let app = ProxyApp {
+//             loadbalancer: bg_service.task(),
+//             service_name: proxy_key.clone(),
+//         };
+
+//         let mut router_service = http_proxy_service(&Server::new(None).unwrap().configuration, app);
+//         router_service.add_tcp(&format!("0.0.0.0:{}", exposed_port));
+
+//         let mut server = Server::new(None).expect("Failed to initialise Pingora server");
+//         server.bootstrap();
+//         server.add_service(router_service);
+//         server.add_service(bg_service);
+
+//         // Run server
+//         let handle = task::spawn_blocking(move || {
+//             server.run_forever();
+//         });
+
+//         // Store server task
+//         server_tasks.insert(proxy_key.clone(), handle);
+
+//         slog::debug!(
+//             log,
+//             "Proxy running";
+//             "service" => &service_name,
+//             "port" => exposed_port
+//         );
+//     }
+
+//     // Update the instance store cache
+//     update_instance_store_cache();
+// }

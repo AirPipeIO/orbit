@@ -17,14 +17,6 @@ use serde::Serialize;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-// status response
-#[derive(Debug, Serialize)]
-pub struct ServiceStatus {
-    service_name: String,
-    service_url: String,
-    containers: Vec<ContainerInfo>,
-}
-
 #[derive(Debug, Serialize)]
 pub struct ContainerInfo {
     uuid: Uuid,
@@ -90,7 +82,37 @@ async fn update_cache_with_timeout() -> Result<()> {
     Ok(())
 }
 
-// Modify the get_status handler to use cached data
+#[derive(Serialize)]
+pub struct ServiceStatus {
+    service_name: String,
+    service_ports: Vec<u16>, // Changed from single service_url to multiple ports
+    pods: Vec<PodStatus>,    // Changed from containers to pods
+}
+
+#[derive(Serialize)]
+pub struct PodStatus {
+    uuid: Uuid,
+    containers: Vec<ContainerStatus>,
+}
+
+#[derive(Serialize)]
+pub struct ContainerStatus {
+    name: String,
+    ports: Vec<PortStatus>,
+    status: String,
+    cpu_percentage: Option<f64>,
+    cpu_percentage_relative: Option<f64>,
+    memory_usage: Option<u64>,
+    memory_limit: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub struct PortStatus {
+    pub port: u16,
+    pub node_port: u16,
+    pub healthy: bool,
+}
+
 pub async fn get_status() -> Json<Vec<ServiceStatus>> {
     let instance_cache = INSTANCE_STORE_CACHE
         .get()
@@ -113,43 +135,89 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
         if let Some(config) = service_config {
             let service_stat = service_stats.get(service_name);
 
-            let containers: Vec<ContainerInfo> = instances
+            // Collect all service ports
+            let service_ports = config
+                .spec
+                .containers
+                .iter()
+                .flat_map(|c| c.ports.iter().flatten())
+                .map(|p| p.port)
+                .collect::<Vec<_>>();
+
+            let pods: Vec<PodStatus> = instances
                 .iter()
                 .map(|(uuid, metadata)| {
-                    let container_name = format!("{}__{}", service_name, uuid);
-                    let container_addr = format!("127.0.0.1:{}", metadata.exposed_port);
+                    let containers = metadata
+                        .containers
+                        .iter()
+                        .map(|container| {
+                            let container_stats = service_stat
+                                .as_ref()
+                                .and_then(|s| s.get_container_stats(&container.name));
 
-                    let backends = server_backends.get(service_name);
-                    let status = if backends.iter().any(|b| {
-                        b.iter()
-                            .any(|backend| backend.addr.to_string() == container_addr)
-                    }) {
-                        "running".to_string()
-                    } else {
-                        "unknown".to_string()
-                    };
+                            let ports = container
+                                .ports
+                                .iter()
+                                .map(|port_info| {
+                                    let container_addr = format!("127.0.0.1:{}", port_info.port);
+                                    let healthy = server_backends.iter().any(|backend_entry| {
+                                        let proxy_key =
+                                            format!("{}_{}", service_name, port_info.node_port);
+                                        backend_entry.key() == &proxy_key
+                                            && backend_entry.value().iter().any(|backend| {
+                                                backend.addr.to_string() == container_addr
+                                            })
+                                    });
 
-                    // Get stats from service-level stats
-                    let stats = service_stat
-                        .as_ref()
-                        .and_then(|s| s.get_container_stats(&container_name));
+                                    PortStatus {
+                                        port: port_info.port,
+                                        node_port: port_info.node_port,
+                                        healthy,
+                                    }
+                                })
+                                .collect();
 
-                    ContainerInfo {
+                            ContainerStatus {
+                                name: container.name.clone(),
+                                ports,
+                                status: if container.ports.iter().any(|port_info| {
+                                    let addr = format!("127.0.0.1:{}", port_info.port);
+                                    let proxy_key =
+                                        format!("{}_{}", service_name, port_info.node_port);
+                                    server_backends
+                                        .get(&proxy_key)
+                                        .map(|backends| {
+                                            backends
+                                                .iter()
+                                                .any(|backend| backend.addr.to_string() == addr)
+                                        })
+                                        .unwrap_or(false)
+                                }) {
+                                    "running".to_string()
+                                } else {
+                                    "unknown".to_string()
+                                },
+                                cpu_percentage: container_stats.as_ref().map(|s| s.cpu_percentage),
+                                cpu_percentage_relative: container_stats
+                                    .as_ref()
+                                    .map(|s| s.cpu_percentage_relative),
+                                memory_usage: container_stats.as_ref().map(|s| s.memory_usage),
+                                memory_limit: container_stats.as_ref().map(|s| s.memory_limit),
+                            }
+                        })
+                        .collect();
+
+                    PodStatus {
                         uuid: *uuid,
-                        exposed_port: metadata.exposed_port,
-                        status,
-                        cpu_percentage: stats.as_ref().map(|s| s.cpu_percentage),
-                        cpu_percentage_relative: stats.as_ref().map(|s| s.cpu_percentage_relative),
-                        memory_usage: stats.as_ref().map(|s| s.memory_usage),
-                        memory_limit: stats.as_ref().map(|s| s.memory_limit),
+                        containers,
                     }
                 })
                 .collect();
 
             services.push(ServiceStatus {
                 service_name: service_name.clone(),
-                service_url: format!("http://0.0.0.0:{}", config.exposed_port),
-                containers,
+                service_ports,
+                pods,
             });
         }
     }

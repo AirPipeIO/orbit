@@ -5,7 +5,7 @@ use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, DebouncedEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{path::PathBuf, sync::OnceLock, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::OnceLock, time::Duration};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 use validator::Validate;
@@ -13,8 +13,8 @@ use validator::Validate;
 use crate::{
     container::{
         self, clean_up, manage, remove_container_stats, remove_reserved_ports,
-        update_reserved_ports, InstanceMetadata, INSTANCE_STORE, RESERVED_PORTS, RUNTIME,
-        SCALING_TASKS,
+        update_reserved_ports, ContainerInfo, ContainerMetadata, ContainerPortMetadata,
+        ContainerStats, InstanceMetadata, INSTANCE_STORE, RESERVED_PORTS, RUNTIME, SCALING_TASKS,
     },
     proxy::{self, SERVER_BACKENDS},
     scale::auto_scale,
@@ -36,32 +36,112 @@ pub struct PortRange {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ResourceThresholds {
-    pub cpu_percentage: Option<u8>,
-    pub cpu_percentage_relative: Option<u8>,
-    pub memory_percentage: Option<u8>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct InstanceCount {
     pub min: u8, // Minimum instances to keep running
     pub max: u8,
 }
 
+use crate::container::{Container, ContainerPort};
+
 #[derive(Debug, Serialize, Deserialize, Clone, Validate)]
 pub struct ServiceConfig {
     #[validate(length(max = 210))]
     pub name: String,
-    pub image: String,
-    pub memory_limit: Option<Value>, // Examples: "512Mi", "1Gi"
-    pub cpu_limit: Option<Value>,    // Examples: "0.5", "1", "2"
-    pub target_port: u16,
-    pub exposed_port: u16,
-    // pub port_range: PortRange,
+    pub spec: ServiceSpec,
+    pub memory_limit: Option<Value>,
+    pub cpu_limit: Option<Value>,
     pub resource_thresholds: Option<ResourceThresholds>,
     pub instance_count: InstanceCount,
     pub adopt_orphans: bool,
     pub interval_seconds: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ServiceSpec {
+    pub containers: Vec<Container>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum PodMetricsStrategy {
+    #[serde(rename = "max")]
+    Maximum,
+    #[serde(rename = "average")]
+    Average,
+}
+
+impl Default for PodMetricsStrategy {
+    fn default() -> Self {
+        Self::Maximum
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ResourceThresholds {
+    pub cpu_percentage: Option<u8>,
+    pub cpu_percentage_relative: Option<u8>,
+    pub memory_percentage: Option<u8>,
+    #[serde(default)]
+    pub metrics_strategy: PodMetricsStrategy,
+}
+
+#[derive(Debug)]
+pub struct PodStats {
+    pub cpu_percentage: f64,
+    pub cpu_percentage_relative: f64,
+    pub memory_usage: u64,
+    pub memory_limit: u64,
+}
+
+pub fn aggregate_pod_stats(
+    container_stats: &[(Uuid, InstanceMetadata, ContainerStats)],
+    strategy: &PodMetricsStrategy,
+) -> PodStats {
+    match strategy {
+        PodMetricsStrategy::Maximum => {
+            let mut max_stats = PodStats {
+                cpu_percentage: 0.0,
+                cpu_percentage_relative: 0.0,
+                memory_usage: 0,
+                memory_limit: 0,
+            };
+
+            for stats in container_stats {
+                max_stats.cpu_percentage = max_stats.cpu_percentage.max(stats.2.cpu_percentage);
+                max_stats.cpu_percentage_relative = max_stats
+                    .cpu_percentage_relative
+                    .max(stats.2.cpu_percentage_relative);
+                max_stats.memory_usage = max_stats.memory_usage.max(stats.2.memory_usage);
+                max_stats.memory_limit = max_stats.memory_limit.max(stats.2.memory_limit);
+            }
+
+            max_stats
+        }
+        PodMetricsStrategy::Average => {
+            let count = container_stats.len() as f64;
+            let sum_stats = container_stats.iter().fold(
+                PodStats {
+                    cpu_percentage: 0.0,
+                    cpu_percentage_relative: 0.0,
+                    memory_usage: 0,
+                    memory_limit: 0,
+                },
+                |mut acc, stats| {
+                    acc.cpu_percentage += stats.2.cpu_percentage;
+                    acc.cpu_percentage_relative += stats.2.cpu_percentage_relative;
+                    acc.memory_usage += stats.2.memory_usage;
+                    acc.memory_limit += stats.2.memory_limit;
+                    acc
+                },
+            );
+
+            PodStats {
+                cpu_percentage: sum_stats.cpu_percentage / count,
+                cpu_percentage_relative: sum_stats.cpu_percentage_relative / count,
+                memory_usage: sum_stats.memory_usage / count as u64,
+                memory_limit: sum_stats.memory_limit / count as u64,
+            }
+        }
+    }
 }
 
 pub static CONFIG_STORE: OnceLock<DashMap<String, (PathBuf, ServiceConfig)>> = OnceLock::new();
@@ -158,7 +238,7 @@ async fn process_event(event: DebouncedEvent) {
                             );
 
                             // Handle like initialization
-                            update_reserved_ports(&service_name, config.exposed_port);
+                            update_reserved_ports(&config.name, &config.spec);
 
                             // Store config
                             config_store.insert(
@@ -303,7 +383,6 @@ use std::fs;
 
 pub async fn initialize_configs(config_dir: &PathBuf) -> Result<()> {
     let config_store = CONFIG_STORE.get().unwrap();
-    let reserved_ports = RESERVED_PORTS.get_or_init(DashMap::new);
     let log = slog_scope::logger();
 
     for entry in fs::read_dir(config_dir)? {
@@ -321,7 +400,7 @@ pub async fn initialize_configs(config_dir: &PathBuf) -> Result<()> {
                     );
 
                     // Reserve the port
-                    reserved_ports.insert(config.exposed_port, config.name.clone());
+                    update_reserved_ports(&config.name, &config.spec);
 
                     config_store.insert(path.display().to_string(), (path.clone(), config.clone()));
                     // Handle orphaned containers based on the adopt_orphans flag
@@ -355,6 +434,7 @@ pub async fn initialize_configs(config_dir: &PathBuf) -> Result<()> {
 
     Ok(())
 }
+
 pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
     let log = slog_scope::logger();
     let instance_store = INSTANCE_STORE.get().unwrap();
@@ -378,29 +458,87 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
     );
 
     if config.adopt_orphans {
-        // Bulk adopt containers
+        // Group containers by pod (using UUID)
+        let mut pod_containers: HashMap<Uuid, Vec<ContainerInfo>> = HashMap::new();
+
+        for container in orphaned_containers {
+            if let Ok(uuid) = extract_uuid_from_name(&container.name) {
+                pod_containers.entry(uuid).or_default().push(container);
+            }
+        }
+
+        // Bulk adopt containers by pod
         let mut instances = instance_store.entry(service_name.to_string()).or_default();
         let mut adopted_count = 0;
 
-        for container in orphaned_containers {
-            if container.port > 0 {
-                if let Ok(uuid) = extract_uuid_from_name(&container.name) {
-                    instances.insert(
-                        uuid,
-                        InstanceMetadata {
-                            uuid,
-                            exposed_port: container.port,
-                            status: "adopted".to_string(),
-                        },
-                    );
-                    adopted_count += 1;
+        for (uuid, containers) in &pod_containers {
+            let mut pod_metadata = Vec::new();
+
+            for container in containers {
+                if container.port > 0 {
+                    // Parse container name to get service information
+                    match parse_container_name(&container.name) {
+                        Ok(parts) => {
+                            // Look up service config
+                            if let Some(config) = get_config_by_service(&parts.service_name) {
+                                // Find the container config that matches this container name
+                                if let Some(container_config) = config
+                                    .spec
+                                    .containers
+                                    .iter()
+                                    .find(|c| c.name == parts.container_name)
+                                {
+                                    // If we find port configuration, use it
+                                    if let Some(port_configs) = &container_config.ports {
+                                        let port_metadata: Vec<ContainerPortMetadata> =
+                                            port_configs
+                                                .iter()
+                                                .map(|p| ContainerPortMetadata {
+                                                    port: p.target_port.unwrap_or(p.port),
+                                                    node_port: p.node_port.unwrap_or(p.port),
+                                                })
+                                                .collect();
+
+                                        pod_metadata.push(ContainerMetadata {
+                                            name: container.name.clone(),
+                                            ports: port_metadata,
+                                            status: "adopted".to_string(),
+                                        });
+                                        adopted_count += 1;
+                                    }
+                                }
+                            } else {
+                                slog::warn!(log, "Could not find service config for orphaned container";
+                                    "service" => parts.service_name,
+                                    "container" => &container.name
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            slog::warn!(log, "Failed to parse container name";
+                                "container" => &container.name,
+                                "error" => e.to_string()
+                            );
+                        }
+                    }
                 }
+            }
+
+            if !pod_metadata.is_empty() {
+                instances.insert(
+                    *uuid,
+                    InstanceMetadata {
+                        uuid: *uuid,
+                        containers: pod_metadata,
+                    },
+                );
             }
         }
 
         slog::info!(log, "Adopted orphaned containers";
             "service" => service_name,
-            "adopted" => adopted_count.to_string()
+            "adopted_pods" => pod_containers.len().to_string(),
+            "adopted_containers" => adopted_count.to_string()
         );
     } else {
         // Bulk remove containers
@@ -436,7 +574,7 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
     Ok(())
 }
 
-fn extract_uuid_from_name(container_name: &str) -> Result<Uuid> {
+pub fn extract_uuid_from_name(container_name: &str) -> Result<Uuid> {
     if let Some(uuid_str) = container_name.split("__").nth(1) {
         Uuid::parse_str(uuid_str).map_err(|e| anyhow!("Invalid UUID in container name: {}", e))
     } else {
@@ -445,6 +583,43 @@ fn extract_uuid_from_name(container_name: &str) -> Result<Uuid> {
             container_name
         ))
     }
+}
+
+#[derive(Debug)]
+pub struct ContainerNameParts {
+    pub service_name: String,
+    pub pod_number: u8,
+    pub container_name: String,
+    pub uuid: Uuid,
+}
+
+pub fn parse_container_name(container_name: &str) -> Result<ContainerNameParts> {
+    let parts: Vec<&str> = container_name.split("__").collect();
+
+    if parts.len() != 4 {
+        return Err(anyhow!(
+            "Container name does not match pattern 'service__pod-number__container-name__uuid': {}",
+            container_name
+        ));
+    }
+
+    let pod_number = parts[1].parse::<u8>().map_err(|e| {
+        anyhow!(
+            "Invalid pod number in container name '{}': {}",
+            container_name,
+            e
+        )
+    })?;
+
+    let uuid = Uuid::parse_str(parts[3])
+        .map_err(|e| anyhow!("Invalid UUID in container name '{}': {}", container_name, e))?;
+
+    Ok(ContainerNameParts {
+        service_name: parts[0].to_string(),
+        pod_number,
+        container_name: parts[2].to_string(),
+        uuid,
+    })
 }
 
 // Update the stop_service function to ensure complete cleanup

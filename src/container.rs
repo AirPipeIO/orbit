@@ -19,9 +19,73 @@ use std::time::SystemTime;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::config::{get_config_by_service, parse_cpu_limit, parse_memory_limit, ServiceConfig};
+use crate::config::{
+    get_config_by_service, parse_cpu_limit, parse_memory_limit, ServiceConfig, ServiceSpec,
+};
 use crate::proxy::SERVER_BACKENDS;
 use crate::status::update_instance_store_cache;
+
+const MAX_SERVICE_NAME_LENGTH: usize = 60; // Common k8s practice
+const MAX_CONTAINER_NAME_LENGTH: usize = 60; // This gives us plenty of room
+const SEPARATOR: &str = "__";
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Container {
+    pub name: String,
+    pub image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ports: Option<Vec<ContainerPort>>,
+    // Other container-specific fields
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ContainerPort {
+    pub port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<Protocol>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum Protocol {
+    TCP,
+    UDP,
+}
+
+use thiserror::Error;
+
+#[derive(Error, Debug, Clone)]
+pub enum ContainerError {
+    #[error("Service name exceeds maximum length of {0} characters")]
+    ServiceNameTooLong(usize),
+    #[error("Container name exceeds maximum length of {0} characters")]
+    ContainerNameTooLong(usize),
+}
+
+impl Container {
+    pub fn generate_runtime_name(
+        &self,
+        service_name: &str,
+        pod_number: u8,
+        uuid: &str,
+    ) -> Result<String, ContainerError> {
+        if service_name.len() > MAX_SERVICE_NAME_LENGTH {
+            return Err(ContainerError::ServiceNameTooLong(MAX_SERVICE_NAME_LENGTH).into());
+        }
+        if self.name.len() > MAX_CONTAINER_NAME_LENGTH {
+            return Err(ContainerError::ContainerNameTooLong(MAX_CONTAINER_NAME_LENGTH).into());
+        }
+
+        // Format: service-name__pod-number__container-name__uuid
+        Ok(format!(
+            "{service_name}__{pod_number}__{}__{uuid}",
+            self.name
+        ))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ServiceStats {
@@ -151,22 +215,42 @@ pub static CONTAINER_STATS: OnceLock<DashMap<String, StatsEntry>> = OnceLock::ne
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct InstanceMetadata {
-    pub uuid: Uuid,        // Unique identifier for the instance
-    pub exposed_port: u16, // Port mapped for this container
-    pub status: String,    // Status (e.g., "running", "stopped")
+    pub uuid: Uuid,
+    pub containers: Vec<ContainerMetadata>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ContainerMetadata {
+    pub name: String,
+    pub ports: Vec<ContainerPortMetadata>,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ContainerPortMetadata {
+    pub port: u16,      // The container's port
+    pub node_port: u16, // The external port
 }
 
 // Define the container runtime trait
 #[async_trait]
 pub trait ContainerRuntime: Send + Sync + std::fmt::Debug {
-    async fn start_container(
+    // async fn start_container(
+    //     &self,
+    //     name: &str,
+    //     image: &str,
+    //     target_port: u16,
+    //     memory_limit: Option<Value>, // Human-readable memory limit (e.g., "512Mi")
+    //     cpu_limit: Option<Value>,    // Human-readable CPU limit (e.g., "0.5")
+    // ) -> Result<u16>;
+    async fn start_containers(
         &self,
-        name: &str,
-        image: &str,
-        target_port: u16,
-        memory_limit: Option<Value>, // Human-readable memory limit (e.g., "512Mi")
-        cpu_limit: Option<Value>,    // Human-readable CPU limit (e.g., "0.5")
-    ) -> Result<u16>;
+        service_name: &str,
+        pod_number: u8,
+        containers: &Vec<Container>,
+        memory_limit: Option<Value>,
+        cpu_limit: Option<Value>,
+    ) -> Result<Vec<(String, Vec<ContainerPortMetadata>)>>; // Returns vec of (container_name, ports)
     async fn stop_container(&self, name: &str) -> Result<()>;
     async fn inspect_container(&self, name: &str) -> Result<ContainerStats>;
     async fn list_containers(&self, service_name: Option<&str>) -> Result<Vec<ContainerInfo>>;
@@ -198,9 +282,17 @@ pub struct ContainerStats {
     timestamp: SystemTime,
 }
 
-pub fn update_reserved_ports(service_name: &str, exposed_port: u16) {
+pub fn update_reserved_ports(service_name: &str, spec: &ServiceSpec) {
     let reserved_ports = RESERVED_PORTS.get().unwrap();
-    reserved_ports.insert(exposed_port, service_name.to_string());
+
+    // For each container in the service
+    for container in &spec.containers {
+        if let Some(ports) = &container.ports {
+            for port_config in ports {
+                reserved_ports.insert(port_config.port, service_name.to_string());
+            }
+        }
+    }
 }
 
 pub fn remove_reserved_ports(service_name: &str) {
@@ -242,20 +334,18 @@ impl DockerRuntime {
 
 #[async_trait]
 impl ContainerRuntime for DockerRuntime {
-    async fn start_container(
+    async fn start_containers(
         &self,
-        name: &str,
-        image: &str,
-        target_port: u16,
-        memory_limit: Option<Value>, // Human-readable memory limit (e.g., "512Mi")
-        cpu_limit: Option<Value>,    // Human-readable CPU limit (e.g., "0.5")
-    ) -> Result<u16> {
-        // Find an available port using the globally configured range
-        let available_port = Self::find_available_port()
-            .ok_or_else(|| anyhow!("No available ports found in the configured range"))?;
+        service_name: &str,
+        pod_number: u8,
+        containers: &Vec<Container>,
+        memory_limit: Option<Value>,
+        cpu_limit: Option<Value>,
+    ) -> Result<Vec<(String, Vec<ContainerPortMetadata>)>> {
+        let uuid = Uuid::new_v4();
+        let mut started_containers = Vec::new();
 
-        // Container configuration
-        // Parse the memory and CPU limits
+        // Parse resource limits once as they apply to all containers in the pod
         let parsed_memory_limit = memory_limit
             .as_ref()
             .map(|v| parse_memory_limit(v).unwrap_or(0))
@@ -265,43 +355,76 @@ impl ContainerRuntime for DockerRuntime {
             .map(|v| parse_cpu_limit(v).unwrap_or(0))
             .unwrap_or(0);
 
-        // Container configuration
-        let config = Config {
-            image: Some(image.to_string()),
-            host_config: Some(HostConfig {
-                port_bindings: Some(HashMap::from([(
-                    format!("{}/tcp", target_port),
-                    Some(vec![PortBinding {
-                        host_ip: Some("0.0.0.0".to_string()),
-                        host_port: Some(available_port.to_string()),
-                    }]),
-                )])),
-                memory: Some(parsed_memory_limit.try_into().unwrap()), // Pass parsed memory limit
-                nano_cpus: Some(parsed_cpu_limit.try_into().unwrap()), // Pass parsed CPU limit
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        for container in containers {
+            let container_name =
+                container.generate_runtime_name(service_name, pod_number, &uuid.to_string())?;
+            let mut assigned_port_metadata = Vec::new();
 
-        // Create the container
-        self.client
-            .create_container(
-                Some(CreateContainerOptions {
-                    name,
-                    platform: None,
+            // Prepare port bindings
+            let mut port_bindings = HashMap::new();
+            let mut exposed_ports = HashMap::new();
+
+            if let Some(ports) = &container.ports {
+                for port_config in ports {
+                    // Container's listening port (target_port defaults to port if not specified)
+                    let container_port = port_config.target_port.unwrap_or(port_config.port);
+                    let container_port_key = format!("{}/tcp", container_port);
+
+                    // Get a random available port for the container-to-host mapping
+                    let host_port = Self::find_available_port().ok_or_else(|| {
+                        anyhow!("No available ports found in the configured range")
+                    })?;
+
+                    port_bindings.insert(
+                        container_port_key.clone(),
+                        Some(vec![PortBinding {
+                            host_ip: Some("0.0.0.0".to_string()),
+                            host_port: Some(host_port.to_string()),
+                        }]),
+                    );
+
+                    exposed_ports.insert(container_port_key, HashMap::new());
+                    assigned_port_metadata.push(ContainerPortMetadata {
+                        port: host_port, // The dynamically assigned host port
+                        node_port: port_config.node_port.unwrap_or(port_config.port), // The service's node port
+                    });
+                }
+            }
+
+            // Create container config
+            let config = Config {
+                image: Some(container.image.clone()),
+                host_config: Some(HostConfig {
+                    port_bindings: Some(port_bindings),
+                    memory: Some(parsed_memory_limit.try_into().unwrap()),
+                    nano_cpus: Some(parsed_cpu_limit.try_into().unwrap()),
+                    ..Default::default()
                 }),
-                config,
-            )
-            .await
-            .map_err(|e| anyhow!("Failed to create container {}: {:?}", name, e))?;
+                exposed_ports: Some(exposed_ports),
+                ..Default::default()
+            };
 
-        // Start the container
-        self.client
-            .start_container(name, None::<StartContainerOptions<String>>)
-            .await
-            .map_err(|e| anyhow!("Failed to start container {}: {:?}", name, e))?;
+            // Create and start the container
+            self.client
+                .create_container(
+                    Some(CreateContainerOptions {
+                        name: container_name.as_str(),
+                        platform: None,
+                    }),
+                    config,
+                )
+                .await
+                .map_err(|e| anyhow!("Failed to create container {}: {:?}", container_name, e))?;
 
-        Ok(available_port)
+            self.client
+                .start_container(&container_name, None::<StartContainerOptions<String>>)
+                .await
+                .map_err(|e| anyhow!("Failed to start container {}: {:?}", container_name, e))?;
+
+            started_containers.push((container_name, assigned_port_metadata));
+        }
+
+        Ok(started_containers)
     }
 
     async fn stop_container(&self, name: &str) -> Result<()> {
@@ -431,31 +554,33 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
             "target" => target_instances
         );
 
-        for _ in current_instances..target_instances {
+        for pod_number in current_instances..target_instances {
             let uuid = uuid::Uuid::new_v4();
-            let container_name = format!("{}__{}", service_name, uuid);
 
-            slog::debug!(log, "Starting new container";
+            slog::debug!(log, "Starting new pod instance";
                 "service" => service_name,
-                "container" => &container_name
+                "pod_number" => pod_number,
+                "uuid" => uuid.to_string()
             );
 
             match runtime
-                .start_container(
-                    &container_name,
-                    &config.image,
-                    config.target_port,
+                .start_containers(
+                    service_name,
+                    pod_number as u8, // Pass the pod number
+                    &config.spec.containers,
                     config.memory_limit.clone(),
                     config.cpu_limit.clone(),
                 )
                 .await
             {
-                Ok(exposed_port) => {
-                    slog::debug!(log, "Container started successfully";
-                        "service" => service_name,
-                        "container" => &container_name,
-                        "port" => exposed_port.to_string()
-                    );
+                Ok(started_containers) => {
+                    for (container_name, ports) in &started_containers {
+                        slog::debug!(log, "Container started successfully";
+                            "service" => service_name,
+                            "container" => container_name,
+                            "ports" => ?ports
+                        );
+                    }
 
                     // Only lock briefly to update the instance store
                     if let Some(mut instances) = instance_store.get_mut(service_name) {
@@ -463,8 +588,14 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
                             uuid,
                             InstanceMetadata {
                                 uuid,
-                                exposed_port,
-                                status: "running".to_string(),
+                                containers: started_containers
+                                    .into_iter()
+                                    .map(|(name, ports)| ContainerMetadata {
+                                        name,
+                                        ports,
+                                        status: "running".to_string(),
+                                    })
+                                    .collect(),
                             },
                         );
                     } else {
@@ -474,8 +605,14 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
                             uuid,
                             InstanceMetadata {
                                 uuid,
-                                exposed_port,
-                                status: "running".to_string(),
+                                containers: started_containers
+                                    .into_iter()
+                                    .map(|(name, ports)| ContainerMetadata {
+                                        name,
+                                        ports,
+                                        status: "running".to_string(),
+                                    })
+                                    .collect(),
                             },
                         );
                         instance_store.insert(service_name.to_string(), map);
@@ -484,7 +621,7 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
                     tokio::task::yield_now().await;
                 }
                 Err(e) => {
-                    slog::error!(log, "Failed to start container";
+                    slog::error!(log, "Failed to start containers";
                         "service" => service_name,
                         "error" => e.to_string()
                     );
@@ -510,27 +647,37 @@ pub async fn clean_up(service_name: &str) {
 
     if let Some((_, instances)) = instance_store.remove(service_name) {
         for (uuid, metadata) in instances {
-            let container_name = format!("{}__{}", service_name, uuid);
-
-            // Remove from load balancer
-            if let Some(backends) = SERVER_BACKENDS.get().unwrap().get(service_name) {
-                let addr = format!("127.0.0.1:{}", metadata.exposed_port);
-                if let Ok(backend) = Backend::new(&addr) {
-                    backends.remove(&backend);
+            // For each container in the pod
+            for container in metadata.containers {
+                // Remove from load balancer for each port
+                for port_metadata in &container.ports {
+                    // Need to remove from the specific proxy instance for this node_port
+                    let proxy_key = format!("{}_{}", service_name, port_metadata.node_port);
+                    if let Some(backends) = SERVER_BACKENDS.get().unwrap().get(&proxy_key) {
+                        let addr = format!("127.0.0.1:{}", port_metadata.port);
+                        if let Ok(backend) = Backend::new(&addr) {
+                            backends.remove(&backend);
+                            slog::debug!(log, "Removed backend from load balancer";
+                                "service" => service_name,
+                                "container" => &container.name,
+                                "port" => port_metadata.port,
+                                "node_port" => port_metadata.node_port
+                            );
+                        }
+                    }
                 }
-            }
+                // Clean up stats for each container
+                remove_container_stats(service_name, &container.name);
 
-            // Clean up stats first
-            remove_container_stats(service_name, &container_name);
-
-            // Stop the container
-            let runtime = runtime.clone();
-            if let Err(e) = runtime.stop_container(&container_name).await {
-                slog::error!(log, "Failed to stop container";
-                    "service" => service_name,
-                    "container" => &container_name,
-                    "error" => e.to_string()
-                );
+                // Stop each container
+                let runtime = runtime.clone();
+                if let Err(e) = runtime.stop_container(&container.name).await {
+                    slog::error!(log, "Failed to stop container";
+                        "service" => service_name,
+                        "container" => &container.name,
+                        "error" => e.to_string()
+                    );
+                }
             }
         }
 
