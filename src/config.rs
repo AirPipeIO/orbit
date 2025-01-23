@@ -659,7 +659,7 @@ pub async fn stop_service(service_name: &str) {
     }
 
     // Update instance store cache
-    update_instance_store_cache();
+    let _ = update_instance_store_cache();
 
     slog::info!(log, "Service stopped and cleaned up"; "service" => service_name);
 }

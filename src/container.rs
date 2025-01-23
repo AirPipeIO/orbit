@@ -15,15 +15,13 @@ use pingora_load_balancing::Backend;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::config::{
-    get_config_by_service, parse_container_name, parse_cpu_limit, parse_memory_limit,
-    ServiceConfig, ServiceSpec,
+    get_config_by_service, parse_container_name, parse_cpu_limit, parse_memory_limit, ServiceConfig,
 };
 use crate::proxy::SERVER_BACKENDS;
 use crate::status::update_instance_store_cache;
@@ -536,141 +534,6 @@ impl ContainerRuntime for DockerRuntime {
 
         Err(anyhow!("Max retries exceeded"))
     }
-
-    // async fn attempt_start_containers(
-    //     &self,
-    //     service_name: &str,
-    //     pod_number: u8,
-    //     containers: &Vec<Container>,
-    //     memory_limit: Option<Value>,
-    //     cpu_limit: Option<Value>,
-    // ) -> Result<Vec<(String, String, Vec<ContainerPortMetadata>)>> {
-    //     let uuid = Uuid::new_v4();
-    //     let network_name = format!("{}_{}", service_name, uuid);
-
-    //     // Create network
-    //     self.create_pod_network(service_name, &uuid.to_string())
-    //         .await?;
-
-    //     let parsed_memory_limit = memory_limit
-    //         .as_ref()
-    //         .map(|v| parse_memory_limit(v).unwrap_or(0))
-    //         .unwrap_or(0);
-    //     let parsed_cpu_limit = cpu_limit
-    //         .as_ref()
-    //         .map(|v| parse_cpu_limit(v).unwrap_or(0))
-    //         .unwrap_or(0);
-
-    //     let mut started_containers = Vec::new();
-    //     let mut containers_to_cleanup = Vec::new();
-    //     let mut pod_creation_failed = false;
-
-    //     for container in containers {
-    //         let container_name =
-    //             container.generate_runtime_name(service_name, pod_number, &uuid.to_string())?;
-    //         let (_temp_dir, mounts) = self.setup_volume_mounts(container, &container_name).await?;
-    //         let (port_bindings, exposed_ports, assigned_port_metadata) =
-    //             self.prepare_port_configuration(container).await?;
-
-    //         let mut host_config = HostConfig {
-    //             port_bindings: Some(port_bindings),
-    //             memory: Some(parsed_memory_limit.try_into().unwrap()),
-    //             nano_cpus: Some(parsed_cpu_limit.try_into().unwrap()),
-    //             network_mode: Some(network_name.clone()),
-    //             ..Default::default()
-    //         };
-
-    //         if !mounts.is_empty() {
-    //             host_config.mounts = Some(mounts);
-    //         }
-
-    //         let config = Config {
-    //             image: Some(container.image.clone()),
-    //             host_config: Some(host_config),
-    //             exposed_ports: Some(exposed_ports),
-    //             hostname: Some(container.name.clone()),
-    //             ..Default::default()
-    //         };
-
-    //         match self
-    //             .client
-    //             .create_container(
-    //                 Some(CreateContainerOptions {
-    //                     name: container_name.as_str(),
-    //                     platform: None,
-    //                 }),
-    //                 config,
-    //             )
-    //             .await
-    //         {
-    //             Ok(_) => {
-    //                 match self
-    //                     .client
-    //                     .start_container(&container_name, None::<StartContainerOptions<String>>)
-    //                     .await
-    //                 {
-    //                     Ok(_) => {
-    //                         if let Ok(container_data) =
-    //                             self.client.inspect_container(&container_name, None).await
-    //                         {
-    //                             if let Some(network_settings) = container_data.network_settings {
-    //                                 if let Some(networks) = network_settings.networks {
-    //                                     if let Some(network) = networks.get(&network_name) {
-    //                                         if let Some(ip) = &network.ip_address {
-    //                                             containers_to_cleanup
-    //                                                 .push((container_name.clone(), ip.clone()));
-    //                                             started_containers.push((
-    //                                                 container_name,
-    //                                                 ip.clone(),
-    //                                                 assigned_port_metadata,
-    //                                             ));
-    //                                             continue;
-    //                                         }
-    //                                     }
-    //                                 }
-    //                             }
-    //                             pod_creation_failed = true;
-    //                         }
-    //                     }
-    //                     Err(e) => {
-    //                         slog::error!(slog_scope::logger(), "Failed to start container";
-    //                             "service" => service_name,
-    //                             "container" => &container_name,
-    //                             "error" => e.to_string()
-    //                         );
-    //                         pod_creation_failed = true;
-    //                         break;
-    //                     }
-    //                 }
-    //             }
-    //             Err(e) => {
-    //                 slog::error!(slog_scope::logger(), "Failed to create container";
-    //                     "service" => service_name,
-    //                     "container" => &container_name,
-    //                     "error" => e.to_string()
-    //                 );
-    //                 pod_creation_failed = true;
-    //                 break;
-    //             }
-    //         }
-    //     }
-
-    //     if pod_creation_failed {
-    //         for (container_name, _) in containers_to_cleanup {
-    //             if let Err(e) = self.stop_container(&container_name).await {
-    //                 slog::error!(slog_scope::logger(), "Failed to cleanup container after pod creation failure";
-    //                     "service" => service_name,
-    //                     "container" => &container_name,
-    //                     "error" => e.to_string()
-    //                 );
-    //             }
-    //         }
-    //         self.remove_pod_network(&network_name).await?;
-    //         return Err(anyhow!("Failed to create one or more containers in pod"));
-    //     }
-
-    //     Ok(started_containers)
-    // }
 
     async fn attempt_start_containers(
         &self,
