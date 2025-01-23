@@ -547,35 +547,55 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
             "adopted_containers" => adopted_count.to_string()
         );
     } else {
-        let mut futures = Vec::new();
+        // Group containers by their network
+        let mut network_containers: HashMap<String, Vec<String>> = HashMap::new();
+
         for container in &orphaned_containers {
             if let Ok(parts) = parse_container_name(&container.name) {
                 let network_name = format!("{}_{}", service_name, parts.uuid);
+                network_containers
+                    .entry(network_name)
+                    .or_default()
+                    .push(container.name.clone());
+            }
+        }
+
+        // Process each network and its containers
+        for (network_name, containers) in network_containers {
+            // First stop all containers in the network
+            let mut stop_futures = Vec::new();
+            for container_name in containers {
                 let runtime = runtime.clone();
-                let container_name = container.name.clone();
                 let service_name = service_name.to_string();
 
-                futures.push(tokio::spawn(async move {
+                stop_futures.push(tokio::spawn(async move {
                     if let Err(e) = runtime.stop_container(&container_name).await {
                         slog::error!(slog_scope::logger(), "Failed to remove orphaned container";
                             "service" => %service_name,
                             "container" => %container_name,
                             "error" => %e
                         );
+                        return Err(e);
                     }
-                    if let Err(e) = runtime.remove_pod_network(&network_name).await {
-                        slog::error!(slog_scope::logger(), "Failed to remove orphaned network";
-                            "service" => %service_name,
-                            "network" => %network_name,
-                            "error" => %e
-                        );
-                    }
+                    Ok(())
                 }));
             }
-        }
 
-        let _ =
-            tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(futures)).await;
+            // Wait for all containers to be stopped
+            let _ = futures::future::join_all(stop_futures).await;
+
+            // Add a small delay to ensure Docker has processed container removals
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            // Then try to remove the network
+            if let Err(e) = runtime.remove_pod_network(&network_name).await {
+                slog::error!(slog_scope::logger(), "Failed to remove orphaned network";
+                    "service" => %service_name,
+                    "network" => %network_name,
+                    "error" => %e
+                );
+            }
+        }
     }
 
     Ok(())
