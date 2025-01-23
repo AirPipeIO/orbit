@@ -135,7 +135,28 @@ pub async fn auto_scale(service_name: String) {
                     if let TryResult::Present(mut instances_entry) =
                         instance_store.try_get_mut(&*service_name)
                     {
-                        for (uuid, _) in &missing_containers {
+                        for (uuid, metadata) in &missing_containers {
+                            // Cleanup all containers in the pod, even if only one failed
+                            for container in &metadata.containers {
+                                if let Err(e) = runtime.stop_container(&container.name).await {
+                                    slog::error!(log, "Failed to stop container in incomplete pod";
+                                        "service" => service_name.clone(),
+                                        "container" => &container.name,
+                                        "error" => e.to_string()
+                                    );
+                                }
+                            }
+
+                            // Remove pod network
+                            if let Err(e) = runtime.remove_pod_network(&metadata.network).await {
+                                slog::error!(log, "Failed to remove network for incomplete pod";
+                                    "service" => service_name.clone(),
+                                    "network" => &metadata.network,
+                                    "error" => e.to_string()
+                                );
+                            }
+
+                            // Remove from instance store
                             instances_entry.remove(uuid);
                         }
 

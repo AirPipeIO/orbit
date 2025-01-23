@@ -500,66 +500,6 @@ impl ContainerRuntime for DockerRuntime {
         self.create_pod_network(service_name, &uuid.to_string())
             .await?;
 
-        let mut temporary_containers = Vec::new();
-        let mut container_ips = HashMap::new();
-
-        // First pass: Create temporary containers to get their IPs
-        for container in containers {
-            let temp_name = format!("temp_{}_{}", service_name, container.name);
-            let config = Config {
-                image: Some(container.image.clone()),
-                host_config: Some(HostConfig {
-                    network_mode: Some(network_name.clone()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
-
-            self.client
-                .create_container(
-                    Some(CreateContainerOptions {
-                        name: temp_name.as_str(),
-                        platform: None,
-                    }),
-                    config,
-                )
-                .await?;
-
-            self.client
-                .start_container(&temp_name, None::<StartContainerOptions<String>>)
-                .await?;
-
-            if let Ok(container_data) = self.client.inspect_container(&temp_name, None).await {
-                if let Some(network_settings) = container_data.network_settings {
-                    if let Some(networks) = network_settings.networks {
-                        if let Some(network) = networks.get(&network_name) {
-                            if let Some(ip) = &network.ip_address {
-                                container_ips.insert(container.name.clone(), ip.clone());
-                                temporary_containers.push(temp_name);
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-            return Err(anyhow!("Failed to get IP for temporary container"));
-        }
-
-        // Clean up temporary containers
-        for temp_name in &temporary_containers {
-            let _ = self.client.stop_container(temp_name, None).await;
-            let _ = self
-                .client
-                .remove_container(
-                    temp_name,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
-        }
-
         let parsed_memory_limit = memory_limit
             .as_ref()
             .map(|v| parse_memory_limit(v).unwrap_or(0))
@@ -569,7 +509,6 @@ impl ContainerRuntime for DockerRuntime {
             .map(|v| parse_cpu_limit(v).unwrap_or(0))
             .unwrap_or(0);
 
-        // Second pass: Create final containers with correct host configuration
         let mut started_containers = Vec::new();
         let mut containers_to_cleanup = Vec::new();
         let mut pod_creation_failed = false;
@@ -577,23 +516,15 @@ impl ContainerRuntime for DockerRuntime {
         for container in containers {
             let container_name =
                 container.generate_runtime_name(service_name, pod_number, &uuid.to_string())?;
-
             let (_temp_dir, mounts) = self.setup_volume_mounts(container, &container_name).await?;
             let (port_bindings, exposed_ports, assigned_port_metadata) =
                 self.prepare_port_configuration(container).await?;
-
-            // Create extra_hosts entries
-            let extra_hosts: Vec<String> = container_ips
-                .iter()
-                .map(|(name, ip)| format!("{}:{}", name, ip))
-                .collect();
 
             let mut host_config = HostConfig {
                 port_bindings: Some(port_bindings),
                 memory: Some(parsed_memory_limit.try_into().unwrap()),
                 nano_cpus: Some(parsed_cpu_limit.try_into().unwrap()),
                 network_mode: Some(network_name.clone()),
-                extra_hosts: Some(extra_hosts),
                 ..Default::default()
             };
 
