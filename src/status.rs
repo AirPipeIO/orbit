@@ -169,18 +169,25 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
                                 .map(|port_info| {
                                     let container_addr =
                                         format!("{}:{}", container.ip_address, port_info.port);
-                                    let healthy = server_backends.iter().any(|backend_entry| {
-                                        if let Some(node_port) = port_info.node_port {
+                                    let healthy = match port_info.node_port {
+                                        Some(node_port) => {
+                                            // Check load balancer registration for node_port
                                             let proxy_key =
                                                 format!("{}_{}", service_name, node_port);
-                                            backend_entry.key() == &proxy_key
-                                                && backend_entry.value().iter().any(|backend| {
-                                                    backend.addr.to_string() == container_addr
-                                                })
-                                        } else {
-                                            false
+                                            server_backends.iter().any(|backend_entry| {
+                                                backend_entry.key() == &proxy_key
+                                                    && backend_entry.value().iter().any(|backend| {
+                                                        backend.addr.to_string() == container_addr
+                                                    })
+                                            })
                                         }
-                                    });
+                                        None => {
+                                            // For target_port, check if IP and port are valid
+                                            !container_addr.is_empty()
+                                                && container.ip_address != "0.0.0.0"
+                                                && port_info.target_port.is_some()
+                                        }
+                                    };
 
                                     PortStatus {
                                         port: port_info.port,
@@ -190,31 +197,49 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
                                     }
                                 })
                                 .collect();
-
                             ContainerStatus {
                                 name: container.name.clone(),
                                 ip_address: container.ip_address.clone(),
                                 ports,
-                                status: if container.ports.iter().any(|port_info| {
-                                    let addr =
-                                        format!("{}:{}", container.ip_address, port_info.port);
-                                    if let Some(node_port) = port_info.node_port {
-                                        let proxy_key = format!("{}_{}", service_name, node_port);
-                                        server_backends
-                                            .get(&proxy_key)
-                                            .map(|backends| {
-                                                backends
-                                                    .iter()
-                                                    .any(|backend| backend.addr.to_string() == addr)
-                                            })
-                                            .unwrap_or(false)
+                                status: {
+                                    let has_node_port =
+                                        container.ports.iter().any(|p| p.node_port.is_some());
+                                    if has_node_port {
+                                        // For containers with node_ports, check if registered with load balancer
+                                        if container.ports.iter().any(|port_info| {
+                                            let addr = format!(
+                                                "{}:{}",
+                                                container.ip_address, port_info.port
+                                            );
+                                            if let Some(node_port) = port_info.node_port {
+                                                let proxy_key =
+                                                    format!("{}_{}", service_name, node_port);
+                                                server_backends
+                                                    .get(&proxy_key)
+                                                    .map(|backends| {
+                                                        backends.iter().any(|backend| {
+                                                            backend.addr.to_string() == addr
+                                                        })
+                                                    })
+                                                    .unwrap_or(false)
+                                            } else {
+                                                false
+                                            }
+                                        }) {
+                                            "running".to_string()
+                                        } else {
+                                            "stopped".to_string()
+                                        }
                                     } else {
-                                        false
+                                        // For containers without node_ports, consider running if they have valid ports
+                                        if container.ports.is_empty()
+                                            || container.ip_address.is_empty()
+                                        {
+                                            "stopped".to_string()
+                                        } else {
+                                            "running".to_string()
+                                        }
                                     }
-                                }) {
-                                    "running".to_string()
-                                } else {
-                                    "stopped".to_string()
                                 },
                                 cpu_percentage: container_stats.as_ref().map(|s| s.cpu_percentage),
                                 cpu_percentage_relative: container_stats
