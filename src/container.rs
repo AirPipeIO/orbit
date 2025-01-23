@@ -7,7 +7,7 @@ use bollard::container::{
 };
 use bollard::models::{HostConfig, PortBinding};
 use bollard::network::CreateNetworkOptions;
-use bollard::secret::{Mount, MountTypeEnum};
+use bollard::secret::{DeviceRequest, Mount, MountTypeEnum};
 use bollard::Docker;
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -21,7 +21,8 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::config::{
-    get_config_by_service, parse_container_name, parse_cpu_limit, parse_memory_limit, ServiceConfig,
+    get_config_by_service, parse_container_name, parse_cpu_limit, parse_memory_limit,
+    ResourceThresholds, ServiceConfig,
 };
 use crate::proxy::SERVER_BACKENDS;
 use crate::status::update_instance_store_cache;
@@ -58,6 +59,26 @@ pub struct Container {
     pub volume_mounts: Option<Vec<VolumeMount>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volumes: Option<HashMap<String, VolumeData>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_limit: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_limit: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_limit: Option<NetworkLimit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_thresholds: Option<ResourceThresholds>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct NetworkLimit {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingress_rate: Option<String>, // e.g. "10Mbps"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress_rate: Option<String>, // e.g. "5Mbps"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingress_burst: Option<String>, // e.g. "20Mb"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress_burst: Option<String>, // e.g. "10Mb"
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -152,14 +173,22 @@ pub async fn update_container_stats(
     let online_cpus = stats.cpu_stats.online_cpus.unwrap_or(1) as f64;
 
     // Get previous stats with minimal lock time
-    let previous = stats_store.get(container_name).map(|entry| StatsEntry {
-        timestamp: entry.timestamp,
-        cpu_total_usage: entry.cpu_total_usage,
-        system_cpu_usage: entry.system_cpu_usage,
+    let previous_stats = stats_store.get(container_name).map(|entry| {
+        (
+            StatsEntry {
+                timestamp: entry.timestamp,
+                cpu_total_usage: entry.cpu_total_usage,
+                system_cpu_usage: entry.system_cpu_usage,
+            },
+            // Get previous container stats for network rate calculation
+            service_stats
+                .get(service_name)
+                .and_then(|s| s.get_container_stats(container_name)),
+        )
     });
 
     let (cpu_percentage, cpu_percentage_relative) = calculate_cpu_percentages(
-        previous.as_ref(),
+        previous_stats.as_ref().map(|(entry, _)| entry),
         cpu_total,
         system_cpu,
         online_cpus,
@@ -174,16 +203,29 @@ pub async fn update_container_stats(
     };
     stats_store.insert(container_name.to_string(), stats_entry);
 
-    let container_stats = ContainerStats {
+    let mut container_stats = ContainerStats {
         id: stats.id.clone(),
         cpu_percentage,
         cpu_percentage_relative,
         memory_usage: stats.memory_stats.usage.unwrap_or(0),
         memory_limit: stats.memory_stats.limit.unwrap_or(0),
         ip_address: String::from(""),
-        port_mappings: HashMap::new(), // Initialize empty, will be populated by inspect_container
+        port_mappings: HashMap::new(),
+        network_rx_bytes: 0,
+        network_tx_bytes: 0,
+        network_rx_rate: 0.0,
+        network_tx_rate: 0.0,
         timestamp: now,
     };
+
+    // Update network stats using previous container stats if available
+    container_stats.update_network_stats(
+        &stats,
+        previous_stats
+            .as_ref()
+            .map(|(_, prev)| prev.as_ref())
+            .flatten(),
+    );
 
     // Update service-level stats
     service_stats
@@ -269,8 +311,7 @@ pub trait ContainerRuntime: Send + Sync + std::fmt::Debug {
         service_name: &str,
         pod_number: u8,
         containers: &Vec<Container>,
-        memory_limit: Option<Value>,
-        cpu_limit: Option<Value>,
+        service_config: &ServiceConfig,
     ) -> Result<Vec<(String, String, Vec<ContainerPortMetadata>)>>; // Returns vec of (container_name, ports)
     async fn stop_container(&self, name: &str) -> Result<()>;
     async fn inspect_container(&self, name: &str) -> Result<ContainerStats>;
@@ -280,8 +321,7 @@ pub trait ContainerRuntime: Send + Sync + std::fmt::Debug {
         service_name: &str,
         pod_number: u8,
         containers: &Vec<Container>,
-        memory_limit: Option<Value>,
-        cpu_limit: Option<Value>,
+        service_config: &ServiceConfig,
     ) -> Result<Vec<(String, String, Vec<ContainerPortMetadata>)>>;
 }
 
@@ -310,7 +350,39 @@ pub struct ContainerStats {
     pub memory_usage: u64,
     pub memory_limit: u64,
     pub port_mappings: HashMap<u16, u16>,
-    timestamp: SystemTime,
+    pub network_rx_bytes: u64,
+    pub network_tx_bytes: u64,
+    pub network_rx_rate: f64, // bytes per second
+    pub network_tx_rate: f64, // bytes per second
+    pub timestamp: SystemTime,
+}
+
+impl ContainerStats {
+    pub fn update_network_stats(&mut self, stats: &Stats, previous: Option<&Self>) {
+        if let Some(networks) = &stats.networks {
+            let rx_bytes: u64 = networks.values().map(|net| net.rx_bytes).sum();
+            let tx_bytes: u64 = networks.values().map(|net| net.tx_bytes).sum();
+
+            // Calculate rates if we have previous stats
+            if let Some(prev) = previous {
+                let time_diff = self
+                    .timestamp
+                    .duration_since(prev.timestamp)
+                    .unwrap_or_else(|_| Duration::from_secs(1))
+                    .as_secs_f64();
+
+                if time_diff > 0.0 {
+                    self.network_rx_rate =
+                        (rx_bytes as f64 - prev.network_rx_bytes as f64) / time_diff;
+                    self.network_tx_rate =
+                        (tx_bytes as f64 - prev.network_tx_bytes as f64) / time_diff;
+                }
+            }
+
+            self.network_rx_bytes = rx_bytes;
+            self.network_tx_bytes = tx_bytes;
+        }
+    }
 }
 
 impl DockerRuntime {
@@ -386,43 +458,33 @@ impl DockerRuntime {
         Ok((temp_dir, mounts))
     }
 
-    async fn prepare_container_config(
-        &self,
-        container: &Container,
-        network_name: String,
-        parsed_memory_limit: u64,
-        parsed_cpu_limit: i64,
-        container_name: String,
-    ) -> Result<Config<String>> {
-        let (_temp_dir, mounts) = self.setup_volume_mounts(container, &container_name).await?;
-        let (port_bindings, exposed_ports, _) = self.prepare_port_configuration(container).await?;
+    fn prepare_network_limits(&self, network_limit: &NetworkLimit) -> Result<Vec<DeviceRequest>> {
+        let mut device_requests = Vec::new();
 
-        let mut host_config = HostConfig {
-            port_bindings: Some(port_bindings),
-            memory: Some(parsed_memory_limit.try_into().unwrap()),
-            nano_cpus: Some(parsed_cpu_limit),
-            network_mode: Some(network_name),
-            ..Default::default()
-        };
+        if let (Some(ingress), Some(egress)) =
+            (&network_limit.ingress_rate, &network_limit.egress_rate)
+        {
+            // Convert rates to bits per second
+            let ingress_bps = parse_network_rate(ingress)?;
+            let egress_bps = parse_network_rate(egress)?;
 
-        if !mounts.is_empty() {
-            host_config.mounts = Some(mounts);
+            // Create TC (traffic control) rules
+            device_requests.push(DeviceRequest {
+                driver: Some("tc-ingress".to_string()),
+                count: Some(1),
+                capabilities: Some(vec![vec![format!("rate={}", ingress_bps)]]),
+                ..Default::default()
+            });
+
+            device_requests.push(DeviceRequest {
+                driver: Some("tc-egress".to_string()),
+                count: Some(1),
+                capabilities: Some(vec![vec![format!("rate={}", egress_bps)]]),
+                ..Default::default()
+            });
         }
 
-        let mut config = Config {
-            image: Some(container.image.clone()),
-            host_config: Some(host_config),
-            exposed_ports: Some(exposed_ports),
-            hostname: Some(container.name.clone()),
-            ..Default::default()
-        };
-
-        // Add command if specified
-        if let Some(cmd) = &container.command {
-            config.cmd = Some(cmd.clone());
-        }
-
-        Ok(config)
+        Ok(device_requests)
     }
 
     async fn prepare_port_configuration(
@@ -501,21 +563,14 @@ impl ContainerRuntime for DockerRuntime {
         service_name: &str,
         pod_number: u8,
         containers: &Vec<Container>,
-        memory_limit: Option<Value>,
-        cpu_limit: Option<Value>,
+        service_config: &ServiceConfig,
     ) -> Result<Vec<(String, String, Vec<ContainerPortMetadata>)>> {
         const MAX_RETRIES: u32 = 3;
         let mut retry_count = 0;
 
         while retry_count < MAX_RETRIES {
             match self
-                .attempt_start_containers(
-                    service_name,
-                    pod_number,
-                    containers,
-                    memory_limit.clone(),
-                    cpu_limit.clone(),
-                )
+                .attempt_start_containers(service_name, pod_number, containers, &service_config)
                 .await
             {
                 Ok(result) => return Ok(result),
@@ -542,8 +597,7 @@ impl ContainerRuntime for DockerRuntime {
         service_name: &str,
         pod_number: u8,
         containers: &Vec<Container>,
-        memory_limit: Option<Value>,
-        cpu_limit: Option<Value>,
+        service_config: &ServiceConfig,
     ) -> Result<Vec<(String, String, Vec<ContainerPortMetadata>)>> {
         let uuid = Uuid::new_v4();
         let network_name = format!("{}_{}", service_name, uuid);
@@ -551,15 +605,6 @@ impl ContainerRuntime for DockerRuntime {
         // Create network
         self.create_pod_network(service_name, &uuid.to_string())
             .await?;
-
-        let parsed_memory_limit = memory_limit
-            .as_ref()
-            .map(|v| parse_memory_limit(v).unwrap_or(0))
-            .unwrap_or(0);
-        let parsed_cpu_limit = cpu_limit
-            .as_ref()
-            .map(|v| parse_cpu_limit(v).unwrap_or(0))
-            .unwrap_or(0);
 
         let mut started_containers = Vec::new();
         let mut containers_to_cleanup = Vec::new();
@@ -579,16 +624,57 @@ impl ContainerRuntime for DockerRuntime {
             let (port_bindings, exposed_ports, assigned_port_metadata) =
                 self.prepare_port_configuration(container).await?;
 
+            // Get container-specific limits, falling back to service-level limits
+            let memory_limit = container
+                .memory_limit
+                .as_ref()
+                .map(parse_memory_limit)
+                .transpose()?
+                .or_else(|| {
+                    service_config
+                        .memory_limit
+                        .as_ref()
+                        .map(parse_memory_limit)
+                        .transpose()
+                        .ok()
+                        .flatten()
+                })
+                .unwrap_or(0);
+
+            let cpu_limit = container
+                .cpu_limit
+                .as_ref()
+                .map(parse_cpu_limit)
+                .transpose()?
+                .or_else(|| {
+                    service_config
+                        .cpu_limit
+                        .as_ref()
+                        .map(parse_cpu_limit)
+                        .transpose()
+                        .ok()
+                        .flatten()
+                })
+                .unwrap_or(0);
+
             let mut host_config = HostConfig {
                 port_bindings: Some(port_bindings),
-                memory: Some(parsed_memory_limit.try_into().unwrap()),
-                nano_cpus: Some(parsed_cpu_limit.try_into().unwrap()),
+                memory: Some(memory_limit.try_into().unwrap()),
+                nano_cpus: Some(cpu_limit as i64),
                 network_mode: Some(network_name.clone()),
                 ..Default::default()
             };
 
             if !mounts.is_empty() {
                 host_config.mounts = Some(mounts);
+            }
+
+            // Apply network limits if specified
+            if let Some(network_limit) = &container.network_limit {
+                let device_requests = self.prepare_network_limits(network_limit)?;
+                if !device_requests.is_empty() {
+                    host_config.device_requests = Some(device_requests);
+                }
             }
 
             let mut config = Config {
@@ -877,8 +963,7 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
                     service_name,
                     pod_number as u8,
                     &config.spec.containers,
-                    config.memory_limit.clone(),
-                    config.cpu_limit.clone(),
+                    &config,
                 )
                 .await
             {
@@ -1002,7 +1087,7 @@ pub async fn clean_up(service_name: &str) {
         }
     }
 
-    update_instance_store_cache();
+    let _ = update_instance_store_cache();
 }
 
 // Helper function to calculate CPU percentages
@@ -1055,5 +1140,22 @@ fn calculate_cpu_percentages(
         }
     } else {
         (0.0, 0.0) // First reading
+    }
+}
+
+// Add helper function to parse network rates
+pub fn parse_network_rate(rate: &str) -> Result<u64> {
+    let re = regex::Regex::new(r"^(\d+(?:\.\d+)?)(Kbps|Mbps|Gbps)$")?;
+    if let Some(caps) = re.captures(rate) {
+        let value: f64 = caps[1].parse()?;
+        let multiplier = match &caps[2] {
+            "Kbps" => 1_000,
+            "Mbps" => 1_000_000,
+            "Gbps" => 1_000_000_000,
+            _ => return Err(anyhow!("Unsupported network rate unit: {}", &caps[2])),
+        };
+        Ok((value * multiplier as f64) as u64)
+    } else {
+        Err(anyhow!("Invalid network rate format: {}", rate))
     }
 }

@@ -399,13 +399,7 @@ pub async fn scale_up(
     let pod_number = get_next_pod_number(service_name).await;
 
     let started_containers = runtime
-        .start_containers(
-            service_name,
-            pod_number,
-            &config.spec.containers,
-            config.memory_limit.clone(),
-            config.cpu_limit.clone(),
-        )
+        .start_containers(service_name, pod_number, &config.spec.containers, &config)
         .await?;
 
     let container_parts = parse_container_name(&started_containers[0].0)?;
