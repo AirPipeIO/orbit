@@ -98,6 +98,7 @@ pub struct ServiceStatus {
 #[derive(Serialize)]
 pub struct PortStatus {
     pub port: u16,
+    pub target_port: Option<u16>,
     pub node_port: Option<u16>,
     pub healthy: bool,
 }
@@ -166,21 +167,24 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
                                 .ports
                                 .iter()
                                 .map(|port_info| {
-                                    let container_addr = format!("127.0.0.1:{}", port_info.port);
+                                    let container_addr =
+                                        format!("{}:{}", container.ip_address, port_info.port);
                                     let healthy = server_backends.iter().any(|backend_entry| {
-                                        let proxy_key = format!(
-                                            "{}_{}",
-                                            service_name,
-                                            port_info.node_port.unwrap_or(0)
-                                        ); // !!! check
-                                        backend_entry.key() == &proxy_key
-                                            && backend_entry.value().iter().any(|backend| {
-                                                backend.addr.to_string() == container_addr
-                                            })
+                                        if let Some(node_port) = port_info.node_port {
+                                            let proxy_key =
+                                                format!("{}_{}", service_name, node_port);
+                                            backend_entry.key() == &proxy_key
+                                                && backend_entry.value().iter().any(|backend| {
+                                                    backend.addr.to_string() == container_addr
+                                                })
+                                        } else {
+                                            false
+                                        }
                                     });
 
                                     PortStatus {
                                         port: port_info.port,
+                                        target_port: port_info.target_port,
                                         node_port: port_info.node_port,
                                         healthy,
                                     }
@@ -192,24 +196,25 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
                                 ip_address: container.ip_address.clone(),
                                 ports,
                                 status: if container.ports.iter().any(|port_info| {
-                                    let addr = format!("127.0.0.1:{}", port_info.port);
-                                    let proxy_key = format!(
-                                        "{}_{}",
-                                        service_name,
-                                        port_info.node_port.unwrap_or(0)
-                                    ); // !!! check
-                                    server_backends
-                                        .get(&proxy_key)
-                                        .map(|backends| {
-                                            backends
-                                                .iter()
-                                                .any(|backend| backend.addr.to_string() == addr)
-                                        })
-                                        .unwrap_or(false)
+                                    let addr =
+                                        format!("{}:{}", container.ip_address, port_info.port);
+                                    if let Some(node_port) = port_info.node_port {
+                                        let proxy_key = format!("{}_{}", service_name, node_port);
+                                        server_backends
+                                            .get(&proxy_key)
+                                            .map(|backends| {
+                                                backends
+                                                    .iter()
+                                                    .any(|backend| backend.addr.to_string() == addr)
+                                            })
+                                            .unwrap_or(false)
+                                    } else {
+                                        false
+                                    }
                                 }) {
                                     "running".to_string()
                                 } else {
-                                    "unknown".to_string()
+                                    "stopped".to_string()
                                 },
                                 cpu_percentage: container_stats.as_ref().map(|s| s.cpu_percentage),
                                 cpu_percentage_relative: container_stats

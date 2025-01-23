@@ -247,8 +247,9 @@ pub struct ContainerMetadata {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ContainerPortMetadata {
-    pub port: u16,              // Container's exposed port
-    pub node_port: Option<u16>, // Optional external port
+    pub port: u16,                // Container's exposed port
+    pub target_port: Option<u16>, // Optional target port
+    pub node_port: Option<u16>,   // Optional external port
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -453,6 +454,7 @@ impl DockerRuntime {
 
                 assigned_port_metadata.push(ContainerPortMetadata {
                     port: container_port,
+                    target_port: port_config.target_port,
                     node_port: port_config.node_port,
                 });
             }

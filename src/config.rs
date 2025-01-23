@@ -12,9 +12,9 @@ use validator::Validate;
 
 use crate::{
     container::{
-        self, clean_up, find_host_port, manage, remove_container_stats, ContainerInfo,
-        ContainerMetadata, ContainerPortMetadata, ContainerStats, InstanceMetadata, INSTANCE_STORE,
-        RUNTIME, SCALING_TASKS,
+        self, clean_up, manage, remove_container_stats, ContainerInfo, ContainerMetadata,
+        ContainerPortMetadata, ContainerStats, InstanceMetadata, INSTANCE_STORE, RUNTIME,
+        SCALING_TASKS,
     },
     proxy::{self, SERVER_BACKENDS},
     scale::auto_scale,
@@ -505,6 +505,7 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
                                     .iter()
                                     .map(|p| ContainerPortMetadata {
                                         port: p.port,
+                                        target_port: p.target_port,
                                         node_port: p.node_port,
                                     })
                                     .collect();

@@ -5,6 +5,7 @@ spec:
       image: strm/helloworld-http:latest
       ports:
         - port: 80
+          target_port: 8333
     - name: nginx-sidecar
       image: nginx:latest
       ports:

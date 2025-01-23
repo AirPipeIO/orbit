@@ -211,5 +211,5 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
         server_tasks.insert(proxy_key.clone(), handle);
     }
 
-    update_instance_store_cache();
+    let _ = update_instance_store_cache();
 }
