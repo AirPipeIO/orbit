@@ -6,6 +6,7 @@ use bollard::container::{
     StatsOptions,
 };
 use bollard::models::{HostConfig, PortBinding};
+use bollard::secret::{Mount, MountTypeEnum};
 use bollard::Docker;
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -20,7 +21,8 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::config::{
-    get_config_by_service, parse_cpu_limit, parse_memory_limit, ServiceConfig, ServiceSpec,
+    get_config_by_service, parse_container_name, parse_cpu_limit, parse_memory_limit,
+    ServiceConfig, ServiceSpec,
 };
 use crate::proxy::SERVER_BACKENDS;
 use crate::status::update_instance_store_cache;
@@ -29,12 +31,32 @@ const MAX_SERVICE_NAME_LENGTH: usize = 60; // Common k8s practice
 const MAX_CONTAINER_NAME_LENGTH: usize = 60; // This gives us plenty of room
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct VolumeMount {
+    pub name: String,
+    pub mount_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_path: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct VolumeData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_path: Option<String>,
+}
+
+// Update Container struct to include volume mounts
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Container {
     pub name: String,
     pub image: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ports: Option<Vec<ContainerPort>>,
-    // Other container-specific fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_mounts: Option<Vec<VolumeMount>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volumes: Option<HashMap<String, VolumeData>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -335,6 +357,111 @@ impl DockerRuntime {
             .clone()
             .find(|port| Self::is_port_available(*port))
     }
+
+    async fn setup_volume_mounts(
+        &self,
+        container: &Container,
+        container_name: &str,
+    ) -> Result<(Option<tempfile::TempDir>, Vec<Mount>)> {
+        let mut mounts = Vec::new();
+        let temp_dir = if container.volume_mounts.is_some() {
+            Some(
+                tempfile::Builder::new()
+                    .prefix(&format!("{}-volumes-", container_name))
+                    .tempdir()?,
+            )
+        } else {
+            None
+        };
+
+        if let (Some(volume_mounts), Some(volumes)) = (&container.volume_mounts, &container.volumes)
+        {
+            for mount in volume_mounts {
+                if let Some(volume_data) = volumes.get(&mount.name) {
+                    if let Some(host_path) = &volume_data.host_path {
+                        mounts.push(Mount {
+                            target: Some(mount.mount_path.clone()),
+                            source: Some(host_path.clone()),
+                            typ: Some(MountTypeEnum::BIND),
+                            ..Default::default()
+                        });
+                    } else if let Some(files) = &volume_data.files {
+                        let temp_dir = temp_dir.as_ref().expect("Temp dir should exist");
+                        let volume_dir = temp_dir.path().join(&mount.name);
+                        tokio::fs::create_dir_all(&volume_dir).await?;
+
+                        for (filename, content) in files {
+                            let file_path = if let Some(sub_path) = &mount.sub_path {
+                                if sub_path == filename {
+                                    volume_dir.join(filename)
+                                } else {
+                                    continue;
+                                }
+                            } else {
+                                volume_dir.join(filename)
+                            };
+
+                            tokio::fs::write(&file_path, content).await?;
+
+                            let mount_target = if mount.sub_path.is_some() {
+                                mount.mount_path.clone()
+                            } else {
+                                format!("{}/{}", mount.mount_path, filename)
+                            };
+
+                            mounts.push(Mount {
+                                target: Some(mount_target),
+                                source: Some(file_path.to_string_lossy().into_owned()),
+                                typ: Some(MountTypeEnum::BIND),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((temp_dir, mounts))
+    }
+
+    async fn prepare_port_configuration(
+        &self,
+        container: &Container,
+    ) -> Result<(
+        HashMap<String, Option<Vec<PortBinding>>>,
+        HashMap<String, HashMap<(), ()>>,
+        Vec<ContainerPortMetadata>,
+    )> {
+        let mut port_bindings = HashMap::new();
+        let mut exposed_ports = HashMap::new();
+        let mut assigned_port_metadata = Vec::new();
+
+        if let Some(ports) = &container.ports {
+            for port_config in ports {
+                let container_port = port_config.target_port.unwrap_or(port_config.port);
+                let container_port_key = format!("{}/tcp", container_port);
+
+                let host_port = Self::find_available_port()
+                    .ok_or_else(|| anyhow!("No available ports found in the configured range"))?;
+
+                port_bindings.insert(
+                    container_port_key.clone(),
+                    Some(vec![PortBinding {
+                        host_ip: Some("0.0.0.0".to_string()),
+                        host_port: Some(host_port.to_string()),
+                    }]),
+                );
+
+                exposed_ports.insert(container_port_key, HashMap::new());
+                assigned_port_metadata.push(ContainerPortMetadata {
+                    port: host_port,
+                    node_port: port_config.node_port.unwrap_or(port_config.port),
+                });
+            }
+        }
+
+        Ok((port_bindings, exposed_ports, assigned_port_metadata))
+    }
 }
 
 #[async_trait]
@@ -349,6 +476,7 @@ impl ContainerRuntime for DockerRuntime {
     ) -> Result<Vec<(String, Vec<ContainerPortMetadata>)>> {
         let uuid = Uuid::new_v4();
         let mut started_containers = Vec::new();
+        let mut containers_to_cleanup = Vec::new();
 
         // Parse resource limits once as they apply to all containers in the pod
         let parsed_memory_limit = memory_limit
@@ -360,57 +488,69 @@ impl ContainerRuntime for DockerRuntime {
             .map(|v| parse_cpu_limit(v).unwrap_or(0))
             .unwrap_or(0);
 
+        // Track creation success
+        let mut pod_creation_failed = false;
+
         for container in containers {
+            if pod_creation_failed {
+                break;
+            }
             let container_name =
                 container.generate_runtime_name(service_name, pod_number, &uuid.to_string())?;
-            let mut assigned_port_metadata = Vec::new();
 
+            // Setup volume mounts
+            let (_temp_dir, mounts) =
+                match self.setup_volume_mounts(container, &container_name).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        slog::error!(slog_scope::logger(), "Failed to setup volume mounts";
+                            "service" => service_name,
+                            "container" => &container_name,
+                            "error" => e.to_string()
+                        );
+                        pod_creation_failed = true;
+                        break;
+                    }
+                };
             // Prepare port bindings
-            let mut port_bindings = HashMap::new();
-            let mut exposed_ports = HashMap::new();
 
-            if let Some(ports) = &container.ports {
-                for port_config in ports {
-                    // Container's listening port (target_port defaults to port if not specified)
-                    let container_port = port_config.target_port.unwrap_or(port_config.port);
-                    let container_port_key = format!("{}/tcp", container_port);
+            // Prepare port bindings and metadata
+            let (port_bindings, exposed_ports, assigned_port_metadata) =
+                match self.prepare_port_configuration(container).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        slog::error!(slog_scope::logger(), "Failed to prepare port configuration";
+                            "service" => service_name,
+                            "container" => &container_name,
+                            "error" => e.to_string()
+                        );
+                        pod_creation_failed = true;
+                        break;
+                    }
+                };
 
-                    // Get a random available port for the container-to-host mapping
-                    let host_port = Self::find_available_port().ok_or_else(|| {
-                        anyhow!("No available ports found in the configured range")
-                    })?;
+            // Create container config with both ports and volumes
+            let mut host_config = HostConfig {
+                port_bindings: Some(port_bindings),
+                memory: Some(parsed_memory_limit.try_into().unwrap()),
+                nano_cpus: Some(parsed_cpu_limit.try_into().unwrap()),
+                ..Default::default()
+            };
 
-                    port_bindings.insert(
-                        container_port_key.clone(),
-                        Some(vec![PortBinding {
-                            host_ip: Some("0.0.0.0".to_string()),
-                            host_port: Some(host_port.to_string()),
-                        }]),
-                    );
-
-                    exposed_ports.insert(container_port_key, HashMap::new());
-                    assigned_port_metadata.push(ContainerPortMetadata {
-                        port: host_port, // The dynamically assigned host port
-                        node_port: port_config.node_port.unwrap_or(port_config.port), // The service's node port
-                    });
-                }
+            if !mounts.is_empty() {
+                host_config.mounts = Some(mounts);
             }
 
-            // Create container config
             let config = Config {
                 image: Some(container.image.clone()),
-                host_config: Some(HostConfig {
-                    port_bindings: Some(port_bindings),
-                    memory: Some(parsed_memory_limit.try_into().unwrap()),
-                    nano_cpus: Some(parsed_cpu_limit.try_into().unwrap()),
-                    ..Default::default()
-                }),
+                host_config: Some(host_config),
                 exposed_ports: Some(exposed_ports),
                 ..Default::default()
             };
 
             // Create and start the container
-            self.client
+            match self
+                .client
                 .create_container(
                     Some(CreateContainerOptions {
                         name: container_name.as_str(),
@@ -419,14 +559,57 @@ impl ContainerRuntime for DockerRuntime {
                     config,
                 )
                 .await
-                .map_err(|e| anyhow!("Failed to create container {}: {:?}", container_name, e))?;
+            {
+                Ok(_) => {
+                    match self
+                        .client
+                        .start_container(&container_name, None::<StartContainerOptions<String>>)
+                        .await
+                    {
+                        Ok(_) => {
+                            slog::info!(slog_scope::logger(), "Container started successfully";
+                                "service" => service_name,
+                                "container" => &container_name,
+                                "ports" => ?assigned_port_metadata
+                            );
+                            containers_to_cleanup.push(container_name.clone());
+                            started_containers.push((container_name, assigned_port_metadata));
+                        }
+                        Err(e) => {
+                            slog::error!(slog_scope::logger(), "Failed to start container";
+                                "service" => service_name,
+                                "container" => &container_name,
+                                "error" => e.to_string()
+                            );
+                            pod_creation_failed = true;
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    slog::error!(slog_scope::logger(), "Failed to create container";
+                        "service" => service_name,
+                        "container" => &container_name,
+                        "error" => e.to_string()
+                    );
+                    pod_creation_failed = true;
+                    break;
+                }
+            }
+        }
 
-            self.client
-                .start_container(&container_name, None::<StartContainerOptions<String>>)
-                .await
-                .map_err(|e| anyhow!("Failed to start container {}: {:?}", container_name, e))?;
-
-            started_containers.push((container_name, assigned_port_metadata));
+        // If any container failed to start, clean up all containers in the pod
+        if pod_creation_failed {
+            for container_name in containers_to_cleanup {
+                if let Err(e) = self.stop_container(&container_name).await {
+                    slog::error!(slog_scope::logger(), "Failed to cleanup container after pod creation failure";
+                        "service" => &service_name,
+                        "container" => &container_name,
+                        "error" => e.to_string()
+                    );
+                }
+            }
+            return Err(anyhow!("Failed to create one or more containers in pod"));
         }
 
         Ok(started_containers)
@@ -564,6 +747,20 @@ pub fn create_runtime(runtime: &str) -> Result<Arc<dyn ContainerRuntime>> {
     }
 }
 
+pub async fn get_next_pod_number(service_name: &str) -> u8 {
+    let runtime = RUNTIME.get().expect("Runtime not initialised").clone();
+
+    match runtime.list_containers(Some(service_name)).await {
+        Ok(containers) => containers
+            .iter()
+            .filter_map(|c| parse_container_name(&c.name).ok())
+            .map(|parts| parts.pod_number)
+            .max()
+            .map_or(0, |max| max + 1),
+        Err(_) => 0,
+    }
+}
+
 pub async fn manage(service_name: &str, config: ServiceConfig) {
     let log = slog_scope::logger();
     let instance_store = INSTANCE_STORE.get().unwrap();
@@ -588,7 +785,9 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
             "target" => target_instances
         );
 
-        for pod_number in current_instances..target_instances {
+        for _ in current_instances..target_instances {
+            let pod_number = get_next_pod_number(service_name).await;
+
             let uuid = uuid::Uuid::new_v4();
 
             slog::debug!(log, "Starting new pod instance";

@@ -32,6 +32,7 @@ notify = "8.0.0"
 notify-debouncer-full = "0.5.0"
 axum = "0.8.1"
 prometheus = { version = "0.13.4", features = ["process"] }
+tempfile = "3.15.0"
 
 # logging
 slog = { version = "2.7.0" }

@@ -10,7 +10,10 @@ use crate::{
         aggregate_pod_stats, get_config_by_service, parse_container_name, PodMetricsStrategy,
         ScaleMessage, ServiceConfig, CONFIG_UPDATES,
     },
-    container::{ContainerMetadata, ContainerRuntime, InstanceMetadata, INSTANCE_STORE, RUNTIME},
+    container::{
+        get_next_pod_number, ContainerMetadata, ContainerRuntime, InstanceMetadata, INSTANCE_STORE,
+        RUNTIME,
+    },
     proxy::{run_proxy_for_service, SERVER_BACKENDS},
 };
 
@@ -349,7 +352,7 @@ pub async fn scale_up(
         return Ok(());
     }
 
-    let pod_number = current_instances as u8;
+    let pod_number = get_next_pod_number(service_name).await;
 
     // Step 1: Start all containers in the pod
     let started_containers = runtime
