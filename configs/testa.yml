@@ -5,28 +5,29 @@ spec:
       image: strm/helloworld-http:latest
       ports:
         - port: 80
+          # node_port: 4333
+    - name: nginx-sidecar
+      image: nginx:latest
+      ports:
+        - port: 8080
           node_port: 4333
-    # - name: nginx-sidecar
-    #   image: nginx:latest
-    #   ports:
-    #     - port: 8080
-    #   volume_mounts:
-    #     - name: nginx-config
-    #       mount_path: /etc/nginx/nginx.conf
-    #       sub_path: nginx.conf
-    #   volumes:
-    #     nginx-config:
-    #       files:
-    #         nginx.conf: |
-    #           events {}
-    #           http {
-    #               server {
-    #                   listen 8080;
-    #                   location / {
-    #                       proxy_pass http://127.0.0.1:80;
-    #                   }
-    #               }
-    #           }
+      volume_mounts:
+        - name: nginx-config
+          mount_path: /etc/nginx/nginx.conf
+          sub_path: nginx.conf
+      volumes:
+        nginx-config:
+          files:
+            nginx.conf: |
+              events {}
+              http {
+                  server {
+                      listen 8080;
+                      location / {
+                          proxy_pass http://127.0.0.1:80;
+                      }
+                  }
+              }
 
 cpu_limit: 0.5
 memory_limit: 100M

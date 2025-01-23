@@ -11,8 +11,7 @@ use axum::{routing::get, Router};
 use clap::Parser;
 use config::CONFIG_STORE;
 use container::{
-    create_runtime, CONTAINER_STATS, INSTANCE_STORE, PORT_RANGE, RESERVED_PORTS, RUNTIME,
-    SCALING_TASKS, SERVICE_STATS,
+    create_runtime, CONTAINER_STATS, INSTANCE_STORE, RUNTIME, SCALING_TASKS, SERVICE_STATS,
 };
 use dashmap::DashMap;
 use logger::setup_logger;
@@ -66,15 +65,9 @@ async fn main() -> Result<()> {
     SERVICE_STATS.get_or_init(|| DashMap::new());
     SERVER_TASKS.get_or_init(DashMap::new);
     SERVER_BACKENDS.get_or_init(DashMap::new);
-    RESERVED_PORTS.get_or_init(DashMap::new);
 
     // Parse command line arguments
     let args = Args::parse();
-
-    // Initialize port range
-    PORT_RANGE
-        .set(args.port_min..args.port_max)
-        .expect("Failed to set port range");
 
     setup_logger(args.log_level);
     let log = slog_scope::logger();

@@ -83,26 +83,29 @@ pub async fn auto_scale(service_name: String) {
                                 {
                                     pod_failed = true;
                                     missing_containers.push((uuid, metadata.clone()));
-
                                     // Remove all pod's containers from load balancer
                                     for container in &metadata.containers {
                                         for port_info in &container.ports {
-                                            // Get the specific backend set for this node_port
-                                            let proxy_key =
-                                                format!("{}_{}", service_name, port_info.node_port);
-                                            if let Some(backends) =
-                                                SERVER_BACKENDS.get().unwrap().get(&proxy_key)
-                                            {
-                                                let addr = format!("127.0.0.1:{}", port_info.port);
-                                                if let Ok(backend) = Backend::new(&addr) {
-                                                    backends.remove(&backend);
-                                                    slog::debug!(log, "Removed missing container backend";
-                                                        "service" => %service_name,
-                                                        "container" => &container.name,
-                                                        "container_port" => port_info.port,
-                                                        "node_port" => port_info.node_port,
-                                                        "address" => &addr
+                                            if let Some(node_port) = port_info.node_port {
+                                                let proxy_key =
+                                                    format!("{}_{}", service_name, node_port);
+                                                if let Some(backends) =
+                                                    SERVER_BACKENDS.get().unwrap().get(&proxy_key)
+                                                {
+                                                    let addr = format!(
+                                                        "{}:{}",
+                                                        container.ip_address, port_info.port
                                                     );
+                                                    if let Ok(backend) = Backend::new(&addr) {
+                                                        backends.remove(&backend);
+                                                        slog::debug!(log, "Removed missing container backend";
+                                                            "service" => %service_name,
+                                                            "container" => &container.name,
+                                                            "container_port" => port_info.port,
+                                                            "node_port" => node_port,
+                                                            "address" => &addr
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
@@ -163,17 +166,19 @@ pub async fn auto_scale(service_name: String) {
                         }
                     }
                 }
-
                 let should_scale = if let Some(thresholds) = &current_config.resource_thresholds {
                     slog::debug!(log, "Starting threshold evaluation";
-            "service" => service_name.as_str(),
-            "config_address" => format!("{:p}", &current_config),
-            "threshold_address" => format!("{:p}", thresholds),
-            "cpu_relative" => thresholds.cpu_percentage_relative);
+                        "service" => service_name.as_str(),
+                        "config_address" => format!("{:p}", &current_config),
+                        "threshold_address" => format!("{:p}", thresholds),
+                        "cpu_relative" => thresholds.cpu_percentage_relative,
+                        "cpu_absolute" => thresholds.cpu_percentage,
+                        "memory_absolute" => thresholds.memory_percentage
+                    );
 
-                    // Count how many pods exceed thresholds
                     let mut pods_exceeding = 0;
-                    let total_pods = pod_stats.len();
+                    let mut total_evaluated_pods = 0; // Count only pods with ready metrics
+                    let mut skipped_pods_due_to_unready_metrics = 0;
 
                     for (_, stats) in &pod_stats {
                         let memory_percentage = if stats.memory_limit > 0 {
@@ -182,34 +187,54 @@ pub async fn auto_scale(service_name: String) {
                             0.0
                         };
 
-                        let cpu_exceeded = thresholds
-                            .cpu_percentage
-                            .map(|threshold| {
-                                stats.cpu_percentage >= 5.0
-                                    && stats.cpu_percentage > threshold as f64
-                            })
-                            .unwrap_or(false);
+                        let cpu_ready = stats.cpu_percentage > 0.0;
+                        let cpu_relative_ready = stats.cpu_percentage_relative > 0.0;
 
-                        let cpu_relative_exceeded = match thresholds.cpu_percentage_relative {
-                            Some(threshold) => {
-                                stats.cpu_percentage_relative >= 5.0
-                                    && stats.cpu_percentage_relative > threshold as f64
-                            }
-                            None => false,
-                        };
+                        if !cpu_ready || !cpu_relative_ready {
+                            skipped_pods_due_to_unready_metrics += 1;
+                            slog::debug!(log, "Skipping pod with unready metrics";
+                                "service" => service_name.as_str(),
+                                "cpu_ready" => cpu_ready,
+                                "cpu_relative_ready" => cpu_relative_ready,
+                                "cpu_value" => stats.cpu_percentage,
+                                "cpu_relative_value" => stats.cpu_percentage_relative
+                            );
+                            continue; // Skip this pod entirely
+                        }
 
-                        slog::debug!(log, "Pod threshold check";
-                "service" => service_name.as_str(),
-                "cpu_relative_exists" => thresholds.cpu_percentage_relative.is_some(),
-                "cpu_relative_value" => stats.cpu_percentage_relative,
-                "exceeded" => cpu_relative_exceeded);
+                        // If the pod is ready, include it in the evaluation
+                        total_evaluated_pods += 1;
 
-                        let memory_exceeded = thresholds
-                            .memory_percentage
-                            .map(|threshold| {
-                                memory_percentage > threshold as f64 && memory_percentage >= 5.0
-                            })
-                            .unwrap_or(false);
+                        let cpu_exceeded = thresholds.cpu_percentage.map_or(false, |threshold| {
+                            stats.cpu_percentage >= 5.0 && stats.cpu_percentage > threshold as f64
+                        });
+
+                        let cpu_relative_exceeded =
+                            thresholds
+                                .cpu_percentage_relative
+                                .map_or(false, |threshold| {
+                                    stats.cpu_percentage_relative >= 5.0
+                                        && stats.cpu_percentage_relative > threshold as f64
+                                });
+
+                        let memory_exceeded =
+                            thresholds.memory_percentage.map_or(false, |threshold| {
+                                memory_percentage >= 5.0 && memory_percentage > threshold as f64
+                            });
+
+                        // Log the evaluation details for each pod
+                        slog::debug!(log, "Pod threshold evaluation";
+                            "service" => service_name.as_str(),
+                            "cpu_absolute_threshold_exists" => thresholds.cpu_percentage.is_some(),
+                            "cpu_absolute_value" => stats.cpu_percentage,
+                            "cpu_absolute_exceeded" => cpu_exceeded,
+                            "cpu_relative_threshold_exists" => thresholds.cpu_percentage_relative.is_some(),
+                            "cpu_relative_value" => stats.cpu_percentage_relative,
+                            "cpu_relative_exceeded" => cpu_relative_exceeded,
+                            "memory_threshold_exists" => thresholds.memory_percentage.is_some(),
+                            "memory_value" => memory_percentage,
+                            "memory_exceeded" => memory_exceeded
+                        );
 
                         if cpu_exceeded || cpu_relative_exceeded || memory_exceeded {
                             pods_exceeding += 1;
@@ -217,24 +242,23 @@ pub async fn auto_scale(service_name: String) {
                     }
 
                     // Calculate the percentage of pods that are exceeding thresholds
-                    let percentage_exceeding = if total_pods > 0 {
-                        (pods_exceeding as f64 / total_pods as f64) * 100.0
+                    let percentage_exceeding = if total_evaluated_pods > 0 {
+                        (pods_exceeding as f64 / total_evaluated_pods as f64) * 100.0
                     } else {
                         0.0
                     };
 
-                    let should_scale = percentage_exceeding >= 75.0;
+                    slog::info!(log, "Threshold evaluation summary";
+                        "service" => service_name.as_str(),
+                        "pods_exceeding" => pods_exceeding.to_string(),
+                        "total_pods" => pod_stats.len(), // Original total pods before skipping
+                        "total_evaluated_pods" => total_evaluated_pods.to_string(), // Pods with ready metrics
+                        "percentage_exceeding" => percentage_exceeding.to_string(),
+                        "skipped_pods_due_to_unready_metrics" => skipped_pods_due_to_unready_metrics.to_string(),
+                        "should_scale" => percentage_exceeding >= 75.0
+                    );
 
-                    if should_scale {
-                        slog::info!(log, "High load detected across pods";
-                            "service" => service_name.as_str(),
-                            "pods_exceeding" => pods_exceeding.to_string(),
-                            "total_pods" => total_pods.to_string(),
-                            "percentage_exceeding" => percentage_exceeding.to_string()
-                        );
-                    }
-
-                    should_scale
+                    percentage_exceeding >= 75.0
                 } else {
                     false
                 };
@@ -342,7 +366,6 @@ pub async fn scale_up(
     let instance_store = INSTANCE_STORE.get().unwrap();
     let server_backends = SERVER_BACKENDS.get().unwrap();
 
-    // Get current instances without holding long-term lock
     let current_instances = match instance_store.get(service_name) {
         Some(entry) => entry.value().len(),
         None => 0,
@@ -354,7 +377,6 @@ pub async fn scale_up(
 
     let pod_number = get_next_pod_number(service_name).await;
 
-    // Step 1: Start all containers in the pod
     let started_containers = runtime
         .start_containers(
             service_name,
@@ -365,49 +387,22 @@ pub async fn scale_up(
         )
         .await?;
 
-    slog::info!(log, "Pod containers started";
-        "service" => service_name,
-        "pod_number" => pod_number,
-        "container_count" => started_containers.len()
-    );
-
-    // Step 2: Wait for all containers to be healthy
-    let mut all_healthy = true;
-    for (container_name, _) in &started_containers {
-        if !wait_for_container_health(container_name, runtime.clone()).await {
-            slog::error!(log, "Container failed health check, removing pod";
-                "service" => service_name,
-                "container" => container_name
-            );
-            all_healthy = false;
-            break;
-        }
-    }
-
-    if !all_healthy {
-        // Clean up all containers in the pod
-        for (container_name, _) in started_containers {
-            let _ = runtime.stop_container(&container_name).await;
-        }
-        return Err(anyhow::anyhow!(
-            "One or more containers failed health check"
-        ));
-    }
-
-    // Extract UUID from any container name (they all share the same UUID)
     let container_parts = parse_container_name(&started_containers[0].0)?;
     let uuid = container_parts.uuid;
+    let network_name = format!("{}_{}", service_name, uuid);
 
-    // Step 3: Add to instance store
     if let Some(mut instances) = instance_store.get_mut(service_name) {
         instances.insert(
             uuid,
             InstanceMetadata {
                 uuid,
+                network: network_name.clone(),
                 containers: started_containers
                     .iter()
-                    .map(|(name, ports)| ContainerMetadata {
+                    .map(|(name, ip, ports)| ContainerMetadata {
                         name: name.clone(),
+                        network: network_name.clone(),
+                        ip_address: ip.clone(),
                         ports: ports.clone(),
                         status: "running".to_string(),
                     })
@@ -416,63 +411,24 @@ pub async fn scale_up(
         );
     }
 
-    // Step 4: Wait for application readiness for each container
-    let mut all_ready = true;
-    for (container_name, port_metadata) in &started_containers {
+    // Add containers with node_ports to load balancer
+    for (container_name, ip, port_metadata) in started_containers {
         for port_info in port_metadata {
-            // Check readiness using the container's actual port
-            if !check_application_readiness("127.0.0.1", port_info.port, Duration::from_secs(30))
-                .await
-            {
-                slog::error!(log, "Container application failed readiness check";
-                    "service" => service_name,
-                    "container" => container_name,
-                    "container_port" => port_info.port,
-                    "node_port" => port_info.node_port
-                );
-                all_ready = false;
-                break;
-            }
-        }
-        if !all_ready {
-            break;
-        }
-    }
-
-    if !all_ready {
-        // Clean up all containers in the pod
-        for (container_name, _) in started_containers {
-            let _ = runtime.stop_container(&container_name).await;
-        }
-        return Err(anyhow!(
-            "One or more container applications failed readiness check"
-        ));
-    }
-
-    // Step 5: Add all containers to load balancer after they're healthy
-    for (container_name, port_metadata) in started_containers {
-        for port_info in port_metadata {
-            // Get the specific backend set for this node_port
-            let proxy_key = format!("{}_{}", service_name, port_info.node_port);
-            if let Some(backends) = server_backends.get(&proxy_key) {
-                // Use the container's actual port for the backend
-                let addr = format!("127.0.0.1:{}", port_info.port);
-                if let Ok(backend) = Backend::new(&addr) {
-                    backends.insert(backend);
-                    slog::info!(log, "Added backend to load balancer";
-                        "service" => service_name,
-                        "container" => &container_name,
-                        "container_port" => port_info.port,
-                        "node_port" => port_info.node_port,
-                        "address" => &addr
-                    );
+            if let Some(node_port) = port_info.node_port {
+                let proxy_key = format!("{}_{}", service_name, node_port);
+                if let Some(backends) = server_backends.get(&proxy_key) {
+                    let addr = format!("{}:{}", ip, port_info.port);
+                    if let Ok(backend) = Backend::new(&addr) {
+                        backends.insert(backend);
+                        slog::info!(log, "Added backend to load balancer";
+                            "service" => service_name,
+                            "container" => &container_name,
+                            "ip" => &ip,
+                            "port" => port_info.port,
+                            "node_port" => node_port
+                        );
+                    }
                 }
-            } else {
-                slog::warn!(log, "No backend set found for node_port";
-                    "service" => service_name,
-                    "container" => &container_name,
-                    "node_port" => port_info.node_port
-                );
             }
         }
     }
@@ -490,7 +446,6 @@ pub async fn scale_down(
     let instance_store = INSTANCE_STORE.get().unwrap();
     let server_backends = SERVER_BACKENDS.get().unwrap();
 
-    // Get instance data without holding long-term lock
     let instance_data = match instance_store.get(service_name) {
         Some(entry) => entry.value().clone(),
         None => return Ok(()),
@@ -500,52 +455,34 @@ pub async fn scale_down(
         return Ok(());
     }
 
-    // Get target pod metadata
     let target_metadata = match instance_data.get(&target_uuid) {
         Some(metadata) => metadata.clone(),
         None => return Ok(()),
     };
 
-    // Step 1: Remove all pod's containers from load balancer first
+    // Remove containers from load balancer
     for container in &target_metadata.containers {
         for port_info in &container.ports {
-            // Get the specific backend set for this node_port
-            let proxy_key = format!("{}_{}", service_name, port_info.node_port);
-            if let Some(backends) = server_backends.get(&proxy_key) {
-                let addr = format!("127.0.0.1:{}", port_info.port);
-                if let Ok(backend) = Backend::new(&addr) {
-                    backends.remove(&backend);
-                    slog::info!(log, "Removed backend from load balancer";
-                        "service" => service_name,
-                        "container" => &container.name,
-                        "container_port" => port_info.port,
-                        "node_port" => port_info.node_port,
-                        "address" => &addr
-                    );
+            if let Some(node_port) = port_info.node_port {
+                let proxy_key = format!("{}_{}", service_name, node_port);
+                if let Some(backends) = server_backends.get(&proxy_key) {
+                    let addr = format!("{}:{}", container.ip_address, port_info.port);
+                    if let Ok(backend) = Backend::new(&addr) {
+                        backends.remove(&backend);
+                    }
                 }
-            } else {
-                slog::warn!(log, "No backend set found for node_port during removal";
-                    "service" => service_name,
-                    "container" => &container.name,
-                    "node_port" => port_info.node_port
-                );
             }
         }
     }
-
-    // Step 2: Wait for in-flight requests to complete
-    slog::info!(log, "Waiting for in-flight requests";
-        "service" => service_name,
-        "pod_uuid" => %target_uuid
-    );
+    // Wait for in-flight requests
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    // Step 3: Remove from instance store
+    // Remove from instance store
     if let Some(mut instances) = instance_store.get_mut(service_name) {
         instances.remove(&target_uuid);
     }
 
-    // Step 4: Stop all containers in the pod
+    // Stop containers
     for container in &target_metadata.containers {
         if let Err(e) = runtime.stop_container(&container.name).await {
             slog::error!(log, "Failed to stop container";
@@ -553,21 +490,18 @@ pub async fn scale_down(
                 "container" => &container.name,
                 "error" => e.to_string()
             );
-            // Continue trying to stop other containers even if one fails
             continue;
         }
-
-        slog::info!(log, "Stopped container";
-            "service" => service_name,
-            "container" => &container.name
-        );
     }
 
-    slog::info!(log, "Successfully scaled down pod";
-        "service" => service_name,
-        "pod_uuid" => %target_uuid,
-        "container_count" => target_metadata.containers.len()
-    );
+    // Remove network
+    if let Err(e) = runtime.remove_pod_network(&target_metadata.network).await {
+        slog::error!(log, "Failed to remove network";
+            "service" => service_name,
+            "network" => &target_metadata.network,
+            "error" => e.to_string()
+        );
+    }
 
     Ok(())
 }

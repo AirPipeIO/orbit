@@ -91,8 +91,15 @@ async fn update_cache_with_timeout() -> Result<()> {
 #[derive(Serialize)]
 pub struct ServiceStatus {
     service_name: String,
-    service_ports: Vec<u16>, // Changed from single service_url to multiple ports
-    pods: Vec<PodStatus>,    // Changed from containers to pods
+    service_ports: Vec<u16>,
+    pods: Vec<PodStatus>,
+}
+
+#[derive(Serialize)]
+pub struct PortStatus {
+    pub port: u16,
+    pub node_port: Option<u16>,
+    pub healthy: bool,
 }
 
 #[derive(Serialize)]
@@ -104,19 +111,13 @@ pub struct PodStatus {
 #[derive(Serialize)]
 pub struct ContainerStatus {
     name: String,
+    ip_address: String,
     ports: Vec<PortStatus>,
     status: String,
     cpu_percentage: Option<f64>,
     cpu_percentage_relative: Option<f64>,
     memory_usage: Option<u64>,
     memory_limit: Option<u64>,
-}
-
-#[derive(Serialize)]
-pub struct PortStatus {
-    pub port: u16,
-    pub node_port: u16,
-    pub healthy: bool,
 }
 
 pub async fn get_status() -> Json<Vec<ServiceStatus>> {
@@ -167,8 +168,11 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
                                 .map(|port_info| {
                                     let container_addr = format!("127.0.0.1:{}", port_info.port);
                                     let healthy = server_backends.iter().any(|backend_entry| {
-                                        let proxy_key =
-                                            format!("{}_{}", service_name, port_info.node_port);
+                                        let proxy_key = format!(
+                                            "{}_{}",
+                                            service_name,
+                                            port_info.node_port.unwrap_or(0)
+                                        ); // !!! check
                                         backend_entry.key() == &proxy_key
                                             && backend_entry.value().iter().any(|backend| {
                                                 backend.addr.to_string() == container_addr
@@ -185,11 +189,15 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
 
                             ContainerStatus {
                                 name: container.name.clone(),
+                                ip_address: container.ip_address.clone(),
                                 ports,
                                 status: if container.ports.iter().any(|port_info| {
                                     let addr = format!("127.0.0.1:{}", port_info.port);
-                                    let proxy_key =
-                                        format!("{}_{}", service_name, port_info.node_port);
+                                    let proxy_key = format!(
+                                        "{}_{}",
+                                        service_name,
+                                        port_info.node_port.unwrap_or(0)
+                                    ); // !!! check
                                     server_backends
                                         .get(&proxy_key)
                                         .map(|backends| {

@@ -6,6 +6,7 @@ use bollard::container::{
     StatsOptions,
 };
 use bollard::models::{HostConfig, PortBinding};
+use bollard::network::CreateNetworkOptions;
 use bollard::secret::{Mount, MountTypeEnum};
 use bollard::Docker;
 use dashmap::DashMap;
@@ -62,8 +63,6 @@ pub struct Container {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ContainerPort {
     pub port: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -180,6 +179,7 @@ pub async fn update_container_stats(
         cpu_percentage_relative,
         memory_usage: stats.memory_stats.usage.unwrap_or(0),
         memory_limit: stats.memory_stats.limit.unwrap_or(0),
+        ip_address: String::from(""),
         port_mappings: HashMap::new(), // Initialize empty, will be populated by inspect_container
         timestamp: now,
     };
@@ -218,12 +218,8 @@ pub fn initialize_stats() {
 
 pub static RUNTIME: OnceLock<Arc<dyn ContainerRuntime>> = OnceLock::new();
 
-pub static RESERVED_PORTS: OnceLock<DashMap<u16, String>> = OnceLock::new();
-
 pub static INSTANCE_STORE: OnceLock<DashMap<String, HashMap<Uuid, InstanceMetadata>>> =
     OnceLock::new();
-
-pub static PORT_RANGE: OnceLock<Range<u16>> = OnceLock::new();
 
 // Global registry for scaling tasks
 pub static SCALING_TASKS: OnceLock<DashMap<String, JoinHandle<()>>> = OnceLock::new();
@@ -240,35 +236,32 @@ pub struct StatsEntry {
 pub static CONTAINER_STATS: OnceLock<DashMap<String, StatsEntry>> = OnceLock::new();
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct InstanceMetadata {
-    pub uuid: Uuid,
-    pub containers: Vec<ContainerMetadata>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ContainerMetadata {
     pub name: String,
+    pub network: String,
+    pub ip_address: String,
     pub ports: Vec<ContainerPortMetadata>,
     pub status: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ContainerPortMetadata {
-    pub port: u16,      // The container's port
-    pub node_port: u16, // The external port
+    pub port: u16,              // Container's exposed port
+    pub node_port: Option<u16>, // Optional external port
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct InstanceMetadata {
+    pub uuid: Uuid,
+    pub network: String,
+    pub containers: Vec<ContainerMetadata>,
 }
 
 // Define the container runtime trait
 #[async_trait]
 pub trait ContainerRuntime: Send + Sync + std::fmt::Debug {
-    // async fn start_container(
-    //     &self,
-    //     name: &str,
-    //     image: &str,
-    //     target_port: u16,
-    //     memory_limit: Option<Value>, // Human-readable memory limit (e.g., "512Mi")
-    //     cpu_limit: Option<Value>,    // Human-readable CPU limit (e.g., "0.5")
-    // ) -> Result<u16>;
+    async fn remove_pod_network(&self, network_name: &str) -> Result<()>;
+    async fn create_pod_network(&self, service_name: &str, uuid: &str) -> Result<String>;
     async fn start_containers(
         &self,
         service_name: &str,
@@ -276,7 +269,7 @@ pub trait ContainerRuntime: Send + Sync + std::fmt::Debug {
         containers: &Vec<Container>,
         memory_limit: Option<Value>,
         cpu_limit: Option<Value>,
-    ) -> Result<Vec<(String, Vec<ContainerPortMetadata>)>>; // Returns vec of (container_name, ports)
+    ) -> Result<Vec<(String, String, Vec<ContainerPortMetadata>)>>; // Returns vec of (container_name, ports)
     async fn stop_container(&self, name: &str) -> Result<()>;
     async fn inspect_container(&self, name: &str) -> Result<ContainerStats>;
     async fn list_containers(&self, service_name: Option<&str>) -> Result<Vec<ContainerInfo>>;
@@ -301,30 +294,13 @@ pub struct DockerRuntime {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ContainerStats {
     pub id: String,
+    pub ip_address: String,
     pub cpu_percentage: f64,
     pub cpu_percentage_relative: f64,
     pub memory_usage: u64,
     pub memory_limit: u64,
-    pub port_mappings: HashMap<u16, u16>, // container_port -> host_port
+    pub port_mappings: HashMap<u16, u16>,
     timestamp: SystemTime,
-}
-
-pub fn update_reserved_ports(service_name: &str, spec: &ServiceSpec) {
-    let reserved_ports = RESERVED_PORTS.get().unwrap();
-
-    // For each container in the service
-    for container in &spec.containers {
-        if let Some(ports) = &container.ports {
-            for port_config in ports {
-                reserved_ports.insert(port_config.port, service_name.to_string());
-            }
-        }
-    }
-}
-
-pub fn remove_reserved_ports(service_name: &str) {
-    let reserved_ports = RESERVED_PORTS.get().unwrap();
-    reserved_ports.retain(|_, v| v != service_name);
 }
 
 impl DockerRuntime {
@@ -332,30 +308,6 @@ impl DockerRuntime {
         let client = Docker::connect_with_local_defaults()
             .map_err(|e| anyhow!("Failed to connect to Docker: {:?}", e))?;
         Ok(Self { client })
-    }
-
-    fn is_port_available(port: u16) -> bool {
-        use std::net::TcpListener;
-
-        // Check if the port is available system-wide
-        if !TcpListener::bind(("0.0.0.0", port)).is_ok() {
-            return false;
-        }
-
-        // Check against reserved ports
-        let reserved_ports = RESERVED_PORTS.get().unwrap();
-        if reserved_ports.contains_key(&port) {
-            return false;
-        }
-
-        true
-    }
-
-    fn find_available_port() -> Option<u16> {
-        let port_range = PORT_RANGE.get().expect("Port range not initialized");
-        port_range
-            .clone()
-            .find(|port| Self::is_port_available(*port))
     }
 
     async fn setup_volume_mounts(
@@ -423,7 +375,6 @@ impl DockerRuntime {
 
         Ok((temp_dir, mounts))
     }
-
     async fn prepare_port_configuration(
         &self,
         container: &Container,
@@ -438,24 +389,13 @@ impl DockerRuntime {
 
         if let Some(ports) = &container.ports {
             for port_config in ports {
-                let container_port = port_config.target_port.unwrap_or(port_config.port);
+                let container_port = port_config.port;
                 let container_port_key = format!("{}/tcp", container_port);
-
-                let host_port = Self::find_available_port()
-                    .ok_or_else(|| anyhow!("No available ports found in the configured range"))?;
-
-                port_bindings.insert(
-                    container_port_key.clone(),
-                    Some(vec![PortBinding {
-                        host_ip: Some("0.0.0.0".to_string()),
-                        host_port: Some(host_port.to_string()),
-                    }]),
-                );
-
                 exposed_ports.insert(container_port_key, HashMap::new());
+
                 assigned_port_metadata.push(ContainerPortMetadata {
-                    port: host_port,
-                    node_port: port_config.node_port.unwrap_or(port_config.port),
+                    port: container_port,
+                    node_port: port_config.node_port,
                 });
             }
         }
@@ -466,6 +406,36 @@ impl DockerRuntime {
 
 #[async_trait]
 impl ContainerRuntime for DockerRuntime {
+    async fn remove_pod_network(&self, network_name: &str) -> Result<()> {
+        self.client.remove_network(network_name).await?;
+        Ok(())
+    }
+
+    async fn create_pod_network(&self, service_name: &str, uuid: &str) -> Result<String> {
+        let network_name = format!("{}_{}", service_name, uuid);
+
+        // Check if network exists and remove if it does
+        if let Ok(networks) = self.client.list_networks::<String>(None).await {
+            if networks
+                .iter()
+                .any(|n| n.name == Some(network_name.clone()))
+            {
+                self.client.remove_network(&network_name).await?;
+            }
+        }
+
+        // Create network
+        self.client
+            .create_network(CreateNetworkOptions {
+                name: network_name.clone(),
+                driver: "bridge".to_string(),
+                ..Default::default()
+            })
+            .await?;
+
+        Ok(network_name)
+    }
+
     async fn start_containers(
         &self,
         service_name: &str,
@@ -473,7 +443,7 @@ impl ContainerRuntime for DockerRuntime {
         containers: &Vec<Container>,
         memory_limit: Option<Value>,
         cpu_limit: Option<Value>,
-    ) -> Result<Vec<(String, Vec<ContainerPortMetadata>)>> {
+    ) -> Result<Vec<(String, String, Vec<ContainerPortMetadata>)>> {
         let uuid = Uuid::new_v4();
         let mut started_containers = Vec::new();
         let mut containers_to_cleanup = Vec::new();
@@ -567,13 +537,28 @@ impl ContainerRuntime for DockerRuntime {
                         .await
                     {
                         Ok(_) => {
-                            slog::info!(slog_scope::logger(), "Container started successfully";
-                                "service" => service_name,
-                                "container" => &container_name,
-                                "ports" => ?assigned_port_metadata
-                            );
-                            containers_to_cleanup.push(container_name.clone());
-                            started_containers.push((container_name, assigned_port_metadata));
+                            // After starting container, inspect it to get network details
+                            if let Ok(container_data) =
+                                self.client.inspect_container(&container_name, None).await
+                            {
+                                if let Some(network_settings) = container_data.network_settings {
+                                    if let Some(ip) = network_settings.ip_address {
+                                        slog::info!(slog_scope::logger(), "Container started successfully";
+                                            "service" => service_name,
+                                            "container" => &container_name,
+                                            "ip" => &ip,
+                                            "ports" => ?assigned_port_metadata
+                                        );
+                                        containers_to_cleanup
+                                            .push((container_name.clone(), ip.clone()));
+                                        started_containers.push((
+                                            container_name,
+                                            ip,
+                                            assigned_port_metadata,
+                                        ));
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             slog::error!(slog_scope::logger(), "Failed to start container";
@@ -600,7 +585,7 @@ impl ContainerRuntime for DockerRuntime {
 
         // If any container failed to start, clean up all containers in the pod
         if pod_creation_failed {
-            for container_name in containers_to_cleanup {
+            for (container_name, _) in containers_to_cleanup {
                 if let Err(e) = self.stop_container(&container_name).await {
                     slog::error!(slog_scope::logger(), "Failed to cleanup container after pod creation failure";
                         "service" => &service_name,
@@ -644,20 +629,28 @@ impl ContainerRuntime for DockerRuntime {
         });
 
         let mut stats_stream = self.client.stats(name, options);
-
         let stats = stats_stream
             .next()
             .await
-            .ok_or_else(|| anyhow!("No stats available for container {}", name))?;
+            .ok_or_else(|| anyhow!("No stats available for container {}", name))??;
 
-        let stats = stats?;
-
-        // Get container inspection data for port mappings
         let container_data = self.client.inspect_container(name, None).await?;
 
-        // Extract port mappings from container data
+        let mut ip_address = String::from("");
+
+        //  Extract port mappings from container data
         let mut port_mappings = HashMap::new();
         if let Some(network_settings) = container_data.network_settings {
+            ip_address = if let Some(networks) = network_settings.networks {
+                networks
+                    .values()
+                    .next()
+                    .and_then(|network| network.ip_address.clone())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
             if let Some(ports) = network_settings.ports {
                 for (container_port_proto, host_bindings) in ports {
                     if let Some(host_bindings) = host_bindings {
@@ -692,33 +685,102 @@ impl ContainerRuntime for DockerRuntime {
             .as_ref() // Safely access the Option<Value>
             .and_then(|value| parse_cpu_limit(value).ok()); // Parse and handle Result -> Option
 
-        // Update stats history and get CPU percentage
         let mut container_stats =
             update_container_stats(service_name, name, stats.clone(), nano_cpus).await;
+        container_stats.ip_address = ip_address;
         container_stats.port_mappings = port_mappings;
 
         Ok(container_stats)
     }
 
+    // async fn inspect_container_old(&self, name: &str) -> Result<ContainerStats> {
+    //     let options = Some(StatsOptions {
+    //         stream: false,
+    //         one_shot: true,
+    //     });
+
+    //     let mut stats_stream = self.client.stats(name, options);
+
+    //     let stats = stats_stream
+    //         .next()
+    //         .await
+    //         .ok_or_else(|| anyhow!("No stats available for container {}", name))?;
+
+    //     let stats = stats?;
+
+    //     // Get container inspection data for port mappings
+    //     let container_data = self.client.inspect_container(name, None).await?;
+
+    //     // Extract port mappings from container data
+    //     let mut port_mappings = HashMap::new();
+    //     if let Some(network_settings) = container_data.network_settings {
+    //         if let Some(ports) = network_settings.ports {
+    //             for (container_port_proto, host_bindings) in ports {
+    //                 if let Some(host_bindings) = host_bindings {
+    //                     for binding in host_bindings {
+    //                         if let Some(host_port) = binding.host_port {
+    //                             // Parse "80/tcp" to get just the port number
+    //                             if let Some(container_port) = container_port_proto
+    //                                 .split('/')
+    //                                 .next()
+    //                                 .and_then(|p| p.parse::<u16>().ok())
+    //                             {
+    //                                 if let Ok(host_port) = host_port.parse::<u16>() {
+    //                                     port_mappings.insert(container_port, host_port);
+    //                                 }
+    //                             }
+    //                         }
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+
+    //     let service_name = name
+    //         .splitn(2, "__")
+    //         .next()
+    //         .expect("Split always returns at least one element");
+
+    //     let service_cfg = get_config_by_service(service_name).unwrap();
+
+    //     let nano_cpus = service_cfg
+    //         .cpu_limit
+    //         .as_ref() // Safely access the Option<Value>
+    //         .and_then(|value| parse_cpu_limit(value).ok()); // Parse and handle Result -> Option
+
+    //     // Update stats history and get CPU percentage
+    //     let mut container_stats =
+    //         update_container_stats(service_name, name, stats.clone(), nano_cpus).await;
+    //     container_stats.port_mappings = port_mappings;
+
+    //     Ok(container_stats)
+    // }
+
     async fn list_containers(&self, service_name: Option<&str>) -> Result<Vec<ContainerInfo>> {
         let mut filters = HashMap::new();
 
         if let Some(service_name) = service_name {
-            // Filter by service name using the naming convention
             filters.insert("name".to_string(), vec![format!("{}__", service_name)]);
         }
 
         let containers = self
             .client
             .list_containers(Some(bollard::container::ListContainersOptions {
-                all: true,
+                all: false, // Change to only get running containers
                 filters,
                 ..Default::default()
             }))
             .await?;
 
+        slog::debug!(slog_scope::logger(), "Found containers";
+            "service" => service_name,
+            "count" => containers.len(),
+            "containers" => ?containers
+        );
+
         Ok(containers
             .into_iter()
+            .filter(|c| c.state.as_deref() == Some("running"))
             .map(|c| ContainerInfo {
                 id: c.id.unwrap_or_default(),
                 name: c
@@ -733,8 +795,8 @@ impl ContainerRuntime for DockerRuntime {
                     .ports
                     .unwrap_or_default()
                     .get(0)
-                    .and_then(|p| p.public_port) // Flatten the nested Option
-                    .unwrap_or(0), // Default to 0 if no port is available
+                    .and_then(|p| p.public_port)
+                    .unwrap_or(0),
             })
             .collect())
     }
@@ -760,24 +822,18 @@ pub async fn get_next_pod_number(service_name: &str) -> u8 {
         Err(_) => 0,
     }
 }
-
 pub async fn manage(service_name: &str, config: ServiceConfig) {
     let log = slog_scope::logger();
     let instance_store = INSTANCE_STORE.get().unwrap();
     let runtime = RUNTIME.get().expect("Runtime not initialised").clone();
 
-    // Calculate required containers outside the lock
-    let current_instances = {
-        let instances = instance_store
-            .get(service_name)
-            .map(|entry| entry.value().len())
-            .unwrap_or(0);
-        instances
-    };
+    let current_instances = instance_store
+        .get(service_name)
+        .map(|entry| entry.value().len())
+        .unwrap_or(0);
 
     let target_instances = config.instance_count.min as usize;
 
-    // Scale up without holding the main lock
     if current_instances < target_instances {
         slog::debug!(log, "Starting scale up";
             "service" => service_name,
@@ -787,8 +843,8 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
 
         for _ in current_instances..target_instances {
             let pod_number = get_next_pod_number(service_name).await;
-
             let uuid = uuid::Uuid::new_v4();
+            let network_name = format!("{}_{}", service_name, uuid);
 
             slog::debug!(log, "Starting new pod instance";
                 "service" => service_name,
@@ -799,7 +855,7 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
             match runtime
                 .start_containers(
                     service_name,
-                    pod_number as u8, // Pass the pod number
+                    pod_number as u8,
                     &config.spec.containers,
                     config.memory_limit.clone(),
                     config.cpu_limit.clone(),
@@ -807,24 +863,27 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
                 .await
             {
                 Ok(started_containers) => {
-                    for (container_name, ports) in &started_containers {
+                    for (container_name, ip, ports) in &started_containers {
                         slog::debug!(log, "Container started successfully";
                             "service" => service_name,
                             "container" => container_name,
+                            "ip" => ip,
                             "ports" => ?ports
                         );
                     }
 
-                    // Only lock briefly to update the instance store
                     if let Some(mut instances) = instance_store.get_mut(service_name) {
                         instances.insert(
                             uuid,
                             InstanceMetadata {
                                 uuid,
+                                network: network_name.clone(),
                                 containers: started_containers
                                     .into_iter()
-                                    .map(|(name, ports)| ContainerMetadata {
+                                    .map(|(name, ip, ports)| ContainerMetadata {
                                         name,
+                                        network: network_name.clone(),
+                                        ip_address: ip,
                                         ports,
                                         status: "running".to_string(),
                                     })
@@ -832,16 +891,18 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
                             },
                         );
                     } else {
-                        // Create new entry if it doesn't exist
                         let mut map = HashMap::new();
                         map.insert(
                             uuid,
                             InstanceMetadata {
                                 uuid,
+                                network: network_name.clone(),
                                 containers: started_containers
                                     .into_iter()
-                                    .map(|(name, ports)| ContainerMetadata {
+                                    .map(|(name, ip, ports)| ContainerMetadata {
                                         name,
+                                        network: network_name.clone(),
+                                        ip_address: ip,
                                         ports,
                                         status: "running".to_string(),
                                     })
@@ -884,18 +945,19 @@ pub async fn clean_up(service_name: &str) {
             for container in metadata.containers {
                 // Remove from load balancer for each port
                 for port_metadata in &container.ports {
-                    // Need to remove from the specific proxy instance for this node_port
-                    let proxy_key = format!("{}_{}", service_name, port_metadata.node_port);
-                    if let Some(backends) = SERVER_BACKENDS.get().unwrap().get(&proxy_key) {
-                        let addr = format!("127.0.0.1:{}", port_metadata.port);
-                        if let Ok(backend) = Backend::new(&addr) {
-                            backends.remove(&backend);
-                            slog::debug!(log, "Removed backend from load balancer";
-                                "service" => service_name,
-                                "container" => &container.name,
-                                "port" => port_metadata.port,
-                                "node_port" => port_metadata.node_port
-                            );
+                    if let Some(node_port) = port_metadata.node_port {
+                        let proxy_key = format!("{}_{}", service_name, node_port);
+                        if let Some(backends) = SERVER_BACKENDS.get().unwrap().get(&proxy_key) {
+                            let addr = format!("{}:{}", container.ip_address, port_metadata.port);
+                            if let Ok(backend) = Backend::new(&addr) {
+                                backends.remove(&backend);
+                                slog::debug!(log, "Removed backend from load balancer";
+                                    "service" => service_name,
+                                    "container" => &container.name,
+                                    "port" => port_metadata.port,
+                                    "node_port" => node_port
+                                );
+                            }
                         }
                     }
                 }
