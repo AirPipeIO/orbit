@@ -5,7 +5,6 @@ spec:
       image: strm/helloworld-http:latest
       ports:
         - port: 80
-          # node_port: 4333
     - name: nginx-sidecar
       image: nginx:latest
       ports:
@@ -24,7 +23,7 @@ spec:
                   server {
                       listen 8080;
                       location / {
-                          proxy_pass http://127.0.0.1:80;
+                          proxy_pass http://main:80;
                       }
                   }
               }

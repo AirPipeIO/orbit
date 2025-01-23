@@ -17,7 +17,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -273,6 +273,14 @@ pub trait ContainerRuntime: Send + Sync + std::fmt::Debug {
     async fn stop_container(&self, name: &str) -> Result<()>;
     async fn inspect_container(&self, name: &str) -> Result<ContainerStats>;
     async fn list_containers(&self, service_name: Option<&str>) -> Result<Vec<ContainerInfo>>;
+    async fn attempt_start_containers(
+        &self,
+        service_name: &str,
+        pod_number: u8,
+        containers: &Vec<Container>,
+        memory_limit: Option<Value>,
+        cpu_limit: Option<Value>,
+    ) -> Result<Vec<(String, String, Vec<ContainerPortMetadata>)>>;
 }
 
 // Container information struct
@@ -444,11 +452,114 @@ impl ContainerRuntime for DockerRuntime {
         memory_limit: Option<Value>,
         cpu_limit: Option<Value>,
     ) -> Result<Vec<(String, String, Vec<ContainerPortMetadata>)>> {
-        let uuid = Uuid::new_v4();
-        let mut started_containers = Vec::new();
-        let mut containers_to_cleanup = Vec::new();
+        const MAX_RETRIES: u32 = 3;
+        let mut retry_count = 0;
 
-        // Parse resource limits once as they apply to all containers in the pod
+        while retry_count < MAX_RETRIES {
+            match self
+                .attempt_start_containers(
+                    service_name,
+                    pod_number,
+                    containers,
+                    memory_limit.clone(),
+                    cpu_limit.clone(),
+                )
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    retry_count += 1;
+                    if retry_count == MAX_RETRIES {
+                        return Err(e);
+                    }
+                    slog::warn!(slog_scope::logger(), "Container creation failed, retrying";
+                        "service" => service_name,
+                        "retry" => retry_count,
+                        "error" => e.to_string()
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+
+        Err(anyhow!("Max retries exceeded"))
+    }
+
+    async fn attempt_start_containers(
+        &self,
+        service_name: &str,
+        pod_number: u8,
+        containers: &Vec<Container>,
+        memory_limit: Option<Value>,
+        cpu_limit: Option<Value>,
+    ) -> Result<Vec<(String, String, Vec<ContainerPortMetadata>)>> {
+        let uuid = Uuid::new_v4();
+        let network_name = format!("{}_{}", service_name, uuid);
+
+        // Create network
+        self.create_pod_network(service_name, &uuid.to_string())
+            .await?;
+
+        let mut temporary_containers = Vec::new();
+        let mut container_ips = HashMap::new();
+
+        // First pass: Create temporary containers to get their IPs
+        for container in containers {
+            let temp_name = format!("temp_{}_{}", service_name, container.name);
+            let config = Config {
+                image: Some(container.image.clone()),
+                host_config: Some(HostConfig {
+                    network_mode: Some(network_name.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            self.client
+                .create_container(
+                    Some(CreateContainerOptions {
+                        name: temp_name.as_str(),
+                        platform: None,
+                    }),
+                    config,
+                )
+                .await?;
+
+            self.client
+                .start_container(&temp_name, None::<StartContainerOptions<String>>)
+                .await?;
+
+            if let Ok(container_data) = self.client.inspect_container(&temp_name, None).await {
+                if let Some(network_settings) = container_data.network_settings {
+                    if let Some(networks) = network_settings.networks {
+                        if let Some(network) = networks.get(&network_name) {
+                            if let Some(ip) = &network.ip_address {
+                                container_ips.insert(container.name.clone(), ip.clone());
+                                temporary_containers.push(temp_name);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            return Err(anyhow!("Failed to get IP for temporary container"));
+        }
+
+        // Clean up temporary containers
+        for temp_name in &temporary_containers {
+            let _ = self.client.stop_container(temp_name, None).await;
+            let _ = self
+                .client
+                .remove_container(
+                    temp_name,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+        }
+
         let parsed_memory_limit = memory_limit
             .as_ref()
             .map(|v| parse_memory_limit(v).unwrap_or(0))
@@ -458,52 +569,31 @@ impl ContainerRuntime for DockerRuntime {
             .map(|v| parse_cpu_limit(v).unwrap_or(0))
             .unwrap_or(0);
 
-        // Track creation success
+        // Second pass: Create final containers with correct host configuration
+        let mut started_containers = Vec::new();
+        let mut containers_to_cleanup = Vec::new();
         let mut pod_creation_failed = false;
 
         for container in containers {
-            if pod_creation_failed {
-                break;
-            }
             let container_name =
                 container.generate_runtime_name(service_name, pod_number, &uuid.to_string())?;
 
-            // Setup volume mounts
-            let (_temp_dir, mounts) =
-                match self.setup_volume_mounts(container, &container_name).await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        slog::error!(slog_scope::logger(), "Failed to setup volume mounts";
-                            "service" => service_name,
-                            "container" => &container_name,
-                            "error" => e.to_string()
-                        );
-                        pod_creation_failed = true;
-                        break;
-                    }
-                };
-            // Prepare port bindings
-
-            // Prepare port bindings and metadata
+            let (_temp_dir, mounts) = self.setup_volume_mounts(container, &container_name).await?;
             let (port_bindings, exposed_ports, assigned_port_metadata) =
-                match self.prepare_port_configuration(container).await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        slog::error!(slog_scope::logger(), "Failed to prepare port configuration";
-                            "service" => service_name,
-                            "container" => &container_name,
-                            "error" => e.to_string()
-                        );
-                        pod_creation_failed = true;
-                        break;
-                    }
-                };
+                self.prepare_port_configuration(container).await?;
 
-            // Create container config with both ports and volumes
+            // Create extra_hosts entries
+            let extra_hosts: Vec<String> = container_ips
+                .iter()
+                .map(|(name, ip)| format!("{}:{}", name, ip))
+                .collect();
+
             let mut host_config = HostConfig {
                 port_bindings: Some(port_bindings),
                 memory: Some(parsed_memory_limit.try_into().unwrap()),
                 nano_cpus: Some(parsed_cpu_limit.try_into().unwrap()),
+                network_mode: Some(network_name.clone()),
+                extra_hosts: Some(extra_hosts),
                 ..Default::default()
             };
 
@@ -515,10 +605,10 @@ impl ContainerRuntime for DockerRuntime {
                 image: Some(container.image.clone()),
                 host_config: Some(host_config),
                 exposed_ports: Some(exposed_ports),
+                hostname: Some(container.name.clone()),
                 ..Default::default()
             };
 
-            // Create and start the container
             match self
                 .client
                 .create_container(
@@ -537,27 +627,26 @@ impl ContainerRuntime for DockerRuntime {
                         .await
                     {
                         Ok(_) => {
-                            // After starting container, inspect it to get network details
                             if let Ok(container_data) =
                                 self.client.inspect_container(&container_name, None).await
                             {
                                 if let Some(network_settings) = container_data.network_settings {
-                                    if let Some(ip) = network_settings.ip_address {
-                                        slog::info!(slog_scope::logger(), "Container started successfully";
-                                            "service" => service_name,
-                                            "container" => &container_name,
-                                            "ip" => &ip,
-                                            "ports" => ?assigned_port_metadata
-                                        );
-                                        containers_to_cleanup
-                                            .push((container_name.clone(), ip.clone()));
-                                        started_containers.push((
-                                            container_name,
-                                            ip,
-                                            assigned_port_metadata,
-                                        ));
+                                    if let Some(networks) = network_settings.networks {
+                                        if let Some(network) = networks.get(&network_name) {
+                                            if let Some(ip) = &network.ip_address {
+                                                containers_to_cleanup
+                                                    .push((container_name.clone(), ip.clone()));
+                                                started_containers.push((
+                                                    container_name,
+                                                    ip.clone(),
+                                                    assigned_port_metadata,
+                                                ));
+                                                continue;
+                                            }
+                                        }
                                     }
                                 }
+                                pod_creation_failed = true;
                             }
                         }
                         Err(e) => {
@@ -583,17 +672,17 @@ impl ContainerRuntime for DockerRuntime {
             }
         }
 
-        // If any container failed to start, clean up all containers in the pod
         if pod_creation_failed {
             for (container_name, _) in containers_to_cleanup {
                 if let Err(e) = self.stop_container(&container_name).await {
                     slog::error!(slog_scope::logger(), "Failed to cleanup container after pod creation failure";
-                        "service" => &service_name,
+                        "service" => service_name,
                         "container" => &container_name,
                         "error" => e.to_string()
                     );
                 }
             }
+            self.remove_pod_network(&network_name).await?;
             return Err(anyhow!("Failed to create one or more containers in pod"));
         }
 
@@ -692,69 +781,6 @@ impl ContainerRuntime for DockerRuntime {
 
         Ok(container_stats)
     }
-
-    // async fn inspect_container_old(&self, name: &str) -> Result<ContainerStats> {
-    //     let options = Some(StatsOptions {
-    //         stream: false,
-    //         one_shot: true,
-    //     });
-
-    //     let mut stats_stream = self.client.stats(name, options);
-
-    //     let stats = stats_stream
-    //         .next()
-    //         .await
-    //         .ok_or_else(|| anyhow!("No stats available for container {}", name))?;
-
-    //     let stats = stats?;
-
-    //     // Get container inspection data for port mappings
-    //     let container_data = self.client.inspect_container(name, None).await?;
-
-    //     // Extract port mappings from container data
-    //     let mut port_mappings = HashMap::new();
-    //     if let Some(network_settings) = container_data.network_settings {
-    //         if let Some(ports) = network_settings.ports {
-    //             for (container_port_proto, host_bindings) in ports {
-    //                 if let Some(host_bindings) = host_bindings {
-    //                     for binding in host_bindings {
-    //                         if let Some(host_port) = binding.host_port {
-    //                             // Parse "80/tcp" to get just the port number
-    //                             if let Some(container_port) = container_port_proto
-    //                                 .split('/')
-    //                                 .next()
-    //                                 .and_then(|p| p.parse::<u16>().ok())
-    //                             {
-    //                                 if let Ok(host_port) = host_port.parse::<u16>() {
-    //                                     port_mappings.insert(container_port, host_port);
-    //                                 }
-    //                             }
-    //                         }
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //     }
-
-    //     let service_name = name
-    //         .splitn(2, "__")
-    //         .next()
-    //         .expect("Split always returns at least one element");
-
-    //     let service_cfg = get_config_by_service(service_name).unwrap();
-
-    //     let nano_cpus = service_cfg
-    //         .cpu_limit
-    //         .as_ref() // Safely access the Option<Value>
-    //         .and_then(|value| parse_cpu_limit(value).ok()); // Parse and handle Result -> Option
-
-    //     // Update stats history and get CPU percentage
-    //     let mut container_stats =
-    //         update_container_stats(service_name, name, stats.clone(), nano_cpus).await;
-    //     container_stats.port_mappings = port_mappings;
-
-    //     Ok(container_stats)
-    // }
 
     async fn list_containers(&self, service_name: Option<&str>) -> Result<Vec<ContainerInfo>> {
         let mut filters = HashMap::new();
