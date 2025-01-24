@@ -6,6 +6,7 @@ use notify_debouncer_full::{new_debouncer, DebounceEventResult, DebouncedEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, path::PathBuf, sync::OnceLock, time::Duration};
+use thiserror::Error;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 use validator::Validate;
@@ -20,6 +21,81 @@ use crate::{
     scale::auto_scale,
     status::update_instance_store_cache,
 };
+
+use std::collections::HashSet;
+
+// Add new validation error types
+#[derive(Error, Debug)]
+pub enum ConfigValidationError {
+    #[error("Duplicate service name '{0}' found")]
+    DuplicateServiceName(String),
+    #[error("Duplicate container name '{0}' found in service '{1}'")]
+    DuplicateContainerName(String, String),
+    #[error("Invalid service name '{0}': {1}")]
+    InvalidServiceName(String, String),
+    #[error("Invalid container name '{0}': {1}")]
+    InvalidContainerName(String, String),
+}
+
+// Add validation functions
+fn validate_service_name(name: &str) -> Result<(), ConfigValidationError> {
+    // RFC 1123 DNS label validation
+    let name_regex = regex::Regex::new(r"^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$").unwrap();
+    if !name_regex.is_match(name) {
+        return Err(ConfigValidationError::InvalidServiceName(
+            name.to_string(),
+            "Service name must be a valid DNS label: lowercase alphanumeric characters or '-', starting and ending with alphanumeric".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_container_name(name: &str) -> Result<(), ConfigValidationError> {
+    // Similar validation for container names
+    let name_regex = regex::Regex::new(r"^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$").unwrap();
+    if !name_regex.is_match(name) {
+        return Err(ConfigValidationError::InvalidContainerName(
+            name.to_string(),
+            "Container name must be a valid DNS label: lowercase alphanumeric characters or '-', starting and ending with alphanumeric".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+// Add this function to check for duplicate service names
+pub fn check_service_name_uniqueness(config: &ServiceConfig) -> Result<(), ConfigValidationError> {
+    let config_store = CONFIG_STORE.get().expect("Config store not initialized");
+
+    // Check if any existing config has the same name
+    for existing_config in config_store.iter() {
+        if existing_config.value().1.name == config.name {
+            return Err(ConfigValidationError::DuplicateServiceName(
+                config.name.clone(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+// Add this function to check for duplicate container names within a service
+fn check_container_name_uniqueness(config: &ServiceConfig) -> Result<(), ConfigValidationError> {
+    let mut container_names = HashSet::new();
+
+    for container in &config.spec.containers {
+        if !container_names.insert(&container.name) {
+            return Err(ConfigValidationError::DuplicateContainerName(
+                container.name.clone(),
+                config.name.clone(),
+            ));
+        }
+
+        // Also validate the container name format
+        validate_container_name(&container.name)?;
+    }
+
+    Ok(())
+}
 
 #[derive(Clone)]
 pub enum ScaleMessage {
@@ -352,6 +428,15 @@ pub async fn read_yaml_config(path: &PathBuf) -> Result<ServiceConfig> {
     if path_str.ends_with(".yml") || path_str.ends_with(".yaml") {
         let contents = tokio::fs::read_to_string(path).await?;
         let config: ServiceConfig = serde_yaml::from_str(&contents)?;
+
+        // Validate service name format
+        validate_service_name(&config.name)?;
+
+        // Check for duplicate service names
+        check_service_name_uniqueness(&config)?;
+
+        // Check for duplicate container names
+        check_container_name_uniqueness(&config)?;
 
         // Debug log the parsed thresholds
         if let Some(thresholds) = &config.resource_thresholds {
@@ -732,6 +817,18 @@ pub fn parse_cpu_limit(cpu_limit: &serde_json::Value) -> Result<u64> {
 
 pub async fn handle_config_update(service_name: &str, config: ServiceConfig) -> Result<()> {
     let log = slog_scope::logger();
+
+    // Validate service name format
+    validate_service_name(&config.name)?;
+
+    // Check for duplicate container names
+    check_container_name_uniqueness(&config)?;
+
+    // Only check for service name uniqueness if it's different from the current name
+    if service_name != config.name {
+        check_service_name_uniqueness(&config)?;
+    }
+
     let scaling_tasks = SCALING_TASKS.get().unwrap();
 
     slog::debug!(log, "Starting config update process";
