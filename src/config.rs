@@ -1,4 +1,5 @@
 // config.rs
+use crate::container::Container;
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use notify::{EventKind, RecursiveMode};
@@ -246,8 +247,6 @@ pub struct InstanceCount {
     pub min: u8, // Minimum instances to keep running
     pub max: u8,
 }
-
-use crate::container::Container;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Validate)]
 pub struct ServiceConfig {

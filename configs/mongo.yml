@@ -1,0 +1,16 @@
+name: mongotest
+cpu_limit: 0.5
+memory_limit: 100M
+instance_count:
+  min: 1                        # Number of instances to spawn at start.
+  max: 3                        # Maximum number of instances allowed.
+adopt_orphans: false            # Adopt or destroy orphaned containers
+
+spec:
+  containers:
+    - name: mongodb
+      image: mongodb/mongodb-enterprise-server:latest
+      command: ["--replSet", "rs1", "--bind_ip_all"]
+      ports:
+        - port: 27017
+          target_port: 4333
