@@ -3,6 +3,7 @@ pub mod container;
 pub mod logger;
 pub mod metrics;
 pub mod proxy;
+pub mod rolling_update;
 pub mod scale;
 pub mod status;
 
@@ -11,7 +12,8 @@ use axum::{routing::get, Router};
 use clap::Parser;
 use config::CONFIG_STORE;
 use container::{
-    create_runtime, CONTAINER_STATS, INSTANCE_STORE, RUNTIME, SCALING_TASKS, SERVICE_STATS,
+    create_runtime, CONTAINER_STATS, IMAGE_CHECK_TASKS, INSTANCE_STORE, RUNTIME, SCALING_TASKS,
+    SERVICE_STATS,
 };
 use dashmap::DashMap;
 use logger::setup_logger;
@@ -65,6 +67,7 @@ async fn main() -> Result<()> {
     SERVICE_STATS.get_or_init(|| DashMap::new());
     SERVER_TASKS.get_or_init(DashMap::new);
     SERVER_BACKENDS.get_or_init(DashMap::new);
+    IMAGE_CHECK_TASKS.get_or_init(DashMap::new);
 
     // Parse command line arguments
     let args = Args::parse();

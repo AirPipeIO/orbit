@@ -14,7 +14,8 @@ use futures::StreamExt;
 use pingora_load_balancing::Backend;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use slog::ser;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::task::JoinHandle;
@@ -24,12 +25,14 @@ use crate::config::{
     get_config_by_service, parse_container_name, parse_cpu_limit, parse_memory_limit,
     ResourceThresholds, ScaleMessage, ServiceConfig, CONFIG_UPDATES,
 };
-use crate::proxy::SERVER_BACKENDS;
+use crate::proxy::{self, SERVER_BACKENDS};
 use crate::scale::{scale_down, scale_up};
 use crate::status::update_instance_store_cache;
 
 const MAX_SERVICE_NAME_LENGTH: usize = 60; // Common k8s practice
 const MAX_CONTAINER_NAME_LENGTH: usize = 60; // This gives us plenty of room
+
+pub static IMAGE_CHECK_TASKS: OnceLock<DashMap<String, JoinHandle<()>>> = OnceLock::new();
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct VolumeMount {
@@ -576,7 +579,7 @@ impl ContainerRuntime for DockerRuntime {
     }
 
     async fn create_pod_network(&self, service_name: &str, uuid: &str) -> Result<String> {
-        let network_name = format!("{}_{}", service_name, uuid);
+        let network_name = format!("{}__{}", service_name, uuid);
 
         // Check if network exists and remove if it does
         if let Ok(networks) = self.client.list_networks::<String>(None).await {
@@ -642,7 +645,7 @@ impl ContainerRuntime for DockerRuntime {
         service_config: &ServiceConfig,
     ) -> Result<Vec<(String, String, Vec<ContainerPortMetadata>)>> {
         let uuid = Uuid::new_v4();
-        let network_name = format!("{}_{}", service_name, uuid);
+        let network_name = format!("{}__{}", service_name, uuid);
 
         // Create network
         self.create_pod_network(service_name, &uuid.to_string())
@@ -993,7 +996,7 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
         for _ in current_instances..target_instances {
             let pod_number = get_next_pod_number(service_name).await;
             let uuid = uuid::Uuid::new_v4();
-            let network_name = format!("{}_{}", service_name, uuid);
+            let network_name = format!("{}__{}", service_name, uuid);
 
             slog::debug!(log, "Starting new pod instance";
                 "service" => service_name,

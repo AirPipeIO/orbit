@@ -14,7 +14,7 @@ image_check_interval: 30s  # Supports s, m, h units
 rolling_update_config:
   max_unavailable: 1  # Max pods to update at once
   max_surge: 1        # Extra pods allowed during update
-  timeout: 5m         # Time to wait for new pods
+  timeout: 1m         # Time to wait for new pods
 
 spec:
   containers:

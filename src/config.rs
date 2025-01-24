@@ -1,5 +1,8 @@
 // config.rs
-use crate::container::Container;
+use crate::{
+    container::{Container, IMAGE_CHECK_TASKS},
+    rolling_update,
+};
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use notify::{EventKind, RecursiveMode};
@@ -653,7 +656,7 @@ pub async fn initialize_configs(config_dir: &PathBuf) -> Result<()> {
                     proxy::run_proxy_for_service(config.name.to_string(), config.clone()).await;
 
                     // Start auto-scaling task
-                    let service_name = config.name.clone();
+                    let service_name: String = config.name.clone();
 
                     let handle = tokio::spawn(async move {
                         auto_scale(service_name.clone()).await;
@@ -664,6 +667,24 @@ pub async fn initialize_configs(config_dir: &PathBuf) -> Result<()> {
                         .get()
                         .unwrap()
                         .insert(config.name.clone(), handle);
+
+                    let service_name: String = config.name.clone();
+                    let svc_name: String = config.name.clone();
+
+                    let handle = tokio::spawn(async move {
+                        if let Err(e) =
+                            rolling_update::start_image_check_task(service_name.clone(), config)
+                                .await
+                        {
+                            slog::error!(slog_scope::logger(), "Image check task failed";
+                                "error" => e.to_string()
+                            );
+                        }
+                    });
+                    IMAGE_CHECK_TASKS
+                        .get()
+                        .unwrap()
+                        .insert(svc_name.clone(), handle);
                 }
                 Err(e) => {
                     slog::error!(log, "Failed to load config";
@@ -713,7 +734,7 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
 
         for uuid in &incomplete_pod_uuids {
             if let Some(containers) = pod_containers.get(uuid) {
-                let network_name = format!("{}_{}", service_name, uuid);
+                let network_name = format!("{}__{}", service_name, uuid);
 
                 for container in containers {
                     if let Err(e) = runtime.stop_container(&container.name).await {
@@ -743,7 +764,7 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
         let mut adopted_count = 0;
 
         for (uuid, containers) in &pod_containers {
-            let network_name = format!("{}_{}", service_name, uuid);
+            let network_name = format!("{}__{}", service_name, uuid);
             let mut pod_metadata = Vec::new();
 
             for container in containers {
@@ -926,13 +947,21 @@ pub async fn stop_service(service_name: &str) {
     let server_backends = SERVER_BACKENDS.get().unwrap();
 
     // Stop the scaling task
-    if let Some((_, handle)) = scaling_tasks.remove(service_name) {
-        handle.abort(); // Cancel the task
-        slog::debug!(log, "Scaling task aborted"; "service" => service_name);
+    // Stop both the scaling task and image checker
+    for task_name in [service_name, &format!("{}_updater", service_name)] {
+        if let Some((_, handle)) = scaling_tasks.remove(task_name) {
+            handle.abort();
+            slog::debug!(log, "Task aborted";
+                "service" => service_name,
+                "task" => task_name
+            );
+        }
     }
 
-    if let Some((_, handle)) = scaling_tasks.remove(&format!("{}_updater", service_name)) {
+    // Stop the image check task
+    if let Some((_, handle)) = IMAGE_CHECK_TASKS.get().unwrap().remove(service_name) {
         handle.abort();
+        slog::debug!(log, "Image check task aborted"; "service" => service_name);
     }
 
     // Remove from load balancer

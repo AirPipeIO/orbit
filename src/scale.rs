@@ -416,7 +416,7 @@ pub async fn scale_up(
 
     let container_parts = parse_container_name(&started_containers[0].0)?;
     let uuid = container_parts.uuid;
-    let network_name = format!("{}_{}", service_name, uuid);
+    let network_name = format!("{}__{}", service_name, uuid);
 
     if let Some(mut instances) = instance_store.get_mut(service_name) {
         let now = SystemTime::now();
