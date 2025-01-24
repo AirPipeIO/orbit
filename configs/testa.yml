@@ -10,14 +10,19 @@ instance_count:
   max: 10                       # Maximum number of instances allowed.
 interval_seconds: 10
 adopt_orphans: false            # Adopt or destroy orphaned containers
+image_check_interval: 30s  # Supports s, m, h units
+rolling_update_config:
+  max_unavailable: 1  # Max pods to update at once
+  max_surge: 1        # Extra pods allowed during update
+  timeout: 5m         # Time to wait for new pods
 
 spec:
   containers:
     - name: main
-      image: strm/helloworld-http:latest
+      image: info-server:latest
       ports:
         - port: 80
-          target_port: 8333
+          # target_port: 8333
     - name: nginx-sidecar
       image: nginx:latest
       memory_limit: 200M

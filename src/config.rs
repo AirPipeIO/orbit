@@ -6,7 +6,12 @@ use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, DebouncedEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, path::PathBuf, sync::OnceLock, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::OnceLock,
+    time::{Duration, SystemTime},
+};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -24,6 +29,33 @@ use crate::{
 };
 
 use std::collections::HashSet;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RollingUpdateConfig {
+    #[serde(default = "default_max_unavailable")]
+    pub max_unavailable: u8,
+    #[serde(default = "default_max_surge")]
+    pub max_surge: u8,
+    #[serde(with = "humantime_serde")]
+    pub timeout: Duration,
+}
+
+fn default_max_unavailable() -> u8 {
+    1
+}
+fn default_max_surge() -> u8 {
+    1
+}
+
+impl Default for RollingUpdateConfig {
+    fn default() -> Self {
+        Self {
+            max_unavailable: default_max_unavailable(),
+            max_surge: default_max_surge(),
+            timeout: Duration::from_secs(300), // 5 minute default timeout
+        }
+    }
+}
 
 // Add new validation error types
 #[derive(Error, Debug)]
@@ -228,10 +260,12 @@ fn check_container_name_uniqueness(config: &ServiceConfig) -> Result<(), ConfigV
     Ok(())
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum ScaleMessage {
     ConfigUpdate, // Added version number
     Resume,       // Resume with version to ensure matching
+    RollingUpdate,
+    RollingUpdateComplete,
 }
 // Change CONFIG_UPDATES to use ScaleMessage
 pub static CONFIG_UPDATES: OnceLock<mpsc::Sender<(String, ScaleMessage)>> = OnceLock::new();
@@ -259,6 +293,9 @@ pub struct ServiceConfig {
     pub instance_count: InstanceCount,
     pub adopt_orphans: bool,
     pub interval_seconds: Option<u64>,
+    #[serde(with = "humantime_serde", default)]
+    pub image_check_interval: Option<Duration>,
+    pub rolling_update_config: Option<RollingUpdateConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -750,11 +787,34 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
             }
 
             if !pod_metadata.is_empty() {
+                let now = SystemTime::now();
+                let mut image_hashes = HashMap::new();
+
+                // Try to get image hashes for existing containers
+                for container in containers {
+                    if let Ok(parts) = parse_container_name(&container.name) {
+                        if let Some(container_config) = config
+                            .spec
+                            .containers
+                            .iter()
+                            .find(|c| c.name == parts.container_name)
+                        {
+                            if let Ok(hash) =
+                                runtime.get_image_digest(&container_config.image).await
+                            {
+                                image_hashes.insert(container_config.name.clone(), hash);
+                            }
+                        }
+                    }
+                }
+
                 instances.insert(
                     *uuid,
                     InstanceMetadata {
                         uuid: *uuid,
+                        created_at: now,
                         network: network_name,
+                        image_hash: image_hashes,
                         containers: pod_metadata,
                     },
                 );
@@ -869,6 +929,10 @@ pub async fn stop_service(service_name: &str) {
     if let Some((_, handle)) = scaling_tasks.remove(service_name) {
         handle.abort(); // Cancel the task
         slog::debug!(log, "Scaling task aborted"; "service" => service_name);
+    }
+
+    if let Some((_, handle)) = scaling_tasks.remove(&format!("{}_updater", service_name)) {
+        handle.abort();
     }
 
     // Remove from load balancer

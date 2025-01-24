@@ -1,7 +1,11 @@
 // scale.rs
 use anyhow::{anyhow, Result};
 use pingora_load_balancing::Backend;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -361,6 +365,14 @@ pub async fn auto_scale(service_name: String) {
             Some((name, message)) = rx.recv() => {
                 if name == *service_name {
                     match message {
+                        ScaleMessage::RollingUpdate => {
+                            scaling_paused = true;
+                            slog::debug!(log, "Scaling paused for rolling update");
+                        }
+                        ScaleMessage::RollingUpdateComplete => {
+                            scaling_paused = false;
+                            slog::debug!(log, "Scaling resumed after rolling update");
+                        }
                         ScaleMessage::ConfigUpdate => {
                             scaling_paused = true;
                             slog::debug!(log, "Scaling paused for config update";
@@ -407,11 +419,23 @@ pub async fn scale_up(
     let network_name = format!("{}_{}", service_name, uuid);
 
     if let Some(mut instances) = instance_store.get_mut(service_name) {
+        let now = SystemTime::now();
+        let mut image_hashes = HashMap::new();
+
+        // Get image hashes for containers being started
+        for container in &config.spec.containers {
+            if let Ok(hash) = runtime.get_image_digest(&container.image).await {
+                image_hashes.insert(container.name.clone(), hash);
+            }
+        }
+
         instances.insert(
             uuid,
             InstanceMetadata {
                 uuid,
+                created_at: now,
                 network: network_name.clone(),
+                image_hash: image_hashes,
                 containers: started_containers
                     .iter()
                     .map(|(name, ip, ports)| ContainerMetadata {

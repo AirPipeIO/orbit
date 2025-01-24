@@ -13,4 +13,4 @@ spec:
       command: ["--replSet", "rs1", "--bind_ip_all"]
       ports:
         - port: 27017
-          target_port: 4333
+          target_port: 27018

@@ -22,9 +22,10 @@ use uuid::Uuid;
 
 use crate::config::{
     get_config_by_service, parse_container_name, parse_cpu_limit, parse_memory_limit,
-    ResourceThresholds, ServiceConfig,
+    ResourceThresholds, ScaleMessage, ServiceConfig, CONFIG_UPDATES,
 };
 use crate::proxy::SERVER_BACKENDS;
+use crate::scale::{scale_down, scale_up};
 use crate::status::update_instance_store_cache;
 
 const MAX_SERVICE_NAME_LENGTH: usize = 60; // Common k8s practice
@@ -297,13 +298,22 @@ pub struct ContainerPortMetadata {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct InstanceMetadata {
     pub uuid: Uuid,
+    pub created_at: SystemTime,
     pub network: String,
     pub containers: Vec<ContainerMetadata>,
+    pub image_hash: HashMap<String, String>, // container_name -> image_hash
 }
 
 // Define the container runtime trait
 #[async_trait]
 pub trait ContainerRuntime: Send + Sync + std::fmt::Debug {
+    async fn check_image_updates(
+        &self,
+        service_name: &str,
+        containers: &[Container],
+        current_hashes: &HashMap<String, String>,
+    ) -> Result<HashMap<String, bool>>;
+    async fn get_image_digest(&self, image: &str) -> Result<String>;
     async fn remove_pod_network(&self, network_name: &str) -> Result<()>;
     async fn create_pod_network(&self, service_name: &str, uuid: &str) -> Result<String>;
     async fn start_containers(
@@ -528,6 +538,38 @@ impl DockerRuntime {
 
 #[async_trait]
 impl ContainerRuntime for DockerRuntime {
+    async fn get_image_digest(&self, image: &str) -> Result<String> {
+        let inspect = self.client.inspect_image(image).await?;
+
+        // Get the image digest
+        if let Some(id) = inspect.id {
+            Ok(id)
+        } else {
+            Err(anyhow!("Failed to get image digest"))
+        }
+    }
+
+    async fn check_image_updates(
+        &self,
+        service_name: &str,
+        containers: &[Container],
+        current_hashes: &HashMap<String, String>,
+    ) -> Result<HashMap<String, bool>> {
+        let mut updates = HashMap::new();
+
+        for container in containers {
+            let current_hash = current_hashes.get(&container.name);
+            let new_hash = self.get_image_digest(&container.image).await?;
+
+            updates.insert(
+                container.name.clone(),
+                current_hash.map_or(true, |h| h != &new_hash),
+            );
+        }
+
+        Ok(updates)
+    }
+
     async fn remove_pod_network(&self, network_name: &str) -> Result<()> {
         self.client.remove_network(network_name).await?;
         Ok(())
@@ -881,7 +923,7 @@ impl ContainerRuntime for DockerRuntime {
         slog::debug!(slog_scope::logger(), "Found containers";
             "service" => service_name,
             "count" => containers.len(),
-            "containers" => ?containers
+            // "containers" => ?containers
         );
 
         Ok(containers
@@ -939,6 +981,7 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
         .unwrap_or(0);
 
     let target_instances = config.instance_count.min as usize;
+    let now = SystemTime::now();
 
     if current_instances < target_instances {
         slog::debug!(log, "Starting scale up";
@@ -978,11 +1021,21 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
                     }
 
                     if let Some(mut instances) = instance_store.get_mut(service_name) {
+                        // Get image hashes for started containers
+                        let mut image_hashes = HashMap::new();
+                        for container in &config.spec.containers {
+                            if let Ok(hash) = runtime.get_image_digest(&container.image).await {
+                                image_hashes.insert(container.name.clone(), hash);
+                            }
+                        }
+
                         instances.insert(
                             uuid,
                             InstanceMetadata {
                                 uuid,
+                                created_at: now,
                                 network: network_name.clone(),
+                                image_hash: image_hashes.clone(),
                                 containers: started_containers
                                     .into_iter()
                                     .map(|(name, ip, ports)| ContainerMetadata {
@@ -997,11 +1050,21 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
                         );
                     } else {
                         let mut map = HashMap::new();
+                        // Get image hashes for started containers
+                        let mut image_hashes = HashMap::new();
+                        for container in &config.spec.containers {
+                            if let Ok(hash) = runtime.get_image_digest(&container.image).await {
+                                image_hashes.insert(container.name.clone(), hash);
+                            }
+                        }
+
                         map.insert(
                             uuid,
                             InstanceMetadata {
                                 uuid,
+                                created_at: now,
                                 network: network_name.clone(),
+                                image_hash: image_hashes,
                                 containers: started_containers
                                     .into_iter()
                                     .map(|(name, ip, ports)| ContainerMetadata {
