@@ -37,6 +37,136 @@ pub enum ConfigValidationError {
     InvalidContainerName(String, String),
 }
 
+#[derive(Error, Debug)]
+pub enum PortValidationError {
+    #[error("Duplicate {port_type} port {port} found in service '{service}'")]
+    DuplicatePortInService {
+        port_type: String,
+        port: u16,
+        service: String,
+    },
+    #[error("{port_type} port {port} in service '{service1}' conflicts with service '{service2}'")]
+    PortConflictBetweenServices {
+        port_type: String,
+        port: u16,
+        service1: String,
+        service2: String,
+    },
+}
+
+// Validate ports within a single service config
+pub fn validate_service_ports(config: &ServiceConfig) -> Result<(), PortValidationError> {
+    let mut target_ports = HashSet::new();
+    let mut node_ports = HashSet::new();
+
+    for container in &config.spec.containers {
+        if let Some(ports) = &container.ports {
+            for port_config in ports {
+                // Check target_ports against both target and node ports
+                if let Some(target_port) = port_config.target_port {
+                    if !target_ports.insert(target_port) || node_ports.contains(&target_port) {
+                        return Err(PortValidationError::DuplicatePortInService {
+                            port_type: "target".to_string(),
+                            port: target_port,
+                            service: config.name.clone(),
+                        });
+                    }
+                }
+
+                // Check node_ports against both node and target ports
+                if let Some(node_port) = port_config.node_port {
+                    if !node_ports.insert(node_port) || target_ports.contains(&node_port) {
+                        return Err(PortValidationError::DuplicatePortInService {
+                            port_type: "node".to_string(),
+                            port: node_port,
+                            service: config.name.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// Check for port conflicts between services
+pub fn check_port_conflicts(
+    new_config: &ServiceConfig,
+    exclude_service: Option<&str>,
+) -> Result<(), PortValidationError> {
+    let config_store = CONFIG_STORE.get().expect("Config store not initialized");
+
+    // Collect ports from new config
+    let mut new_target_ports = HashSet::new();
+    let mut new_node_ports = HashSet::new();
+
+    for container in &new_config.spec.containers {
+        if let Some(ports) = &container.ports {
+            for port_config in ports {
+                if let Some(target_port) = port_config.target_port {
+                    new_target_ports.insert(target_port);
+                }
+                if let Some(node_port) = port_config.node_port {
+                    new_node_ports.insert(node_port);
+                }
+            }
+        }
+    }
+
+    // Check against all existing services
+    for entry in config_store.iter() {
+        let existing_config = &entry.value().1;
+
+        // Skip if this is the service we're updating
+        if let Some(exclude) = exclude_service {
+            if existing_config.name == exclude {
+                continue;
+            }
+        }
+
+        // Skip comparing against self
+        if existing_config.name == new_config.name {
+            continue;
+        }
+
+        for container in &existing_config.spec.containers {
+            if let Some(ports) = &container.ports {
+                for port_config in ports {
+                    // Check for conflicts between target_ports and existing node_ports, and vice versa
+                    if let Some(target_port) = port_config.target_port {
+                        if new_target_ports.contains(&target_port)
+                            || new_node_ports.contains(&target_port)
+                        {
+                            return Err(PortValidationError::PortConflictBetweenServices {
+                                port_type: "target".to_string(),
+                                port: target_port,
+                                service1: new_config.name.clone(),
+                                service2: existing_config.name.clone(),
+                            });
+                        }
+                    }
+
+                    if let Some(node_port) = port_config.node_port {
+                        if new_node_ports.contains(&node_port)
+                            || new_target_ports.contains(&node_port)
+                        {
+                            return Err(PortValidationError::PortConflictBetweenServices {
+                                port_type: "node".to_string(),
+                                port: node_port,
+                                service1: new_config.name.clone(),
+                                service2: existing_config.name.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // Add validation functions
 fn validate_service_name(name: &str) -> Result<(), ConfigValidationError> {
     // RFC 1123 DNS label validation
@@ -438,6 +568,12 @@ pub async fn read_yaml_config(path: &PathBuf) -> Result<ServiceConfig> {
         // Check for duplicate container names
         check_container_name_uniqueness(&config)?;
 
+        // Validate ports within the service
+        validate_service_ports(&config)?;
+
+        // Check for conflicts with other services
+        check_port_conflicts(&config, None)?;
+
         // Debug log the parsed thresholds
         if let Some(thresholds) = &config.resource_thresholds {
             slog::debug!(log, "Parsed config thresholds";
@@ -823,6 +959,12 @@ pub async fn handle_config_update(service_name: &str, config: ServiceConfig) -> 
 
     // Check for duplicate container names
     check_container_name_uniqueness(&config)?;
+
+    // Validate ports within the service
+    validate_service_ports(&config)?;
+
+    // Check for conflicts with other services
+    check_port_conflicts(&config, None)?;
 
     // Only check for service name uniqueness if it's different from the current name
     if service_name != config.name {
