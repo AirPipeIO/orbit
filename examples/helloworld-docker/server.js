@@ -31,7 +31,7 @@ const server = http.createServer((req, res) => {
     const dockerInfo = getDockerInfo();
 
     const html = `
-            <h1>:</h1>
+            <h1>SERVER:</h1>
             <h2>Hostname: ${hostname}</h2>
             <h3>IP Addresses: ${ipAddresses.join(", ")}</h3>
             <p>Docker Container ID: ${dockerInfo.containerId || "N/A"}</p>

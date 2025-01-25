@@ -6,11 +6,11 @@ resource_thresholds:
   cpu_percentage_relative: 20   # Threshold for CPU perc relative to the cpu_limit
   memory_percentage: 10         # Threshold for memory utilisation percentage.
 instance_count:
-  min: 3                        # Number of instances to spawn at start.
+  min: 1                       # Number of instances to spawn at start.
   max: 10                       # Maximum number of instances allowed.
 interval_seconds: 10
 adopt_orphans: false            # Adopt or destroy orphaned containers
-image_check_interval: 30s  # Supports s, m, h units
+image_check_interval: 30s       # Supports s, m, h units
 rolling_update_config:
   max_unavailable: 1  # Max pods to update at once
   max_surge: 1        # Extra pods allowed during update
@@ -33,6 +33,7 @@ spec:
         - name: nginx-config
           mount_path: /etc/nginx/nginx.conf
           sub_path: nginx.conf
+
       volumes:
         nginx-config:
           files:

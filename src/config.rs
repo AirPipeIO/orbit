@@ -229,12 +229,22 @@ fn validate_container_name(name: &str) -> Result<(), ConfigValidationError> {
 }
 
 // Add this function to check for duplicate service names
-pub fn check_service_name_uniqueness(config: &ServiceConfig) -> Result<(), ConfigValidationError> {
+pub fn check_service_name_uniqueness(
+    config: &ServiceConfig,
+    exclude_service: Option<&str>,
+) -> Result<(), ConfigValidationError> {
     let config_store = CONFIG_STORE.get().expect("Config store not initialized");
 
-    // Check if any existing config has the same name
+    // Check if any existing config has the same name, excluding the service being updated
     for existing_config in config_store.iter() {
         if existing_config.value().1.name == config.name {
+            // Skip if this is the service we're updating
+            if let Some(exclude) = exclude_service {
+                println!("\n\n{:?} : {:?} \n\n", exclude, config.name);
+                if exclude == config.name {
+                    continue;
+                }
+            }
             return Err(ConfigValidationError::DuplicateServiceName(
                 config.name.clone(),
             ));
@@ -442,13 +452,26 @@ pub async fn watch_directory(config_dir: PathBuf) -> notify::Result<()> {
     slog::debug!(log, "watching directory"; "directory" => config_dir.to_str());
 
     while let Some(event) = rx.recv().await {
-        process_event(event).await;
+        process_event(event, &config_dir).await;
     }
 
     Ok(())
 }
 
-async fn process_event(event: DebouncedEvent) {
+pub fn get_relative_config_path(full_path: &PathBuf, config_dir: &PathBuf) -> Option<String> {
+    let config_dir_str = config_dir.to_str()?;
+    let full_path_str = full_path.to_str()?;
+
+    // Find the position of "configs/" in the full path
+    if let Some(pos) = full_path_str.find(config_dir_str) {
+        // Extract everything from "configs/" onwards
+        let rel_path = &full_path_str[pos..];
+        return Some(rel_path.to_string());
+    }
+    None
+}
+
+async fn process_event(event: DebouncedEvent, config_dir: &PathBuf) {
     let config_store = CONFIG_STORE.get().unwrap();
     let scaling_tasks = SCALING_TASKS.get().unwrap();
 
@@ -457,6 +480,9 @@ async fn process_event(event: DebouncedEvent) {
         match event.kind {
             EventKind::Create(_) | EventKind::Modify(_) => {
                 if path.exists() && path.is_file() {
+                    let rel_config_path = get_relative_config_path(path, config_dir).unwrap();
+                    // Check if there's an existing config for this path
+
                     // Check if it's a YAML file
                     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                         if ext != "yml" && ext != "yaml" {
@@ -468,7 +494,18 @@ async fn process_event(event: DebouncedEvent) {
                         }
                     }
 
-                    match read_yaml_config(path).await {
+                    let existing_service = match event.kind {
+                        EventKind::Modify(_) => {
+                            if let Some(config) = get_config_by_path(&rel_config_path) {
+                                Some(config.name)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+
+                    match read_yaml_config(path, existing_service.as_deref()).await {
                         Ok(config) => {
                             let service_name = config.name.clone();
 
@@ -478,10 +515,8 @@ async fn process_event(event: DebouncedEvent) {
                             );
 
                             // Store config
-                            config_store.insert(
-                                path.display().to_string(),
-                                (path.to_path_buf(), config.clone()),
-                            );
+                            config_store
+                                .insert(rel_config_path, (path.to_path_buf(), config.clone()));
 
                             // Stop existing scaling task if it exists
                             if let Some((_, handle)) = scaling_tasks.remove(&service_name) {
@@ -590,7 +625,10 @@ async fn process_event(event: DebouncedEvent) {
     }
 }
 
-pub async fn read_yaml_config(path: &PathBuf) -> Result<ServiceConfig> {
+pub async fn read_yaml_config(
+    path: &PathBuf,
+    exclude_service: Option<&str>,
+) -> Result<ServiceConfig> {
     let log = slog_scope::logger();
 
     let path_str = path.to_str().unwrap();
@@ -601,8 +639,8 @@ pub async fn read_yaml_config(path: &PathBuf) -> Result<ServiceConfig> {
         // Validate service name format
         validate_service_name(&config.name)?;
 
-        // Check for duplicate service names
-        check_service_name_uniqueness(&config)?;
+        // Check for duplicate service names (no exclusion for new configs)
+        check_service_name_uniqueness(&config, exclude_service)?;
 
         // Check for duplicate container names
         check_container_name_uniqueness(&config)?;
@@ -641,7 +679,7 @@ pub async fn initialize_configs(config_dir: &PathBuf) -> Result<()> {
         if path.extension().and_then(|ext| ext.to_str()) == Some("yaml")
             || path.extension().and_then(|ext| ext.to_str()) == Some("yml")
         {
-            match read_yaml_config(&path).await {
+            match read_yaml_config(&path, None).await {
                 Ok(config) => {
                     slog::info!(log, "Initialising config";
                         "service" => &config.name,
@@ -1060,7 +1098,7 @@ pub async fn handle_config_update(service_name: &str, config: ServiceConfig) -> 
 
     // Only check for service name uniqueness if it's different from the current name
     if service_name != config.name {
-        check_service_name_uniqueness(&config)?;
+        check_service_name_uniqueness(&config, Some(service_name))?;
     }
 
     let scaling_tasks = SCALING_TASKS.get().unwrap();
