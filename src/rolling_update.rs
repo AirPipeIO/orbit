@@ -244,48 +244,6 @@ async fn perform_rolling_update(
     Ok(())
 }
 
-fn add_to_load_balancer(
-    service_name: &str,
-    containers: &[(String, String, Vec<ContainerPortMetadata>)],
-    server_backends: &DashMap<String, Arc<DashSet<Backend>>>,
-) -> Result<()> {
-    for (_, ip, ports) in containers {
-        for port_info in ports {
-            if let Some(node_port) = port_info.node_port {
-                let proxy_key = format!("{}_{}", service_name, node_port);
-                if let Some(backends) = server_backends.get(&proxy_key) {
-                    let addr = format!("{}:{}", ip, port_info.port);
-                    if let Ok(backend) = Backend::new(&addr) {
-                        backends.insert(backend);
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn remove_from_load_balancer(
-    service_name: &str,
-    containers: &[ContainerMetadata],
-    server_backends: &DashMap<String, Arc<DashSet<Backend>>>,
-) -> Result<()> {
-    for container in containers {
-        for port_info in &container.ports {
-            if let Some(node_port) = port_info.node_port {
-                let proxy_key = format!("{}_{}", service_name, node_port);
-                if let Some(backends) = server_backends.get(&proxy_key) {
-                    let addr = format!("{}:{}", container.ip_address, port_info.port);
-                    if let Ok(backend) = Backend::new(&addr) {
-                        backends.remove(&backend);
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 async fn cleanup_pod(
     metadata: &InstanceMetadata,
     service_name: &str,
