@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::time::interval;
 use uuid::Uuid;
@@ -21,7 +21,6 @@ use crate::{
         InstanceMetadata, INSTANCE_STORE, RUNTIME,
     },
     proxy::SERVER_BACKENDS,
-    scale::scale_down,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,7 +102,6 @@ async fn perform_rolling_update(
         .expect("Server backends not initialized");
     let log = slog_scope::logger();
 
-    // Get pods without holding lock
     let pods: Vec<_> = {
         let instances = instance_store
             .get(service_name)
@@ -115,61 +113,132 @@ async fn perform_rolling_update(
             .collect()
     };
 
-    for (pod_uuid, old_metadata) in pods {
-        // Create new pod
-        let pod_number = get_next_pod_number(service_name).await;
-        let new_containers = runtime
-            .start_containers(service_name, pod_number, &config.spec.containers, config)
-            .await?;
+    let total_pods = pods.len();
+    let update_config = config.rolling_update_config.clone().unwrap_or_default();
+    let max_surge = update_config.max_surge as usize;
+    let timeout = update_config.timeout;
 
-        if !new_containers.is_empty() {
-            let new_uuid = parse_container_name(&new_containers[0].0)?.uuid;
+    // Calculate how many new pods we can create at once based on max_surge
+    let allowed_new_pods = (total_pods + max_surge).saturating_sub(total_pods);
+    let new_pod_count = total_pods.min(allowed_new_pods);
 
-            // Add new pod metadata
-            {
-                let mut instances = instance_store
-                    .get_mut(service_name)
-                    .ok_or_else(|| anyhow!("Service not found"))?;
-                instances.insert(
-                    new_uuid,
-                    InstanceMetadata {
-                        uuid: new_uuid,
-                        created_at: SystemTime::now(),
-                        network: format!("{}_{}", service_name, new_uuid),
-                        image_hash: new_image_hashes.clone(),
-                        containers: new_containers
-                            .iter()
-                            .map(|(name, ip, ports)| ContainerMetadata {
-                                name: name.clone(),
-                                network: format!("{}_{}", service_name, new_uuid),
-                                ip_address: ip.clone(),
-                                ports: ports.clone(),
-                                status: "running".to_string(),
-                            })
-                            .collect(),
-                    },
-                );
+    // Create all new pods in parallel
+    let mut new_pod_futures = Vec::new();
+    let mut pod_numbers = Vec::new();
+    for _ in 0..new_pod_count {
+        pod_numbers.push(get_next_pod_number(&service_name).await);
+    }
+
+    for pod_number in pod_numbers {
+        let runtime = runtime.clone();
+        let config = config.clone();
+        let service_name = service_name.to_string();
+
+        new_pod_futures.push(tokio::spawn(async move {
+            runtime
+                .start_containers(&service_name, pod_number, &config.spec.containers, &config)
+                .await
+        }));
+    }
+
+    // Collect results and update instance store sequentially
+    let mut new_pods = Vec::new();
+    for future in new_pod_futures {
+        match future.await? {
+            Ok(new_containers) => {
+                if !new_containers.is_empty() {
+                    let new_uuid = parse_container_name(&new_containers[0].0)?.uuid;
+                    let network_name = format!("{}__{}", service_name, new_uuid);
+
+                    if let Some(mut instances) = instance_store.get_mut(service_name) {
+                        instances.insert(
+                            new_uuid,
+                            InstanceMetadata {
+                                uuid: new_uuid,
+                                created_at: SystemTime::now(),
+                                network: network_name.clone(),
+                                image_hash: new_image_hashes.clone(),
+                                containers: new_containers
+                                    .iter()
+                                    .map(|(name, ip, ports)| ContainerMetadata {
+                                        name: name.clone(),
+                                        network: network_name.clone(),
+                                        ip_address: ip.clone(),
+                                        ports: ports.clone(),
+                                        status: "running".to_string(),
+                                    })
+                                    .collect(),
+                            },
+                        );
+                    }
+                    new_pods.push((new_uuid, new_containers));
+                }
             }
-
-            // Add new containers to LB
-            add_to_load_balancer(service_name, &new_containers, server_backends)?;
-            tokio::time::sleep(Duration::from_secs(5)).await;
-
-            // Remove old pod metadata
-            {
-                let mut instances = instance_store
-                    .get_mut(service_name)
-                    .ok_or_else(|| anyhow!("Service not found"))?;
-                instances.remove(&pod_uuid);
-            }
-
-            // Remove old containers from LB
-            remove_from_load_balancer(service_name, &old_metadata.containers, server_backends)?;
-            tokio::time::sleep(Duration::from_secs(10)).await;
-
-            // Cleanup old pod
-            cleanup_pod(&old_metadata, service_name, runtime.clone()).await?;
+            Err(e) => return Err(e.into()),
         }
+    }
+
+    // Update load balancer for all new pods
+    for (_, containers) in &new_pods {
+        for (_, ip, ports) in containers {
+            for port_info in ports {
+                if let Some(node_port) = port_info.node_port {
+                    let proxy_key = format!("{}_{}", service_name, node_port);
+                    if let Some(backends) = server_backends.get(&proxy_key) {
+                        let addr = format!("{}:{}", ip, port_info.port);
+                        if let Ok(backend) = Backend::new(&addr) {
+                            backends.insert(backend);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Wait for new pods to be ready
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let mut all_ready = true;
+        for (_, containers) in &new_pods {
+            for (name, _, _) in containers {
+                if runtime.inspect_container(name).await.is_err() {
+                    all_ready = false;
+                    break;
+                }
+            }
+        }
+        if all_ready {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    // Remove old pods one by one
+    for (old_uuid, old_metadata) in pods {
+        // Remove from load balancer
+        for container in &old_metadata.containers {
+            for port_info in &container.ports {
+                if let Some(node_port) = port_info.node_port {
+                    let proxy_key = format!("{}_{}", service_name, node_port);
+                    if let Some(backends) = server_backends.get(&proxy_key) {
+                        let addr = format!("{}:{}", container.ip_address, port_info.port);
+                        if let Ok(backend) = Backend::new(&addr) {
+                            backends.remove(&backend);
+                        }
+                    }
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // Remove from instance store
+        if let Some(mut instances) = instance_store.get_mut(service_name) {
+            instances.remove(&old_uuid);
+        }
+
+        // Clean up containers and network
+        let _ = cleanup_pod(&old_metadata, service_name, runtime.clone()).await;
     }
 
     Ok(())

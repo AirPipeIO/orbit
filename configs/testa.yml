@@ -6,7 +6,7 @@ resource_thresholds:
   cpu_percentage_relative: 20   # Threshold for CPU perc relative to the cpu_limit
   memory_percentage: 10         # Threshold for memory utilisation percentage.
 instance_count:
-  min: 1                        # Number of instances to spawn at start.
+  min: 3                        # Number of instances to spawn at start.
   max: 10                       # Maximum number of instances allowed.
 interval_seconds: 10
 adopt_orphans: false            # Adopt or destroy orphaned containers
