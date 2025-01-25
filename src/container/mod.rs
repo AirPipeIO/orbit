@@ -362,7 +362,7 @@ pub trait ContainerRuntime: Send + Sync + std::fmt::Debug {
         current_hashes: &HashMap<String, String>,
     ) -> Result<HashMap<String, bool>>;
     async fn get_image_digest(&self, image: &str) -> Result<String>;
-    async fn remove_pod_network(&self, network_name: &str) -> Result<()>;
+    async fn remove_pod_network(&self, network_name: &str, service_name: &str) -> Result<()>;
     async fn create_pod_network(&self, service_name: &str, uuid: &str) -> Result<String>;
     async fn start_containers(
         &self,

@@ -307,7 +307,10 @@ async fn cleanup_pod(
 
     let network_name = format!("{}__{}", service_name, service_uuid);
 
-    if let Err(e) = runtime.remove_pod_network(&network_name).await {
+    if let Err(e) = runtime
+        .remove_pod_network(&network_name, service_name)
+        .await
+    {
         slog::error!(slog_scope::logger(), "Failed to remove pod network";
             "service" => service_name,
             "network" => &metadata.network,

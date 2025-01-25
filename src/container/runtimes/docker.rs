@@ -7,8 +7,9 @@ use bollard::models::{HostConfig, PortBinding};
 use bollard::network::CreateNetworkOptions;
 use bollard::secret::{DeviceRequest, Mount, MountTypeEnum};
 use bollard::Docker;
+use dashmap::DashMap;
 use futures::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -18,6 +19,8 @@ use crate::container::{
     parse_network_rate, update_container_stats, Container, ContainerInfo, ContainerPortMetadata,
     ContainerRuntime, ContainerStats, NetworkLimit,
 };
+
+use super::NETWORK_USAGE;
 
 #[derive(Debug, Clone)]
 pub struct DockerRuntime {
@@ -29,6 +32,83 @@ impl DockerRuntime {
         let client = Docker::connect_with_local_defaults()
             .map_err(|e| anyhow!("Failed to connect to Docker: {:?}", e))?;
         Ok(Self { client })
+    }
+
+    async fn track_network_usage(&self, network_name: &str, service_name: &str) {
+        let network_usage = NETWORK_USAGE.get_or_init(DashMap::new);
+        network_usage
+            .entry(network_name.to_string())
+            .or_insert_with(HashSet::new)
+            .insert(service_name.to_string());
+    }
+
+    async fn untrack_network_usage(&self, network_name: &str, service_name: &str) -> bool {
+        let network_usage = NETWORK_USAGE.get().expect("Network usage not initialized");
+
+        if let Some(mut services) = network_usage.get_mut(network_name) {
+            services.remove(service_name);
+            if services.is_empty() {
+                network_usage.remove(network_name);
+                return true; // Network has no more users
+            }
+        }
+        false
+    }
+
+    async fn setup_pod_network(
+        &self,
+        service_name: &str,
+        uuid: &str,
+        container_count: usize,
+        config: &ServiceConfig,
+    ) -> Result<Option<String>> {
+        if let Some(network_name) = &config.network {
+            if let Ok(networks) = self.client.list_networks::<String>(None).await {
+                if !networks
+                    .iter()
+                    .any(|n| n.name == Some(network_name.clone()))
+                {
+                    self.client
+                        .create_network(CreateNetworkOptions {
+                            name: network_name.clone(),
+                            driver: "bridge".to_string(),
+                            ..Default::default()
+                        })
+                        .await?;
+                }
+            }
+            // Track usage of user-defined network
+            self.track_network_usage(network_name, service_name).await;
+            return Ok(Some(network_name.clone()));
+        }
+
+        if container_count <= 1 {
+            return Ok(None);
+        }
+
+        // For multi-container pods without specified network, create dedicated network
+        let network_name = format!("{}__{}", service_name, uuid);
+
+        // Check if network exists and remove if it does
+        if let Ok(networks) = self.client.list_networks::<String>(None).await {
+            if networks
+                .iter()
+                .any(|n| n.name == Some(network_name.clone()))
+            {
+                self.client.remove_network(&network_name).await?;
+            }
+        }
+
+        // Create network
+        self.client
+            .create_network(CreateNetworkOptions {
+                name: network_name.clone(),
+                driver: "bridge".to_string(),
+                ..Default::default()
+            })
+            .await?;
+
+        Ok(Some(network_name))
     }
 
     async fn setup_volume_mounts(
@@ -199,8 +279,20 @@ impl ContainerRuntime for DockerRuntime {
         Ok(updates)
     }
 
-    async fn remove_pod_network(&self, network_name: &str) -> Result<()> {
-        self.client.remove_network(network_name).await?;
+    async fn remove_pod_network(&self, network_name: &str, service_name: &str) -> Result<()> {
+        if network_name == "bridge" {
+            return Ok(());
+        }
+
+        if network_name.contains("__") {
+            // Always remove auto-generated networks
+            self.client.remove_network(network_name).await?;
+        } else {
+            // For user-defined networks, check if no more services are using it
+            if self.untrack_network_usage(network_name, service_name).await {
+                self.client.remove_network(network_name).await?;
+            }
+        }
         Ok(())
     }
 
@@ -271,10 +363,14 @@ impl ContainerRuntime for DockerRuntime {
         service_config: &ServiceConfig,
     ) -> Result<Vec<(String, String, Vec<ContainerPortMetadata>)>> {
         let uuid = Uuid::new_v4();
-        let network_name = format!("{}__{}", service_name, uuid);
-
-        // Create network
-        self.create_pod_network(service_name, &uuid.to_string())
+        // Setup network based on container count
+        let network_name = self
+            .setup_pod_network(
+                service_name,
+                &uuid.to_string(),
+                containers.len(),
+                service_config,
+            )
             .await?;
 
         let mut started_containers = Vec::new();
@@ -332,7 +428,7 @@ impl ContainerRuntime for DockerRuntime {
                 port_bindings: Some(port_bindings),
                 memory: Some(memory_limit.try_into().unwrap()),
                 nano_cpus: Some(cpu_limit as i64),
-                network_mode: Some(network_name.clone()),
+                network_mode: network_name.clone().or(Some("bridge".to_string())),
                 ..Default::default()
             };
 
@@ -383,7 +479,10 @@ impl ContainerRuntime for DockerRuntime {
                             {
                                 if let Some(network_settings) = container_data.network_settings {
                                     if let Some(networks) = network_settings.networks {
-                                        if let Some(network) = networks.get(&network_name) {
+                                        // Handle Option<String> for network_name
+                                        let network_key =
+                                            network_name.as_deref().unwrap_or("bridge");
+                                        if let Some(network) = networks.get(network_key) {
                                             if let Some(ip) = &network.ip_address {
                                                 containers_to_cleanup
                                                     .push((container_name.clone(), ip.clone()));
@@ -426,14 +525,18 @@ impl ContainerRuntime for DockerRuntime {
         if pod_creation_failed {
             for (container_name, _) in containers_to_cleanup {
                 if let Err(e) = self.stop_container(&container_name).await {
-                    slog::error!(slog_scope::logger(), "Failed to cleanup container after pod creation failure";
+                    slog::error!(slog_scope::logger(), "Failed to cleanup container";
                         "service" => service_name,
                         "container" => &container_name,
                         "error" => e.to_string()
                     );
                 }
             }
-            self.remove_pod_network(&network_name).await?;
+
+            // Only remove custom network for multi-container pods
+            if let Some(network_name) = network_name {
+                self.remove_pod_network(&network_name, service_name).await?;
+            }
             return Err(anyhow!("Failed to create one or more containers in pod"));
         }
 

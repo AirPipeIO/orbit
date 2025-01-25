@@ -152,7 +152,10 @@ pub async fn auto_scale(service_name: String) {
                             }
 
                             // Remove pod network
-                            if let Err(e) = runtime.remove_pod_network(&metadata.network).await {
+                            if let Err(e) = runtime
+                                .remove_pod_network(&metadata.network, &service_name)
+                                .await
+                            {
                                 slog::error!(log, "Failed to remove network for incomplete pod";
                                     "service" => service_name.clone(),
                                     "network" => &metadata.network,
@@ -534,7 +537,10 @@ pub async fn scale_down(
     }
 
     // Remove network
-    if let Err(e) = runtime.remove_pod_network(&target_metadata.network).await {
+    if let Err(e) = runtime
+        .remove_pod_network(&target_metadata.network, service_name)
+        .await
+    {
         slog::error!(log, "Failed to remove network";
             "service" => service_name,
             "network" => &target_metadata.network,

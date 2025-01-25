@@ -299,16 +299,22 @@ pub struct InstanceCount {
 pub struct ServiceConfig {
     #[validate(length(max = 210))]
     pub name: String,
+    pub network: Option<String>,
     pub spec: ServiceSpec,
     pub memory_limit: Option<Value>,
     pub cpu_limit: Option<Value>,
     pub resource_thresholds: Option<ResourceThresholds>,
     pub instance_count: InstanceCount,
+    #[serde(default = "default_instance_count")]
     pub adopt_orphans: bool,
     pub interval_seconds: Option<u64>,
     #[serde(with = "humantime_serde", default)]
     pub image_check_interval: Option<Duration>,
     pub rolling_update_config: Option<RollingUpdateConfig>,
+}
+
+fn default_instance_count() -> bool {
+    false
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -784,7 +790,10 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
                     }
                 }
 
-                if let Err(e) = runtime.remove_pod_network(&network_name).await {
+                if let Err(e) = runtime
+                    .remove_pod_network(&network_name, &service_name)
+                    .await
+                {
                     slog::error!(log, "Failed to remove network";
                         "service" => service_name,
                         "network" => &network_name,
@@ -927,7 +936,10 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(500)).await;
 
             // Then try to remove the network
-            if let Err(e) = runtime.remove_pod_network(&network_name).await {
+            if let Err(e) = runtime
+                .remove_pod_network(&network_name, &service_name)
+                .await
+            {
                 slog::error!(slog_scope::logger(), "Failed to remove orphaned network";
                     "service" => %service_name,
                     "network" => %network_name,
