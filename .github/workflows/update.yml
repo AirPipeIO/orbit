@@ -8,42 +8,24 @@ on:
       - 'Cargo.toml'
 
 jobs:
-  tag-and-release:
+  tag-version:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: linux
-            arch: amd64
-          - target: aarch64-unknown-linux-gnu
-            os: linux
-            arch: arm64
-          - target: aarch64-apple-darwin
-            os: darwin
-            arch: arm64
-
     steps:
-      # Checkout repository
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # Get current and previous versions
       - name: Get current and previous versions
         id: versions
         run: |
-          # Get current version from Cargo.toml
           current_version=$(grep '^version = ' Cargo.toml | cut -d '"' -f2)
           echo "current_version=v${current_version}" >> $GITHUB_OUTPUT
           
-          # Get the version from the last commit's Cargo.toml
           prev_version=$(git show HEAD^:Cargo.toml | grep '^version = ' | cut -d '"' -f2 || echo "0.0.0")
           echo "prev_version=v${prev_version}" >> $GITHUB_OUTPUT
 
-      # Compare versions
       - name: Version comparison
         id: version_check
         run: |
@@ -58,40 +40,35 @@ jobs:
             echo "changed=true" >> $GITHUB_OUTPUT
           fi
 
-      # Check if the tag already exists
-      - name: Check if tag exists
-        id: check_tag
+      - name: Create tag and push
         if: steps.version_check.outputs.changed == 'true'
-        run: |
-          if git rev-parse "${{ steps.versions.outputs.current_version }}" >/dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
-
-      # Install git-cliff and generate changelog
-      - name: Generate changelog
-        if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
-        uses: kenji-miyake/setup-git-cliff@v1
-      - name: Generate changelog
-        if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
-        run: git cliff --tag ${{ steps.versions.outputs.current_version }} > CHANGELOG.md
-
-      # Create tag and push changes
-      - name: Create tag and release
-        if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
         run: |
           git config user.name "GitHub Action"
           git config user.email "action@github.com"
           git add CHANGELOG.md
           git commit -m "docs: update changelog for ${{ steps.versions.outputs.current_version }}"
           git tag -a ${{ steps.versions.outputs.current_version }} -m "Release ${{ steps.versions.outputs.current_version }}"
-          echo "Pushing changes to main"
           git push origin main
-          echo "Pushing tag ${{ steps.versions.outputs.current_version }}"
           git push origin ${{ steps.versions.outputs.current_version }}
 
-      # Build binaries for multiple targets
+  build-and-release:
+    needs: tag-version
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: linux
+            arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            os: linux
+            arch: arm64
+          - target: aarch64-apple-darwin
+            os: darwin
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -109,7 +86,6 @@ jobs:
         with:
           command: build
           args: --release --target ${{ matrix.target }}
-          use-cross: ${{ matrix.target != 'x86_64-unknown-linux-gnu' }}
 
       - name: Package Binary
         run: |
@@ -117,16 +93,14 @@ jobs:
           tar czf ../../../orbit-${{ matrix.os }}-${{ matrix.arch }}.tar.gz orbit
           cd ../../..
 
-      # Upload artifacts
       - name: Upload artifacts
         uses: actions/upload-artifact@v3
         with:
           name: orbit-${{ matrix.os }}-${{ matrix.arch }}
           path: orbit-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
 
-      # Create GitHub Release
       - name: Create Release
-        if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
+        if: matrix.os == 'linux' && matrix.arch == 'amd64' # Only one job creates the release
         uses: softprops/action-gh-release@v1
         with:
           files: |
