@@ -449,7 +449,8 @@ impl ContainerRuntime for DockerRuntime {
                 image: Some(container.image.clone()),
                 host_config: Some(host_config),
                 exposed_ports: Some(exposed_ports),
-                hostname: Some(container.name.clone()),
+                // this helps avoid a collision if networks are being shared, as service_name is unique
+                hostname: Some(format!("{}-{}", service_name, container.name)),
                 ..Default::default()
             };
 

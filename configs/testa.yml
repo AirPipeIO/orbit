@@ -22,7 +22,6 @@ spec:
       image: info-server:latest
       ports:
         - port: 80
-          # target_port: 8333
     - name: nginx-sidecar
       image: nginx:latest
       memory_limit: 200M
@@ -43,7 +42,7 @@ spec:
                   server {
                       listen 8080;
                       location / {
-                          proxy_pass http://main:80;
+                          proxy_pass http://helloworld-main:80;
                       }
                   }
               }
