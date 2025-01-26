@@ -1,18 +1,20 @@
+// src/main.rs
+pub mod api;
 pub mod config;
 pub mod container;
 pub mod logger;
 pub mod metrics;
 pub mod proxy;
+pub mod rolling_update;
 pub mod scale;
-pub mod status;
 
 use anyhow::Result;
 use axum::{routing::get, Router};
 use clap::Parser;
 use config::CONFIG_STORE;
 use container::{
-    create_runtime, CONTAINER_STATS, INSTANCE_STORE, PORT_RANGE, RUNTIME, SCALING_TASKS,
-    SERVICE_STATS,
+    create_runtime, CONTAINER_STATS, IMAGE_CHECK_TASKS, INSTANCE_STORE, NETWORK_USAGE, RUNTIME,
+    SCALING_TASKS, SERVICE_STATS,
 };
 use dashmap::DashMap;
 use logger::setup_logger;
@@ -66,14 +68,11 @@ async fn main() -> Result<()> {
     SERVICE_STATS.get_or_init(|| DashMap::new());
     SERVER_TASKS.get_or_init(DashMap::new);
     SERVER_BACKENDS.get_or_init(DashMap::new);
+    IMAGE_CHECK_TASKS.get_or_init(DashMap::new);
+    NETWORK_USAGE.get_or_init(DashMap::new);
 
     // Parse command line arguments
     let args = Args::parse();
-
-    // Initialize port range
-    PORT_RANGE
-        .set(args.port_min..args.port_max)
-        .expect("Failed to set port range");
 
     setup_logger(args.log_level);
     let log = slog_scope::logger();
@@ -107,7 +106,7 @@ async fn main() -> Result<()> {
     });
 
     // Initialize background cache update
-    status::initialize_background_cache_update();
+    api::status::initialize_background_cache_update();
 
     // Initialize metrics system
     let _ = metrics::initialize_metrics();
@@ -135,7 +134,7 @@ async fn main() -> Result<()> {
     });
 
     let app = Router::new()
-        .route("/status", get(status::get_status))
+        .route("/status", get(api::status::get_status))
         .route("/metrics", get(metrics::metrics_handler));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:4112").await?;

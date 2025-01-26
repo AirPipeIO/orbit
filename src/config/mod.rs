@@ -1,30 +1,80 @@
-// config.rs
+// src/config/mod.rs
+pub mod utils;
+pub mod validate;
+
+pub use utils::*;
+
+use crate::{
+    container::{Container, IMAGE_CHECK_TASKS},
+    rolling_update,
+};
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, DebouncedEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{path::PathBuf, sync::OnceLock, time::Duration};
+use std::fs;
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::OnceLock,
+    time::{Duration, SystemTime},
+};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+use validate::{
+    check_container_name_uniqueness, check_port_conflicts, check_service_name_uniqueness,
+    validate_service_name, validate_service_ports,
+};
 use validator::Validate;
 
 use crate::{
+    api::status::update_instance_store_cache,
     container::{
-        self, clean_up, manage, remove_container_stats, remove_reserved_ports,
-        update_reserved_ports, InstanceMetadata, INSTANCE_STORE, RESERVED_PORTS, RUNTIME,
+        self, clean_up, manage, remove_container_stats, ContainerInfo, ContainerMetadata,
+        ContainerPortMetadata, ContainerStats, InstanceMetadata, INSTANCE_STORE, RUNTIME,
         SCALING_TASKS,
     },
     proxy::{self, SERVER_BACKENDS},
     scale::auto_scale,
-    status::update_instance_store_cache,
 };
 
-#[derive(Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RollingUpdateConfig {
+    #[serde(default = "default_max_unavailable")]
+    pub max_unavailable: u8,
+    #[serde(default = "default_max_surge")]
+    pub max_surge: u8,
+    #[serde(with = "humantime_serde")]
+    pub timeout: Duration,
+}
+
+fn default_max_unavailable() -> u8 {
+    1
+}
+fn default_max_surge() -> u8 {
+    1
+}
+
+impl Default for RollingUpdateConfig {
+    fn default() -> Self {
+        Self {
+            max_unavailable: default_max_unavailable(),
+            max_surge: default_max_surge(),
+            timeout: Duration::from_secs(300), // 5 minute default timeout
+        }
+    }
+}
+
+// Add new validation error types
+
+#[derive(Clone, Debug)]
 pub enum ScaleMessage {
     ConfigUpdate, // Added version number
     Resume,       // Resume with version to ensure matching
+    RollingUpdate,
+    RollingUpdateComplete,
 }
 // Change CONFIG_UPDATES to use ScaleMessage
 pub static CONFIG_UPDATES: OnceLock<mpsc::Sender<(String, ScaleMessage)>> = OnceLock::new();
@@ -33,13 +83,6 @@ pub static CONFIG_UPDATES: OnceLock<mpsc::Sender<(String, ScaleMessage)>> = Once
 pub struct PortRange {
     pub start: u16,
     pub end: u16,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ResourceThresholds {
-    pub cpu_percentage: Option<u8>,
-    pub cpu_percentage_relative: Option<u8>,
-    pub memory_percentage: Option<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -52,38 +95,113 @@ pub struct InstanceCount {
 pub struct ServiceConfig {
     #[validate(length(max = 210))]
     pub name: String,
-    pub image: String,
-    pub memory_limit: Option<Value>, // Examples: "512Mi", "1Gi"
-    pub cpu_limit: Option<Value>,    // Examples: "0.5", "1", "2"
-    pub target_port: u16,
-    pub exposed_port: u16,
-    // pub port_range: PortRange,
+    pub network: Option<String>,
+    pub spec: ServiceSpec,
+    pub memory_limit: Option<Value>,
+    pub cpu_limit: Option<Value>,
     pub resource_thresholds: Option<ResourceThresholds>,
     pub instance_count: InstanceCount,
+    #[serde(default = "default_instance_count")]
     pub adopt_orphans: bool,
     pub interval_seconds: Option<u64>,
+    #[serde(with = "humantime_serde", default)]
+    pub image_check_interval: Option<Duration>,
+    pub rolling_update_config: Option<RollingUpdateConfig>,
+}
+
+fn default_instance_count() -> bool {
+    false
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ServiceSpec {
+    pub containers: Vec<Container>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum PodMetricsStrategy {
+    #[serde(rename = "max")]
+    Maximum,
+    #[serde(rename = "average")]
+    Average,
+}
+
+impl Default for PodMetricsStrategy {
+    fn default() -> Self {
+        Self::Maximum
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ResourceThresholds {
+    pub cpu_percentage: Option<u8>,
+    pub cpu_percentage_relative: Option<u8>,
+    pub memory_percentage: Option<u8>,
+    #[serde(default)]
+    pub metrics_strategy: PodMetricsStrategy,
+}
+
+#[derive(Debug)]
+pub struct PodStats {
+    pub cpu_percentage: f64,
+    pub cpu_percentage_relative: f64,
+    pub memory_usage: u64,
+    pub memory_limit: u64,
+}
+
+pub fn aggregate_pod_stats(
+    container_stats: &[(Uuid, InstanceMetadata, ContainerStats)],
+    strategy: &PodMetricsStrategy,
+) -> PodStats {
+    match strategy {
+        PodMetricsStrategy::Maximum => {
+            let mut max_stats = PodStats {
+                cpu_percentage: 0.0,
+                cpu_percentage_relative: 0.0,
+                memory_usage: 0,
+                memory_limit: 0,
+            };
+
+            for stats in container_stats {
+                max_stats.cpu_percentage = max_stats.cpu_percentage.max(stats.2.cpu_percentage);
+                max_stats.cpu_percentage_relative = max_stats
+                    .cpu_percentage_relative
+                    .max(stats.2.cpu_percentage_relative);
+                max_stats.memory_usage = max_stats.memory_usage.max(stats.2.memory_usage);
+                max_stats.memory_limit = max_stats.memory_limit.max(stats.2.memory_limit);
+            }
+
+            max_stats
+        }
+        PodMetricsStrategy::Average => {
+            let count = container_stats.len() as f64;
+            let sum_stats = container_stats.iter().fold(
+                PodStats {
+                    cpu_percentage: 0.0,
+                    cpu_percentage_relative: 0.0,
+                    memory_usage: 0,
+                    memory_limit: 0,
+                },
+                |mut acc, stats| {
+                    acc.cpu_percentage += stats.2.cpu_percentage;
+                    acc.cpu_percentage_relative += stats.2.cpu_percentage_relative;
+                    acc.memory_usage += stats.2.memory_usage;
+                    acc.memory_limit += stats.2.memory_limit;
+                    acc
+                },
+            );
+
+            PodStats {
+                cpu_percentage: sum_stats.cpu_percentage / count,
+                cpu_percentage_relative: sum_stats.cpu_percentage_relative / count,
+                memory_usage: sum_stats.memory_usage / count as u64,
+                memory_limit: sum_stats.memory_limit / count as u64,
+            }
+        }
+    }
 }
 
 pub static CONFIG_STORE: OnceLock<DashMap<String, (PathBuf, ServiceConfig)>> = OnceLock::new();
-
-// Helper functions to access configs
-pub fn get_config_by_path(path: &str) -> Option<ServiceConfig> {
-    CONFIG_STORE
-        .get()
-        .and_then(|store| store.get(path).map(|entry| entry.value().1.clone()))
-}
-
-pub fn get_config_by_service(service_name: &str) -> Option<ServiceConfig> {
-    CONFIG_STORE.get().and_then(|store| {
-        store.iter().find_map(|entry| {
-            if entry.value().1.name == service_name {
-                Some(entry.value().1.clone())
-            } else {
-                None
-            }
-        })
-    })
-}
 
 pub async fn watch_directory(config_dir: PathBuf) -> notify::Result<()> {
     let log: slog::Logger = slog_scope::logger();
@@ -117,18 +235,13 @@ pub async fn watch_directory(config_dir: PathBuf) -> notify::Result<()> {
     slog::debug!(log, "watching directory"; "directory" => config_dir.to_str());
 
     while let Some(event) = rx.recv().await {
-        process_event(event).await;
+        process_event(event, &config_dir).await;
     }
 
     Ok(())
 }
 
-// In config.rs, update the process_event function
-
-// In config.rs
-
-async fn process_event(event: DebouncedEvent) {
-    let log: slog::Logger = slog_scope::logger();
+async fn process_event(event: DebouncedEvent, config_dir: &PathBuf) {
     let config_store = CONFIG_STORE.get().unwrap();
     let scaling_tasks = SCALING_TASKS.get().unwrap();
 
@@ -137,6 +250,9 @@ async fn process_event(event: DebouncedEvent) {
         match event.kind {
             EventKind::Create(_) | EventKind::Modify(_) => {
                 if path.exists() && path.is_file() {
+                    let rel_config_path = get_relative_config_path(path, config_dir).unwrap();
+                    // Check if there's an existing config for this path
+
                     // Check if it's a YAML file
                     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                         if ext != "yml" && ext != "yaml" {
@@ -148,7 +264,18 @@ async fn process_event(event: DebouncedEvent) {
                         }
                     }
 
-                    match read_yaml_config(path).await {
+                    let existing_service = match event.kind {
+                        EventKind::Modify(_) => {
+                            if let Some(config) = get_config_by_path(&rel_config_path) {
+                                Some(config.name)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+
+                    match read_yaml_config(path, existing_service.as_deref()).await {
                         Ok(config) => {
                             let service_name = config.name.clone();
 
@@ -157,14 +284,9 @@ async fn process_event(event: DebouncedEvent) {
                                 "path" => path.to_str()
                             );
 
-                            // Handle like initialization
-                            update_reserved_ports(&service_name, config.exposed_port);
-
                             // Store config
-                            config_store.insert(
-                                path.display().to_string(),
-                                (path.to_path_buf(), config.clone()),
-                            );
+                            config_store
+                                .insert(rel_config_path, (path.to_path_buf(), config.clone()));
 
                             // Stop existing scaling task if it exists
                             if let Some((_, handle)) = scaling_tasks.remove(&service_name) {
@@ -208,8 +330,6 @@ async fn process_event(event: DebouncedEvent) {
                         "service" => &service_name,
                         "path" => path.to_str()
                     );
-
-                    remove_reserved_ports(&service_name);
 
                     // Stop scaling task
                     if let Some((_, handle)) = scaling_tasks.remove(&service_name) {
@@ -257,7 +377,6 @@ async fn process_event(event: DebouncedEvent) {
         );
 
         config_store.remove(&path.display().to_string());
-        remove_reserved_ports(&service_name);
 
         // Stop scaling task
         if let Some((_, handle)) = scaling_tasks.remove(&service_name) {
@@ -276,13 +395,31 @@ async fn process_event(event: DebouncedEvent) {
     }
 }
 
-pub async fn read_yaml_config(path: &PathBuf) -> Result<ServiceConfig> {
+pub async fn read_yaml_config(
+    path: &PathBuf,
+    exclude_service: Option<&str>,
+) -> Result<ServiceConfig> {
     let log = slog_scope::logger();
 
     let path_str = path.to_str().unwrap();
     if path_str.ends_with(".yml") || path_str.ends_with(".yaml") {
         let contents = tokio::fs::read_to_string(path).await?;
         let config: ServiceConfig = serde_yaml::from_str(&contents)?;
+
+        // Validate service name format
+        validate_service_name(&config.name)?;
+
+        // Check for duplicate service names (no exclusion for new configs)
+        check_service_name_uniqueness(&config, exclude_service)?;
+
+        // Check for duplicate container names
+        check_container_name_uniqueness(&config)?;
+
+        // Validate ports within the service
+        validate_service_ports(&config)?;
+
+        // Check for conflicts with other services
+        check_port_conflicts(&config, None)?;
 
         // Debug log the parsed thresholds
         if let Some(thresholds) = &config.resource_thresholds {
@@ -299,11 +436,8 @@ pub async fn read_yaml_config(path: &PathBuf) -> Result<ServiceConfig> {
     Err(anyhow!("Not a yaml file {:?}", path))
 }
 
-use std::fs;
-
 pub async fn initialize_configs(config_dir: &PathBuf) -> Result<()> {
     let config_store = CONFIG_STORE.get().unwrap();
-    let reserved_ports = RESERVED_PORTS.get_or_init(DashMap::new);
     let log = slog_scope::logger();
 
     for entry in fs::read_dir(config_dir)? {
@@ -313,15 +447,12 @@ pub async fn initialize_configs(config_dir: &PathBuf) -> Result<()> {
         if path.extension().and_then(|ext| ext.to_str()) == Some("yaml")
             || path.extension().and_then(|ext| ext.to_str()) == Some("yml")
         {
-            match read_yaml_config(&path).await {
+            match read_yaml_config(&path, None).await {
                 Ok(config) => {
                     slog::info!(log, "Initialising config";
                         "service" => &config.name,
                         "path" => path.display().to_string()
                     );
-
-                    // Reserve the port
-                    reserved_ports.insert(config.exposed_port, config.name.clone());
 
                     config_store.insert(path.display().to_string(), (path.clone(), config.clone()));
                     // Handle orphaned containers based on the adopt_orphans flag
@@ -331,7 +462,7 @@ pub async fn initialize_configs(config_dir: &PathBuf) -> Result<()> {
                     proxy::run_proxy_for_service(config.name.to_string(), config.clone()).await;
 
                     // Start auto-scaling task
-                    let service_name = config.name.clone();
+                    let service_name: String = config.name.clone();
 
                     let handle = tokio::spawn(async move {
                         auto_scale(service_name.clone()).await;
@@ -342,6 +473,24 @@ pub async fn initialize_configs(config_dir: &PathBuf) -> Result<()> {
                         .get()
                         .unwrap()
                         .insert(config.name.clone(), handle);
+
+                    let service_name: String = config.name.clone();
+                    let svc_name: String = config.name.clone();
+
+                    let handle = tokio::spawn(async move {
+                        if let Err(e) =
+                            rolling_update::start_image_check_task(service_name.clone(), config)
+                                .await
+                        {
+                            slog::error!(slog_scope::logger(), "Image check task failed";
+                                "error" => e.to_string()
+                            );
+                        }
+                    });
+                    IMAGE_CHECK_TASKS
+                        .get()
+                        .unwrap()
+                        .insert(svc_name.clone(), handle);
                 }
                 Err(e) => {
                     slog::error!(log, "Failed to load config";
@@ -355,96 +504,214 @@ pub async fn initialize_configs(config_dir: &PathBuf) -> Result<()> {
 
     Ok(())
 }
+
 pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
     let log = slog_scope::logger();
     let instance_store = INSTANCE_STORE.get().unwrap();
     let runtime = RUNTIME.get().expect("Runtime not initialised").clone();
     let service_name = &config.name;
 
-    // Find containers matching the naming convention
-    let orphaned_containers = runtime
-        .list_containers(Some(service_name))
-        .await
-        .map_err(|e| anyhow!("Failed to list containers: {:?}", e))?;
-
+    let orphaned_containers = runtime.list_containers(Some(service_name)).await?;
     if orphaned_containers.is_empty() {
         return Ok(());
     }
 
     let orphan_count = orphaned_containers.len();
-    slog::info!(log, "Found orphaned containers";
-        "service" => service_name,
-        "count" => orphan_count
-    );
+    slog::info!(log, "Found orphaned containers"; "service" => service_name, "count" => orphan_count);
 
     if config.adopt_orphans {
-        // Bulk adopt containers
+        let mut pod_containers: HashMap<Uuid, Vec<ContainerInfo>> = HashMap::new();
+
+        for container in orphaned_containers {
+            if let Ok(parts) = parse_container_name(&container.name) {
+                pod_containers
+                    .entry(parts.uuid)
+                    .or_default()
+                    .push(container);
+            }
+        }
+
+        let required_container_count = config.spec.containers.len();
+        let incomplete_pod_uuids: Vec<_> = pod_containers
+            .iter()
+            .filter(|(_, containers)| containers.len() != required_container_count)
+            .map(|(uuid, _)| *uuid)
+            .collect();
+
+        for uuid in &incomplete_pod_uuids {
+            if let Some(containers) = pod_containers.get(uuid) {
+                let network_name = format!("{}__{}", service_name, uuid);
+
+                for container in containers {
+                    if let Err(e) = runtime.stop_container(&container.name).await {
+                        slog::error!(log, "Failed to remove container from incomplete pod";
+                            "service" => service_name,
+                            "container" => &container.name,
+                            "error" => e.to_string()
+                        );
+                    }
+                }
+
+                if let Err(e) = runtime
+                    .remove_pod_network(&network_name, &service_name)
+                    .await
+                {
+                    slog::error!(log, "Failed to remove network";
+                        "service" => service_name,
+                        "network" => &network_name,
+                        "error" => e.to_string()
+                    );
+                }
+            }
+        }
+
+        for uuid in incomplete_pod_uuids {
+            pod_containers.remove(&uuid);
+        }
+
         let mut instances = instance_store.entry(service_name.to_string()).or_default();
         let mut adopted_count = 0;
 
-        for container in orphaned_containers {
-            if container.port > 0 {
-                if let Ok(uuid) = extract_uuid_from_name(&container.name) {
-                    instances.insert(
-                        uuid,
-                        InstanceMetadata {
-                            uuid,
-                            exposed_port: container.port,
-                            status: "adopted".to_string(),
-                        },
-                    );
-                    adopted_count += 1;
+        for (uuid, containers) in &pod_containers {
+            let network_name = format!("{}__{}", service_name, uuid);
+            let mut pod_metadata = Vec::new();
+
+            for container in containers {
+                if let Ok(parts) = parse_container_name(&container.name) {
+                    if let Some(container_config) = config
+                        .spec
+                        .containers
+                        .iter()
+                        .find(|c| c.name == parts.container_name)
+                    {
+                        if let Some(port_configs) = &container_config.ports {
+                            if let Ok(container_data) =
+                                runtime.inspect_container(&container.name).await
+                            {
+                                let port_metadata: Vec<ContainerPortMetadata> = port_configs
+                                    .iter()
+                                    .map(|p| ContainerPortMetadata {
+                                        port: p.port,
+                                        target_port: p.target_port,
+                                        node_port: p.node_port,
+                                    })
+                                    .collect();
+
+                                pod_metadata.push(ContainerMetadata {
+                                    name: container.name.clone(),
+                                    network: network_name.clone(),
+                                    ip_address: container_data.ip_address,
+                                    ports: port_metadata,
+                                    status: "adopted".to_string(),
+                                });
+                                adopted_count += 1;
+                            } else {
+                                slog::error!(log, "Failed to inspect container";
+                                    "service" => service_name,
+                                    "container" => &container.name,
+                                );
+                            }
+                        }
+                    }
                 }
+            }
+
+            if !pod_metadata.is_empty() {
+                let now = SystemTime::now();
+                let mut image_hashes = HashMap::new();
+
+                // Try to get image hashes for existing containers
+                for container in containers {
+                    if let Ok(parts) = parse_container_name(&container.name) {
+                        if let Some(container_config) = config
+                            .spec
+                            .containers
+                            .iter()
+                            .find(|c| c.name == parts.container_name)
+                        {
+                            if let Ok(hash) =
+                                runtime.get_image_digest(&container_config.image).await
+                            {
+                                image_hashes.insert(container_config.name.clone(), hash);
+                            }
+                        }
+                    }
+                }
+
+                instances.insert(
+                    *uuid,
+                    InstanceMetadata {
+                        uuid: *uuid,
+                        created_at: now,
+                        network: network_name,
+                        image_hash: image_hashes,
+                        containers: pod_metadata,
+                    },
+                );
             }
         }
 
         slog::info!(log, "Adopted orphaned containers";
             "service" => service_name,
-            "adopted" => adopted_count.to_string()
+            "adopted_pods" => pod_containers.len(),
+            "adopted_containers" => adopted_count.to_string()
         );
     } else {
-        // Bulk remove containers
-        let mut futures = Vec::new();
-        let containers_to_remove = orphaned_containers.clone();
+        // Group containers by their network
+        let mut network_containers: HashMap<String, Vec<String>> = HashMap::new();
 
-        for container in containers_to_remove {
-            let runtime = runtime.clone();
-            let container_name = container.name.clone();
-            let service_name = service_name.to_string();
-
-            futures.push(tokio::spawn(async move {
-                if let Err(e) = runtime.stop_container(&container_name).await {
-                    slog::error!(slog_scope::logger(), "Failed to remove orphaned container";
-                        "service" => %service_name,
-                        "container" => %container_name,
-                        "error" => %e
-                    );
-                }
-            }));
+        for container in &orphaned_containers {
+            if let Ok(parts) = parse_container_name(&container.name) {
+                let network_name = format!("{}_{}", service_name, parts.uuid);
+                network_containers
+                    .entry(network_name)
+                    .or_default()
+                    .push(container.name.clone());
+            }
         }
 
-        // Wait for all removals to complete with timeout
-        let _ =
-            tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(futures)).await;
+        // Process each network and its containers
+        for (network_name, containers) in network_containers {
+            // First stop all containers in the network
+            let mut stop_futures = Vec::new();
+            for container_name in containers {
+                let runtime = runtime.clone();
+                let service_name = service_name.to_string();
 
-        slog::info!(log, "Removed orphaned containers";
-            "service" => %service_name,
-            "count" => orphan_count
-        );
+                stop_futures.push(tokio::spawn(async move {
+                    if let Err(e) = runtime.stop_container(&container_name).await {
+                        slog::error!(slog_scope::logger(), "Failed to remove orphaned container";
+                            "service" => %service_name,
+                            "container" => %container_name,
+                            "error" => %e
+                        );
+                        return Err(e);
+                    }
+                    Ok(())
+                }));
+            }
+
+            // Wait for all containers to be stopped
+            let _ = futures::future::join_all(stop_futures).await;
+
+            // Add a small delay to ensure Docker has processed container removals
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            // Then try to remove the network
+            if let Err(e) = runtime
+                .remove_pod_network(&network_name, &service_name)
+                .await
+            {
+                slog::error!(slog_scope::logger(), "Failed to remove orphaned network";
+                    "service" => %service_name,
+                    "network" => %network_name,
+                    "error" => %e
+                );
+            }
+        }
     }
 
     Ok(())
-}
-
-fn extract_uuid_from_name(container_name: &str) -> Result<Uuid> {
-    if let Some(uuid_str) = container_name.split("__").nth(1) {
-        Uuid::parse_str(uuid_str).map_err(|e| anyhow!("Invalid UUID in container name: {}", e))
-    } else {
-        Err(anyhow!(
-            "Container name does not contain UUID: {}",
-            container_name
-        ))
-    }
 }
 
 // Update the stop_service function to ensure complete cleanup
@@ -455,9 +722,21 @@ pub async fn stop_service(service_name: &str) {
     let server_backends = SERVER_BACKENDS.get().unwrap();
 
     // Stop the scaling task
-    if let Some((_, handle)) = scaling_tasks.remove(service_name) {
-        handle.abort(); // Cancel the task
-        slog::debug!(log, "Scaling task aborted"; "service" => service_name);
+    // Stop both the scaling task and image checker
+    for task_name in [service_name, &format!("{}_updater", service_name)] {
+        if let Some((_, handle)) = scaling_tasks.remove(task_name) {
+            handle.abort();
+            slog::debug!(log, "Task aborted";
+                "service" => service_name,
+                "task" => task_name
+            );
+        }
+    }
+
+    // Stop the image check task
+    if let Some((_, handle)) = IMAGE_CHECK_TASKS.get().unwrap().remove(service_name) {
+        handle.abort();
+        slog::debug!(log, "Image check task aborted"; "service" => service_name);
     }
 
     // Remove from load balancer
@@ -465,7 +744,7 @@ pub async fn stop_service(service_name: &str) {
 
     // Clean up instance store and stop containers
     if let Some((_, instances)) = instance_store.remove(service_name) {
-        for (uuid, metadata) in instances {
+        for (uuid, _metadata) in instances {
             let container_name = format!("{}__{}", service_name, uuid);
             let runtime = RUNTIME.get().unwrap().clone();
 
@@ -489,7 +768,7 @@ pub async fn stop_service(service_name: &str) {
     }
 
     // Update instance store cache
-    update_instance_store_cache();
+    let _ = update_instance_store_cache();
 
     slog::info!(log, "Service stopped and cleaned up"; "service" => service_name);
 }
@@ -541,6 +820,24 @@ pub fn parse_cpu_limit(cpu_limit: &serde_json::Value) -> Result<u64> {
 
 pub async fn handle_config_update(service_name: &str, config: ServiceConfig) -> Result<()> {
     let log = slog_scope::logger();
+
+    // Validate service name format
+    validate_service_name(&config.name)?;
+
+    // Check for duplicate container names
+    check_container_name_uniqueness(&config)?;
+
+    // Validate ports within the service
+    validate_service_ports(&config)?;
+
+    // Check for conflicts with other services
+    check_port_conflicts(&config, None)?;
+
+    // Only check for service name uniqueness if it's different from the current name
+    if service_name != config.name {
+        check_service_name_uniqueness(&config, Some(service_name))?;
+    }
+
     let scaling_tasks = SCALING_TASKS.get().unwrap();
 
     slog::debug!(log, "Starting config update process";

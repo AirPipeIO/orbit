@@ -1,15 +1,48 @@
 name: helloworld
-image: strm/helloworld-http:latest
 cpu_limit: 0.5
 memory_limit: 100M
-target_port: 80                 # Port the container's HTTP service listens on internally.
-exposed_port: 4333              # The port used by Pingora for external load-balanced traffic.
 resource_thresholds:
   cpu_percentage: 80            # Threshold for CPU percent
-  # cpu_percentage_relative: 20   # Threshold for CPU perc relative to the cpu_limit
+  cpu_percentage_relative: 20   # Threshold for CPU perc relative to the cpu_limit
   memory_percentage: 10         # Threshold for memory utilisation percentage.
 instance_count:
-  min: 1                        # Number of instances to spawn at start.
+  min: 1                       # Number of instances to spawn at start.
   max: 10                       # Maximum number of instances allowed.
 interval_seconds: 10
 adopt_orphans: false            # Adopt or destroy orphaned containers
+image_check_interval: 30s       # Supports s, m, h units
+rolling_update_config:
+  max_unavailable: 1  # Max pods to update at once
+  max_surge: 1        # Extra pods allowed during update
+  timeout: 1m         # Time to wait for new pods
+
+spec:
+  containers:
+    - name: main
+      image: info-server:latest
+      ports:
+        - port: 80
+    - name: nginx-sidecar
+      image: nginx:latest
+      memory_limit: 200M
+      ports:
+        - port: 8080
+          node_port: 4333
+      volume_mounts:
+        - name: nginx-config
+          mount_path: /etc/nginx/nginx.conf
+          sub_path: nginx.conf
+
+      volumes:
+        nginx-config:
+          files:
+            nginx.conf: |
+              events {}
+              http {
+                  server {
+                      listen 8080;
+                      location / {
+                          proxy_pass http://helloworld-main:80;
+                      }
+                  }
+              }
