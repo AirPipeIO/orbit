@@ -1,4 +1,4 @@
-name: Version Tag Creation
+name: Version Tag Creation and Trigger Build
 
 on:
   push:
@@ -38,34 +38,47 @@ jobs:
             echo "changed=true" >> $GITHUB_OUTPUT
           fi
 
-      - name: Create tag and push
+      - name: Check if tag exists
+        id: check_tag
         if: steps.version_check.outputs.changed == 'true'
+        run: |
+          if git rev-parse "${{ steps.versions.outputs.current_version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install git-cliff
+        if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
+        uses: kenji-miyake/setup-git-cliff@v1
+
+      - name: Generate changelog
+        if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
+        run: git cliff --tag ${{ steps.versions.outputs.current_version }} > CHANGELOG.md
+
+      - name: Create tag and push
+        if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
         env:
           GITHUB_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
         run: |
-          git config user.name "Kav"
-          git config user.email "kav.pather@gmail.com"
+          git config user.name "YourName"
+          git config user.email "yourname@example.com"
 
-          # Check if there are changes to commit
-          if [ -n "$(git status --porcelain)" ]; then
-            echo "Changes detected. Committing..."
-            git add CHANGELOG.md
-            git commit -m "docs: update changelog for ${{ steps.versions.outputs.current_version }}"
-            git push origin main
-          else
-            echo "No changes to commit. Skipping commit."
-          fi
+          # Commit changelog
+          git add CHANGELOG.md
+          git commit -m "docs: update changelog for ${{ steps.versions.outputs.current_version }}"
+          git push origin main
 
-          # Create and push the tag using PAT
+          # Create and push the tag
           git tag -a ${{ steps.versions.outputs.current_version }} -m "Release ${{ steps.versions.outputs.current_version }}"
           git push origin ${{ steps.versions.outputs.current_version }}
 
+      # Trigger Build and Release Workflow
       - name: Trigger Build and Release Workflow
-        if: steps.version_check.outputs.changed == 'true'
+        if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
         env:
           GITHUB_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
         run: |
-          # Run curl and capture both the HTTP response body and status code
           response=$(mktemp)
           http_code=$(curl -s -o "$response" -w "%{http_code}" \
             -X POST \
@@ -74,19 +87,14 @@ jobs:
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/build-and-release.yml/dispatches \
             -d '{"ref":"refs/tags/${{ steps.versions.outputs.current_version }}"}')
 
-          # Output the full HTTP response body for debugging
           echo "HTTP Response Body:"
           cat "$response"
 
-          # Output the HTTP status code
           echo "HTTP Status Code: $http_code"
 
-          # Handle non-success status codes
           if [[ "$http_code" -lt 200 || "$http_code" -ge 400 ]]; then
             echo "Error triggering workflow dispatch: HTTP $http_code"
             exit 1
           else
             echo "Workflow dispatch triggered successfully: HTTP $http_code"
           fi
-
-
