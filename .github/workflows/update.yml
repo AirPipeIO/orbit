@@ -38,6 +38,7 @@ jobs:
             echo "changed=true" >> $GITHUB_OUTPUT
           fi
 
+      # Check if the tag already exists
       - name: Check if tag exists
         id: check_tag
         if: steps.version_check.outputs.changed == 'true'
@@ -48,28 +49,28 @@ jobs:
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
 
+      # Install git-cliff
       - name: Install git-cliff
         if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
         uses: kenji-miyake/setup-git-cliff@v1
 
+      # Generate changelog
       - name: Generate changelog
         if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
         run: git cliff --tag ${{ steps.versions.outputs.current_version }} > CHANGELOG.md
 
-      - name: Create tag and push
+      # Commit changelog using GitHub Actions bot
+      - name: Commit changelog
         if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
-        env:
-          GITHUB_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
         run: |
-          git config user.name "YourName"
-          git config user.email "yourname@example.com"
-
-          # Commit changelog
           git add CHANGELOG.md
           git commit -m "docs: update changelog for ${{ steps.versions.outputs.current_version }}"
           git push origin main
 
-          # Create and push the tag
+      # Create tag and push using GitHub Actions bot
+      - name: Create tag and push
+        if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
+        run: |
           git tag -a ${{ steps.versions.outputs.current_version }} -m "Release ${{ steps.versions.outputs.current_version }}"
           git push origin ${{ steps.versions.outputs.current_version }}
 
