@@ -2,12 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.6] - 2025-01-26
+
+### 🚀 Features
+
+- Bump version
+
 ## [0.1.5] - 2025-01-26
 
 ### 🚀 Features
 
 - Bump Merge branch 'main' of github.com:AirPipeIO/orbit
 - Bump version
+
+### 📚 Documentation
+
+- Update changelog for v0.1.5
 
 ## [0.1.3] - 2025-01-26
 
