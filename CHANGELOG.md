@@ -2,11 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.10] - 2025-01-26
+
+### 🚀 Features
+
+- Bump version
+
 ## [0.1.9] - 2025-01-26
 
 ### 🚀 Features
 
 - Bump version
+
+### 📚 Documentation
+
+- Update changelog for v0.1.9
 
 ## [0.1.8] - 2025-01-26
 
