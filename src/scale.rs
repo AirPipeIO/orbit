@@ -1,4 +1,4 @@
-// scale.rs
+// src/scale.rs
 use anyhow::{anyhow, Result};
 use pingora_load_balancing::Backend;
 use std::{

@@ -1,4 +1,4 @@
-// config.rs
+// src/config/mod.rs
 pub mod utils;
 pub mod validate;
 
@@ -30,6 +30,7 @@ use validate::{
 use validator::Validate;
 
 use crate::{
+    api::status::update_instance_store_cache,
     container::{
         self, clean_up, manage, remove_container_stats, ContainerInfo, ContainerMetadata,
         ContainerPortMetadata, ContainerStats, InstanceMetadata, INSTANCE_STORE, RUNTIME,
@@ -37,7 +38,6 @@ use crate::{
     },
     proxy::{self, SERVER_BACKENDS},
     scale::auto_scale,
-    status::update_instance_store_cache,
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

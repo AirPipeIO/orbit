@@ -1,7 +1,6 @@
-// rolling_updates.rs
+// src/rolling_update.rs
 
 use anyhow::{anyhow, Result};
-use dashmap::{DashMap, DashSet};
 use pingora_load_balancing::Backend;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,8 +16,8 @@ use crate::{
         get_config_by_service, parse_container_name, ScaleMessage, ServiceConfig, CONFIG_UPDATES,
     },
     container::{
-        get_next_pod_number, ContainerMetadata, ContainerPortMetadata, ContainerRuntime,
-        InstanceMetadata, INSTANCE_STORE, RUNTIME,
+        get_next_pod_number, ContainerMetadata, ContainerRuntime, InstanceMetadata, INSTANCE_STORE,
+        RUNTIME,
     },
     proxy::SERVER_BACKENDS,
 };

@@ -1,3 +1,5 @@
+// src/main.rs
+pub mod api;
 pub mod config;
 pub mod container;
 pub mod logger;
@@ -5,7 +7,6 @@ pub mod metrics;
 pub mod proxy;
 pub mod rolling_update;
 pub mod scale;
-pub mod status;
 
 use anyhow::Result;
 use axum::{routing::get, Router};
@@ -105,7 +106,7 @@ async fn main() -> Result<()> {
     });
 
     // Initialize background cache update
-    status::initialize_background_cache_update();
+    api::status::initialize_background_cache_update();
 
     // Initialize metrics system
     let _ = metrics::initialize_metrics();
@@ -133,7 +134,7 @@ async fn main() -> Result<()> {
     });
 
     let app = Router::new()
-        .route("/status", get(status::get_status))
+        .route("/status", get(api::status::get_status))
         .route("/metrics", get(metrics::metrics_handler));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:4112").await?;

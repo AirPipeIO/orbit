@@ -1,3 +1,4 @@
+// src/container/mod.rs
 mod runtimes;
 
 use docker::DockerRuntime;
@@ -16,9 +17,9 @@ use std::time::{Duration, SystemTime};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::api::status::update_instance_store_cache;
 use crate::config::{parse_container_name, ResourceThresholds, ServiceConfig};
 use crate::proxy::SERVER_BACKENDS;
-use crate::status::update_instance_store_cache;
 
 const MAX_SERVICE_NAME_LENGTH: usize = 60; // Common k8s practice
 const MAX_CONTAINER_NAME_LENGTH: usize = 60; // This gives us plenty of room

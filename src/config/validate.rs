@@ -1,3 +1,4 @@
+// src/config/validate.rs
 use anyhow::Result;
 
 use std::collections::HashSet;

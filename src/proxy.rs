@@ -1,8 +1,8 @@
-// proxy.rs
+// src/proxy.rs
+use crate::api::status::update_instance_store_cache;
 use crate::config::ServiceConfig;
 use crate::container::INSTANCE_STORE;
 use crate::metrics::{SERVICE_REQUEST_DURATION, SERVICE_REQUEST_TOTAL, TOTAL_REQUESTS};
-use crate::status::update_instance_store_cache;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::DashSet;

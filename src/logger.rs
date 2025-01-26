@@ -1,4 +1,4 @@
-// logger.rs
+// src/logger.rs
 pub static LOG: OnceLock<slog::Logger> = OnceLock::new();
 
 extern crate slog_async;
