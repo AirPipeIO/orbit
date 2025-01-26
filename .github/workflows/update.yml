@@ -68,5 +68,8 @@ jobs:
           git add CHANGELOG.md
           git commit -m "docs: update changelog for ${{ steps.versions.outputs.current_version }}"
           git tag -a ${{ steps.versions.outputs.current_version }} -m "Release ${{ steps.versions.outputs.current_version }}"
+          echo "Pushing changes to main"
           git push origin main
+          echo "Pushing tag ${{ steps.versions.outputs.current_version }}"
           git push origin ${{ steps.versions.outputs.current_version }}
+          echo "Tag push completed"
