@@ -4,10 +4,7 @@ pub mod validate;
 
 pub use utils::*;
 
-use crate::{
-    container::{Container, IMAGE_CHECK_TASKS},
-    rolling_update,
-};
+use crate::container::{rolling_update, Container, IMAGE_CHECK_TASKS};
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use notify::{EventKind, RecursiveMode};
@@ -32,12 +29,11 @@ use validator::Validate;
 use crate::{
     api::status::update_instance_store_cache,
     container::{
-        self, clean_up, manage, remove_container_stats, ContainerInfo, ContainerMetadata,
-        ContainerPortMetadata, ContainerStats, InstanceMetadata, INSTANCE_STORE, RUNTIME,
-        SCALING_TASKS,
+        self, clean_up, manage, remove_container_stats, scale::auto_scale, ContainerInfo,
+        ContainerMetadata, ContainerPortMetadata, ContainerStats, InstanceMetadata, INSTANCE_STORE,
+        RUNTIME, SCALING_TASKS,
     },
     proxy::{self, SERVER_BACKENDS},
-    scale::auto_scale,
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

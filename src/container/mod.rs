@@ -1,8 +1,13 @@
 // src/container/mod.rs
+pub mod rolling_update;
 mod runtimes;
+pub mod scale;
+
+pub use rolling_update::*;
+pub use runtimes::*;
+pub use scale::*;
 
 use docker::DockerRuntime;
-pub use runtimes::*;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;

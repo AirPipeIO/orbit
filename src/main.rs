@@ -5,8 +5,6 @@ pub mod container;
 pub mod logger;
 pub mod metrics;
 pub mod proxy;
-pub mod rolling_update;
-pub mod scale;
 
 use anyhow::Result;
 use axum::{routing::get, Router};
