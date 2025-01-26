@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'Cargo.toml'
 
 jobs:
   tag-version:
@@ -60,7 +58,7 @@ jobs:
           git tag -a ${{ steps.versions.outputs.current_version }} -m "Release ${{ steps.versions.outputs.current_version }}"
           git push origin ${{ steps.versions.outputs.current_version }}
 
-  build-and-release:
+  build-linux:
     needs: tag-version
     runs-on: ubuntu-latest
     strategy:
@@ -68,7 +66,6 @@ jobs:
         target:
           - x86_64-unknown-linux-gnu
           - aarch64-unknown-linux-gnu
-          - aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
 
@@ -90,8 +87,45 @@ jobs:
           name: orbit-${{ matrix.target }}
           path: orbit-${{ matrix.target }}.tar.gz
 
+  build-macos:
+    needs: tag-version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup target add aarch64-apple-darwin
+
+      - name: Build binary
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Package Binary
+        run: |
+          cd target/aarch64-apple-darwin/release
+          tar czf ../../../orbit-aarch64-apple-darwin.tar.gz orbit
+          cd ../../..
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: orbit-aarch64-apple-darwin
+          path: orbit-aarch64-apple-darwin.tar.gz
+
+  create-release:
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v3
+        with:
+          name: orbit-x86_64-unknown-linux-gnu
+      - uses: actions/download-artifact@v3
+        with:
+          name: orbit-aarch64-unknown-linux-gnu
+      - uses: actions/download-artifact@v3
+        with:
+          name: orbit-aarch64-apple-darwin
+
       - name: Create Release
-        if: matrix.target == 'x86_64-unknown-linux-gnu' # Only one job creates the release
         uses: softprops/action-gh-release@v1
         with:
           files: |
