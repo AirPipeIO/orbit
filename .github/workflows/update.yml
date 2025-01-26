@@ -1,4 +1,4 @@
-name: Version Tag
+name: Version Tag and Release
 
 on:
   push:
@@ -8,15 +8,30 @@ on:
       - 'Cargo.toml'
 
 jobs:
-  tag-version:
+  tag-and-release:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: linux
+            arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            os: linux
+            arch: arm64
+          - target: aarch64-apple-darwin
+            os: darwin
+            arch: arm64
+
     steps:
+      # Checkout repository
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # Get current and previous versions
       - name: Get current and previous versions
         id: versions
         run: |
@@ -28,6 +43,7 @@ jobs:
           prev_version=$(git show HEAD^:Cargo.toml | grep '^version = ' | cut -d '"' -f2 || echo "0.0.0")
           echo "prev_version=v${prev_version}" >> $GITHUB_OUTPUT
 
+      # Compare versions
       - name: Version comparison
         id: version_check
         run: |
@@ -42,6 +58,7 @@ jobs:
             echo "changed=true" >> $GITHUB_OUTPUT
           fi
 
+      # Check if the tag already exists
       - name: Check if tag exists
         id: check_tag
         if: steps.version_check.outputs.changed == 'true'
@@ -52,14 +69,15 @@ jobs:
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Install git-cliff
+      # Install git-cliff and generate changelog
+      - name: Generate changelog
         if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
         uses: kenji-miyake/setup-git-cliff@v1
-
       - name: Generate changelog
         if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
         run: git cliff --tag ${{ steps.versions.outputs.current_version }} > CHANGELOG.md
 
+      # Create tag and push changes
       - name: Create tag and release
         if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
         run: |
@@ -72,10 +90,46 @@ jobs:
           git push origin main
           echo "Pushing tag ${{ steps.versions.outputs.current_version }}"
           git push origin ${{ steps.versions.outputs.current_version }}
-          echo "Tag push completed"
 
-      - name: Trigger Release Workflow
-        uses: peter-evans/repository-dispatch@v2
+      # Build binaries for multiple targets
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
         with:
-          token: ${{ secrets.PUBLIC_WORKFLOWS }}
-          event-type: trigger-release
+          toolchain: stable
+          target: ${{ matrix.target }}
+
+      - name: Install cross-compilation dependencies
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Build binary
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --target ${{ matrix.target }}
+          use-cross: ${{ matrix.target != 'x86_64-unknown-linux-gnu' }}
+
+      - name: Package Binary
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../orbit-${{ matrix.os }}-${{ matrix.arch }}.tar.gz orbit
+          cd ../../..
+
+      # Upload artifacts
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: orbit-${{ matrix.os }}-${{ matrix.arch }}
+          path: orbit-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+
+      # Create GitHub Release
+      - name: Create Release
+        if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            orbit-linux-amd64/orbit-linux-amd64.tar.gz
+            orbit-linux-arm64/orbit-linux-arm64.tar.gz
+            orbit-darwin-arm64/orbit-darwin-arm64.tar.gz
