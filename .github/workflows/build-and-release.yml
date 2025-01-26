@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*.*.*" # Trigger workflow only for semantic version tags
+  workflow_dispatch: # Allow manual or API-triggered runs
 
 jobs:
   build-linux:
