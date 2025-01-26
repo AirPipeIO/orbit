@@ -65,54 +65,36 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: linux
-            arch: amd64
-          - target: aarch64-unknown-linux-gnu
-            os: linux
-            arch: arm64
-          - target: aarch64-apple-darwin
-            os: darwin
-            arch: arm64
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-          target: ${{ matrix.target }}
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Install cross-compilation dependencies
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-
-      - name: Build binary
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --release --target ${{ matrix.target }}
+      - name: Build binary with cross
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Package Binary
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../orbit-${{ matrix.os }}-${{ matrix.arch }}.tar.gz orbit
+          tar czf ../../../orbit-${{ matrix.target }}.tar.gz orbit
           cd ../../..
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v3
         with:
-          name: orbit-${{ matrix.os }}-${{ matrix.arch }}
-          path: orbit-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+          name: orbit-${{ matrix.target }}
+          path: orbit-${{ matrix.target }}.tar.gz
 
       - name: Create Release
-        if: matrix.os == 'linux' && matrix.arch == 'amd64'
+        if: matrix.target == 'x86_64-unknown-linux-gnu' # Only one job creates the release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            orbit-linux-amd64/orbit-linux-amd64.tar.gz
-            orbit-linux-arm64/orbit-linux-arm64.tar.gz
-            orbit-darwin-arm64/orbit-darwin-arm64.tar.gz
+            orbit-x86_64-unknown-linux-gnu.tar.gz
+            orbit-aarch64-unknown-linux-gnu.tar.gz
+            orbit-aarch64-apple-darwin.tar.gz
