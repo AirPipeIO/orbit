@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - 'v[0-9]+.[0-9]+.[0-9]+'  # Match semantic version tags
 
 jobs:
   build-release:
@@ -34,13 +34,12 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
           target: ${{ matrix.target }}
-          override: true
 
-      - name: Install cross-compilation tools
+      - name: Install cross-compilation dependencies
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
@@ -51,7 +50,7 @@ jobs:
         with:
           command: build
           args: --release --target ${{ matrix.target }}
-          use-cross: true
+          use-cross: ${{ matrix.target != 'x86_64-unknown-linux-gnu' }}
 
       - name: Package Binary
         run: |
