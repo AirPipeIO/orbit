@@ -1,9 +1,6 @@
 name: Build and Release
 
 on:
-  push:
-    tags:
-      - "v*.*.*" # Trigger workflow only for semantic version tags
   workflow_dispatch: # Allow manual or API-triggered runs
 
 jobs:
@@ -22,12 +19,14 @@ jobs:
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build binary with cross
-        run: cross build --release --target ${{ matrix.target }}
+      - name: Build binary with optimisations
+        run: |
+          RUSTFLAGS="-C link-arg=-s -C lto=fat" cross build --release --target ${{ matrix.target }}
 
       - name: Package Binary
         run: |
           cd target/${{ matrix.target }}/release
+          strip orbit || echo "Strip not supported for this platform"
           tar czf ../../../orbit-${{ matrix.target }}.tar.gz orbit
           cd ../../..
 
@@ -47,12 +46,14 @@ jobs:
       - name: Install Rust
         run: rustup target add aarch64-apple-darwin
 
-      - name: Build binary
-        run: cargo build --release --target aarch64-apple-darwin
+      - name: Build binary with optimisations
+        run: |
+          RUSTFLAGS="-C link-arg=-s -C lto=fat" cargo build --release --target aarch64-apple-darwin
 
       - name: Package Binary
         run: |
           cd target/aarch64-apple-darwin/release
+          strip orbit || echo "Strip not supported for this platform"
           tar czf ../../../orbit-aarch64-apple-darwin.tar.gz orbit
           cd ../../..
 

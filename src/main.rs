@@ -18,7 +18,7 @@ use dashmap::DashMap;
 use logger::setup_logger;
 use metrics::MetricsUpdate;
 use proxy::{SERVER_BACKENDS, SERVER_TASKS};
-use std::{path::PathBuf, process, time::Duration};
+use std::{fs, path::PathBuf, process, time::Duration};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -38,22 +38,6 @@ pub struct Args {
         help = "Log Levels: info, debug, warning, error, trace, critical"
     )]
     log_level: String,
-
-    /// Minimum port number for dynamic port allocation
-    #[arg(
-        long,
-        default_value = "32768",
-        help = "Minimum port number for dynamic port allocation"
-    )]
-    port_min: u16,
-
-    /// Maximum port number for dynamic port allocation
-    #[arg(
-        long,
-        default_value = "61000",
-        help = "Maximum port number for dynamic port allocation"
-    )]
-    port_max: u16,
 }
 
 #[tokio::main]
@@ -81,12 +65,22 @@ async fn main() -> Result<()> {
         "runtime" => args.runtime.to_string()
     );
 
-    // Check if config directory exists
+    // Check if config directory exists, create if it doesn't
     if !args.config_dir.exists() {
-        slog::error!(log, "Configuration directory does not exist";
-            "path" => args.config_dir.display().to_string()
-        );
-        process::exit(1);
+        match fs::create_dir_all(&args.config_dir) {
+            Ok(_) => {
+                slog::info!(log, "Created configuration directory";
+                    "path" => args.config_dir.display().to_string()
+                );
+            }
+            Err(e) => {
+                slog::error!(log, "Failed to create configuration directory";
+                    "path" => args.config_dir.display().to_string(),
+                    "error" => e.to_string()
+                );
+                process::exit(1);
+            }
+        }
     }
 
     // init container runtime
