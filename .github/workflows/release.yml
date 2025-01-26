@@ -1,0 +1,93 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*" # Trigger workflow only for semantic version tags
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build binary with cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package Binary
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../orbit-${{ matrix.target }}.tar.gz orbit
+          cd ../../..
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: orbit-${{ matrix.target }}
+          path: orbit-${{ matrix.target }}.tar.gz
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        run: rustup target add aarch64-apple-darwin
+
+      - name: Build binary
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Package Binary
+        run: |
+          cd target/aarch64-apple-darwin/release
+          tar czf ../../../orbit-aarch64-apple-darwin.tar.gz orbit
+          cd ../../..
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: orbit-aarch64-apple-darwin
+          path: orbit-aarch64-apple-darwin.tar.gz
+
+  create-release:
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Artifacts (Linux x86_64)
+        uses: actions/download-artifact@v3
+        with:
+          name: orbit-x86_64-unknown-linux-gnu
+
+      - name: Download Artifacts (Linux ARM64)
+        uses: actions/download-artifact@v3
+        with:
+          name: orbit-aarch64-unknown-linux-gnu
+
+      - name: Download Artifacts (macOS ARM64)
+        uses: actions/download-artifact@v3
+        with:
+          name: orbit-aarch64-apple-darwin
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            orbit-x86_64-unknown-linux-gnu.tar.gz
+            orbit-aarch64-unknown-linux-gnu.tar.gz
+            orbit-aarch64-apple-darwin.tar.gz
