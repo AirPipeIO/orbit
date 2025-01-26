@@ -40,7 +40,7 @@ jobs:
             echo "changed=true" >> $GITHUB_OUTPUT
           fi
 
-       - name: Create tag and push
+      - name: Create tag and push
         if: steps.version_check.outputs.changed == 'true'
         run: |
           git config user.name "GitHub Action"
@@ -59,7 +59,6 @@ jobs:
           # Create and push the tag
           git tag -a ${{ steps.versions.outputs.current_version }} -m "Release ${{ steps.versions.outputs.current_version }}"
           git push origin ${{ steps.versions.outputs.current_version }}
-
 
   build-and-release:
     needs: tag-version
@@ -110,7 +109,7 @@ jobs:
           path: orbit-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
 
       - name: Create Release
-        if: matrix.os == 'linux' && matrix.arch == 'amd64' # Only one job creates the release
+        if: matrix.os == 'linux' && matrix.arch == 'amd64'
         uses: softprops/action-gh-release@v1
         with:
           files: |
