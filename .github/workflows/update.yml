@@ -73,3 +73,19 @@ jobs:
           echo "Pushing tag ${{ steps.versions.outputs.current_version }}"
           git push origin ${{ steps.versions.outputs.current_version }}
           echo "Tag push completed"
+
+      - name: Trigger Release Workflow
+        if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
+        env:
+          PUBLIC_WORKFLOWS: ${{ secrets.PUBLIC_WORKFLOWS }}
+        run: |
+          # Get the workflow ID for release.yml
+          workflow_id=$(curl -s -H "Authorization: Bearer $PUBLIC_WORKFLOWS" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows" | jq -r '.workflows[] | select(.name=="Release") | .id')
+
+          # Trigger the workflow_dispatch event
+          curl -X POST -H "Authorization: Bearer $PUBLIC_WORKFLOWS" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/dispatches" \
+            -d '{"ref": "main"}'
