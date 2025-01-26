@@ -59,19 +59,16 @@ jobs:
         if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
         run: git cliff --tag ${{ steps.versions.outputs.current_version }} > CHANGELOG.md
 
-      # Commit changelog using GitHub Actions bot
-      - name: Commit changelog
+      # Create tag and release
+      - name: Create tag and release
         if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
         run: |
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
           git add CHANGELOG.md
           git commit -m "docs: update changelog for ${{ steps.versions.outputs.current_version }}"
-          git push origin main
-
-      # Create tag and push using GitHub Actions bot
-      - name: Create tag and push
-        if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
-        run: |
           git tag -a ${{ steps.versions.outputs.current_version }} -m "Release ${{ steps.versions.outputs.current_version }}"
+          git push origin main
           git push origin ${{ steps.versions.outputs.current_version }}
 
       # Trigger Build and Release Workflow
