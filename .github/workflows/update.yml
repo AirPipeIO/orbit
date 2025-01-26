@@ -65,16 +65,26 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
         run: |
-          response=$(curl -s -o /dev/null -w "%{http_code}" \
+          # Run curl and capture both the HTTP response body and status code
+          response=$(curl -s -w "\n%{http_code}" \
             -X POST \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/build-and-release.yml/dispatches \
             -d '{"ref":"refs/tags/${{ steps.versions.outputs.current_version }}"}')
 
-          if [[ "$response" -lt 200 || "$response" -ge 400 ]]; then
-            echo "Error triggering workflow dispatch: HTTP $response"
+          # Split the response into body and status code
+          http_body=$(echo "$response" | head -n1)
+          http_code=$(echo "$response" | tail -n1)
+
+          # Output the response body and handle non-success status codes
+          echo "HTTP Response Body: $http_body"
+          echo "HTTP Status Code: $http_code"
+
+          if [[ "$http_code" -lt 200 || "$http_code" -ge 400 ]]; then
+            echo "Error triggering workflow dispatch: HTTP $http_code"
             exit 1
           else
-            echo "Workflow dispatch triggered successfully: HTTP $response"
+            echo "Workflow dispatch triggered successfully: HTTP $http_code"
           fi
+
