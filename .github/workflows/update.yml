@@ -1,0 +1,98 @@
+name: Version Tag Creation and Trigger Build
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  tag-version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get current and previous versions
+        id: versions
+        run: |
+          current_version=$(grep '^version = ' Cargo.toml | cut -d '"' -f2)
+          echo "current_version=v${current_version}" >> $GITHUB_OUTPUT
+          
+          prev_version=$(git show HEAD^:Cargo.toml | grep '^version = ' | cut -d '"' -f2 || echo "0.0.0")
+          echo "prev_version=v${prev_version}" >> $GITHUB_OUTPUT
+
+      - name: Version comparison
+        id: version_check
+        run: |
+          current="${{ steps.versions.outputs.current_version }}"
+          previous="${{ steps.versions.outputs.prev_version }}"
+          
+          if [ "$current" = "$previous" ]; then
+            echo "Version unchanged ($current), skipping tag creation"
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "Version changed from $previous to $current"
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      # Check if the tag already exists
+      - name: Check if tag exists
+        id: check_tag
+        if: steps.version_check.outputs.changed == 'true'
+        run: |
+          if git rev-parse "${{ steps.versions.outputs.current_version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Install git-cliff
+      - name: Install git-cliff
+        if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
+        uses: kenji-miyake/setup-git-cliff@v1
+
+      # Generate changelog
+      - name: Generate changelog
+        if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
+        run: git cliff --tag ${{ steps.versions.outputs.current_version }} > CHANGELOG.md
+
+      # Create tag and release
+      - name: Create tag and release
+        if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
+        run: |
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+          git add CHANGELOG.md
+          git commit -m "docs: update changelog for ${{ steps.versions.outputs.current_version }}"
+          git tag -a ${{ steps.versions.outputs.current_version }} -m "Release ${{ steps.versions.outputs.current_version }}"
+          git push origin main
+          git push origin ${{ steps.versions.outputs.current_version }}
+
+      # Trigger Build and Release Workflow
+      - name: Trigger Build and Release Workflow
+        if: steps.version_check.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+        run: |
+          response=$(mktemp)
+          http_code=$(curl -s -o "$response" -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/build-and-release.yml/dispatches \
+            -d '{"ref":"refs/tags/${{ steps.versions.outputs.current_version }}"}')
+
+          echo "HTTP Response Body:"
+          cat "$response"
+
+          echo "HTTP Status Code: $http_code"
+
+          if [[ "$http_code" -lt 200 || "$http_code" -ge 400 ]]; then
+            echo "Error triggering workflow dispatch: HTTP $http_code"
+            exit 1
+          else
+            echo "Workflow dispatch triggered successfully: HTTP $http_code"
+          fi
