@@ -22,7 +22,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
-use volumes::{detach_volume, VolumeData, VolumeMount};
+use volumes::{detach_volume, VolumeMount};
 
 use crate::api::status::update_instance_store_cache;
 use crate::config::{

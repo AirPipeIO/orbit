@@ -1,5 +1,5 @@
 // src/container/scale.rs
-use anyhow::{anyhow, Result};
+use anyhow::{Result};
 use pingora_load_balancing::Backend;
 use std::{
     collections::HashMap,
@@ -210,7 +210,7 @@ pub async fn auto_scale(service_name: String) {
 
                     for (_, stats) in &pod_stats {
                         let memory_percentage = if stats.memory_limit > 0 {
-                            (stats.memory_usage as f64 / stats.memory_limit as f64 * 100.0)
+                            stats.memory_usage as f64 / stats.memory_limit as f64 * 100.0
                         } else {
                             0.0
                         };
@@ -552,6 +552,7 @@ pub async fn scale_down(
 }
 
 // Health check function
+#[warn(dead_code)]
 async fn wait_for_container_health(
     container_name: &str,
     runtime: Arc<dyn ContainerRuntime>,
@@ -585,7 +586,7 @@ async fn wait_for_container_health(
 
     false
 }
-
+#[warn(dead_code)]
 async fn check_application_readiness(addr: &str, port: u16, timeout: Duration) -> bool {
     use tokio::net::TcpStream;
 

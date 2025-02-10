@@ -99,7 +99,7 @@ async fn perform_rolling_update(
     let server_backends = SERVER_BACKENDS
         .get()
         .expect("Server backends not initialized");
-    let log = slog_scope::logger();
+    let _log = slog_scope::logger();
 
     let pods: Vec<_> = {
         let instances = instance_store
