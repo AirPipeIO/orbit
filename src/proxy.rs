@@ -127,7 +127,7 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
     }
 
     // Only create proxies for containers requesting external access
-    for (node_port, container_port) in service_ports {
+    for (node_port, _container_port) in service_ports {
         let proxy_key = format!("{}_{}", service_name, node_port);
 
         if let Some(backends) = server_backends.get(&proxy_key) {
