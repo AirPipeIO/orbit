@@ -13,7 +13,7 @@ pull_policy: Always # autorize pulling of image
 spec:
   containers:
   - name: main
-    image: nginx:latest
+    image: airpipeio/infoapp:latest
     ports:
     - port: 80
       node_port: 4333
