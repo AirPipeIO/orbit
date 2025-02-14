@@ -1,11 +1,14 @@
 // src/proxy.rs
 use crate::api::status::update_instance_store_cache;
-use crate::config::ServiceConfig;
-use crate::container::INSTANCE_STORE;
+use crate::config::{get_config_by_service, ServiceConfig};
+use crate::container::scaling::codel::get_service_metrics;
+use crate::container::scaling::scale_up;
+use crate::container::{INSTANCE_STORE, RUNTIME};
 use crate::metrics::{SERVICE_REQUEST_DURATION, SERVICE_REQUEST_TOTAL, TOTAL_REQUESTS};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::DashSet;
+use pingora::http::ResponseHeader;
 use pingora::lb::discovery::ServiceDiscovery;
 use pingora::lb::{Backend, Backends, LoadBalancer};
 use pingora::prelude::RoundRobin;
@@ -13,9 +16,10 @@ use pingora::proxy::{http_proxy_service, ProxyHttp, Session};
 use pingora::server::Server;
 use pingora::services::background::background_service;
 use pingora::upstreams::peer::HttpPeer;
-use pingora_http::ResponseHeader;
 use pingora_load_balancing::health_check;
+
 use std::collections::{BTreeSet, HashMap, HashSet};
+#[cfg(unix)]
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
@@ -37,6 +41,7 @@ impl ServiceDiscovery for Discovery {
 pub struct ProxyApp {
     pub loadbalancer: Arc<LoadBalancer<RoundRobin>>,
     pub service_name: String,
+    // pub listener: Option<ListenerEndpoint>,
 }
 
 #[async_trait]
@@ -48,43 +53,47 @@ impl ProxyHttp for ProxyApp {
         Instant::now()
     }
 
-    async fn upstream_peer(
-        &self,
-        _session: &mut Session,
-        _ctx: &mut Instant,
-    ) -> pingora::Result<Box<HttpPeer>> {
-        match self.loadbalancer.select(b"", 256) {
-            Some(upstream) => Ok(Box::new(HttpPeer::new(
-                upstream,
-                false,
-                "host.name".to_string(),
-            ))),
-            None => {
-                let error = pingora::Error {
-                    etype: pingora::ErrorType::CustomCode("no_upstream", 503),
-                    esource: pingora::ErrorSource::Unset,
-                    retry: pingora::RetryType::Decided(false),
-                    cause: None,
-                    context: Some(pingora::ImmutStr::Static("No upstream available")),
-                };
-                Err(Box::new(error))
-            }
-        }
-    }
-
     async fn response_filter(
         &self,
         _session: &mut Session,
         response: &mut ResponseHeader,
         ctx: &mut Instant,
     ) -> pingora::Result<()> {
-        // Get response status
+        let total_time = ctx.elapsed();
+        let service_name = self.service_name.split_once("__").unwrap().0;
+
+        // Get service configuration and check CoDel metrics here since we now have the complete request time
+        if let Some(config) = get_config_by_service(service_name) {
+            if let Some(codel_config) = config.codel.clone() {
+                let metrics = get_service_metrics(service_name, &codel_config).await;
+                let mut metrics = metrics.lock().await;
+
+                // Record the total request time
+                metrics.record_sojourn(total_time);
+
+                // Check if we need to take action
+                if let Some(_action) = metrics.check_state() {
+                    // Spawn scaling as a background task
+                    let config_clone = config.clone();
+                    let service_name_clone = service_name.to_string();
+                    let runtime = RUNTIME.get().unwrap().clone();
+
+                    tokio::spawn(async move {
+                        if let Err(e) = scale_up(&service_name_clone, config_clone, runtime).await {
+                            slog::error!(slog_scope::logger(), "Failed to scale up service";
+                                "service" => service_name_clone,
+                                "error" => e.to_string()
+                            );
+                        }
+                    });
+                }
+            }
+        }
+
+        // Original metrics recording
         let status = response.status.as_u16().to_string();
+        let duration = total_time.as_secs_f64();
 
-        // Calculate request duration
-        let duration = ctx.elapsed().as_secs_f64();
-
-        // Update metrics
         if let Some(total_requests) = TOTAL_REQUESTS.get() {
             total_requests.inc();
         }
@@ -102,6 +111,64 @@ impl ProxyHttp for ProxyApp {
         }
 
         Ok(())
+    }
+
+    async fn upstream_peer(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Instant,
+    ) -> pingora::Result<Box<HttpPeer>> {
+        let service_name = self.service_name.split_once("__").unwrap().0;
+
+        // Check if we should reject the request based on recent metrics
+        if let Some(config) = get_config_by_service(service_name) {
+            if let Some(codel_config) = config.codel.clone() {
+                let metrics = get_service_metrics(service_name, &codel_config).await;
+                let metrics = metrics.lock().await;
+
+                if metrics.should_reject() {
+                    if let Some(status_code) = codel_config.overload_status_code {
+                        slog::info!(slog_scope::logger(), "Rejecting request due to CoDel";
+                            "service" => service_name,
+                            "status_code" => status_code
+                        );
+
+                        let response = ResponseHeader::build(status_code, Some(0))?;
+                        session
+                            .write_response_header(Box::new(response), true)
+                            .await?;
+
+                        let error = pingora::Error {
+                            etype: pingora::ErrorType::CustomCode("overloaded", status_code),
+                            esource: pingora::ErrorSource::Unset,
+                            retry: pingora::RetryType::Decided(false),
+                            cause: None,
+                            context: Some(pingora::ImmutStr::Static("Service overloaded")),
+                        };
+                        return Err(Box::new(error));
+                    }
+                }
+            }
+        }
+
+        // Proceed with backend selection
+        match self.loadbalancer.select(b"", 256) {
+            Some(upstream) => Ok(Box::new(HttpPeer::new(
+                upstream,
+                false,
+                "host.name".to_string(),
+            ))),
+            None => {
+                let error = pingora::Error {
+                    etype: pingora::ErrorType::CustomCode("no_upstream", 503),
+                    esource: pingora::ErrorSource::Unset,
+                    retry: pingora::RetryType::Decided(false),
+                    cause: None,
+                    context: Some(pingora::ImmutStr::Static("No upstream available")),
+                };
+                Err(Box::new(error))
+            }
+        }
     }
 }
 
@@ -127,8 +194,9 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
     }
 
     // Only create proxies for containers requesting external access
-    for (node_port, container_port) in service_ports {
-        let proxy_key = format!("{}_{}", service_name, node_port);
+    for (node_port, _container_port) in service_ports {
+        let proxy_key = format!("{}__{}", service_name, node_port);
+        let addr = format!("0.0.0.0:{}", node_port);
 
         if let Some(backends) = server_backends.get(&proxy_key) {
             if let Some(instances) = INSTANCE_STORE.get().unwrap().get(&service_name) {
@@ -141,7 +209,7 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
                                         format!("{}:{}", container.ip_address, port_info.port);
                                     if let Ok(backend) = Backend::new(&addr) {
                                         backends.insert(backend);
-                                        slog::debug!(log, "Added backend";
+                                        slog::debug!(log, "Updated backend configuration";
                                             "service" => &service_name,
                                             "container" => &container.name,
                                             "ip" => &container.ip_address,
@@ -197,7 +265,7 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
         };
 
         let mut router_service = http_proxy_service(&Server::new(None).unwrap().configuration, app);
-        router_service.add_tcp(&format!("0.0.0.0:{}", node_port));
+        router_service.add_tcp(&addr);
 
         let mut server = Server::new(None).expect("Failed to initialise Pingora server");
         server.bootstrap();

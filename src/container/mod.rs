@@ -1,12 +1,11 @@
 // src/container/mod.rs
 pub mod rolling_update;
 mod runtimes;
-pub mod scale;
+pub mod scaling;
 pub mod volumes;
 
 pub use rolling_update::*;
 pub use runtimes::*;
-pub use scale::*;
 
 use docker::DockerRuntime;
 
@@ -22,7 +21,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
-use volumes::{detach_volume, VolumeData, VolumeMount};
+use volumes::{detach_volume, VolumeMount};
 
 use crate::api::status::update_instance_store_cache;
 use crate::config::{
@@ -40,6 +39,8 @@ pub static IMAGE_CHECK_TASKS: OnceLock<DashMap<String, JoinHandle<()>>> = OnceLo
 pub struct Container {
     pub name: String,
     pub image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub privileged: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -640,7 +641,7 @@ pub async fn clean_up(service_name: &str) {
                 // Remove from load balancer for each port
                 for port_metadata in &container.ports {
                     if let Some(node_port) = port_metadata.node_port {
-                        let proxy_key = format!("{}_{}", service_name, node_port);
+                        let proxy_key = format!("{}__{}", service_name, node_port);
                         if let Some(backends) = SERVER_BACKENDS.get().unwrap().get(&proxy_key) {
                             let addr = format!("{}:{}", container.ip_address, port_metadata.port);
                             if let Ok(backend) = Backend::new(&addr) {

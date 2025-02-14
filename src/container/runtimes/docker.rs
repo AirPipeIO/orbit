@@ -17,7 +17,6 @@ use uuid::Uuid;
 
 use crate::config::{get_config_by_service, parse_cpu_limit, parse_memory_limit, ServiceConfig};
 
-use crate::container::volumes::{attach_volume, create_named_volume, VOLUME_STORE};
 use crate::container::{
     parse_network_rate, update_container_stats, Container, ContainerInfo, ContainerPortMetadata,
     ContainerRuntime, ContainerStats, NetworkLimit,
@@ -474,6 +473,7 @@ impl ContainerRuntime for DockerRuntime {
                 memory: Some(memory_limit.try_into().unwrap()),
                 nano_cpus: Some(cpu_limit as i64),
                 network_mode: network_name.clone().or(Some("bridge".to_string())),
+                privileged: container.privileged,
                 ..Default::default()
             };
 

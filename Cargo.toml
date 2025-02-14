@@ -29,12 +29,14 @@ pingora-http = "0.4.0"
 pingora-load-balancing = "0.4.0"
 pingora-proxy = "0.4.0"
 pingora-core = "0.4.0"
+# pingora-core = { path = "/home/kav/dev/rust/pingora/pingora-core" }
 notify = "8.0.0"
 notify-debouncer-full = "0.5.0"
 axum = "0.8.1"
 prometheus = { version = "0.13.4", features = ["process"] }
 tempfile = "3.15.0"
 walkdir = "2.5.0"
+libc = "0.2.169"
 
 # logging
 slog = { version = "2.7.0" }

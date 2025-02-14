@@ -11,8 +11,9 @@ use axum::{routing::get, Router};
 use clap::Parser;
 use config::CONFIG_STORE;
 use container::{
-    create_runtime, volumes::initialize_volume_store, CONTAINER_STATS, IMAGE_CHECK_TASKS,
-    INSTANCE_STORE, NETWORK_USAGE, RUNTIME, SCALING_TASKS, SERVICE_STATS,
+    create_runtime, scaling::codel::initialize_codel_metrics, volumes::initialize_volume_store,
+    CONTAINER_STATS, IMAGE_CHECK_TASKS, INSTANCE_STORE, NETWORK_USAGE, RUNTIME, SCALING_TASKS,
+    SERVICE_STATS,
 };
 use dashmap::DashMap;
 use logger::setup_logger;
@@ -73,6 +74,7 @@ async fn main() -> Result<()> {
     SERVER_BACKENDS.get_or_init(DashMap::new);
     IMAGE_CHECK_TASKS.get_or_init(DashMap::new);
     NETWORK_USAGE.get_or_init(DashMap::new);
+    initialize_codel_metrics();
 
     // Parse command line arguments
     let args = Args::parse();

@@ -185,7 +185,7 @@ pub fn check_service_name_uniqueness(
         if existing_config.value().1.name == config.name {
             // Skip if this is the service we're updating
             if let Some(exclude) = exclude_service {
-                println!("\n\n{:?} : {:?} \n\n", exclude, config.name);
+                // println!("\n\n{:?} : {:?} \n\n", exclude, config.name);
                 if exclude == config.name {
                     continue;
                 }

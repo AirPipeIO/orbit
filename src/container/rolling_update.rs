@@ -99,7 +99,6 @@ async fn perform_rolling_update(
     let server_backends = SERVER_BACKENDS
         .get()
         .expect("Server backends not initialized");
-    let log = slog_scope::logger();
 
     let pods: Vec<_> = {
         let instances = instance_store
@@ -182,7 +181,7 @@ async fn perform_rolling_update(
         for (_, ip, ports) in containers {
             for port_info in ports {
                 if let Some(node_port) = port_info.node_port {
-                    let proxy_key = format!("{}_{}", service_name, node_port);
+                    let proxy_key = format!("{}__{}", service_name, node_port);
                     if let Some(backends) = server_backends.get(&proxy_key) {
                         let addr = format!("{}:{}", ip, port_info.port);
                         if let Ok(backend) = Backend::new(&addr) {
@@ -218,7 +217,7 @@ async fn perform_rolling_update(
         for container in &old_metadata.containers {
             for port_info in &container.ports {
                 if let Some(node_port) = port_info.node_port {
-                    let proxy_key = format!("{}_{}", service_name, node_port);
+                    let proxy_key = format!("{}__{}", service_name, node_port);
                     if let Some(backends) = server_backends.get(&proxy_key) {
                         let addr = format!("{}:{}", container.ip_address, port_info.port);
                         if let Ok(backend) = Backend::new(&addr) {

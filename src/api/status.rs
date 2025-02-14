@@ -173,7 +173,7 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
                                         Some(node_port) => {
                                             // Check load balancer registration for node_port
                                             let proxy_key =
-                                                format!("{}_{}", service_name, node_port);
+                                                format!("{}__{}", service_name, node_port);
                                             server_backends.iter().any(|backend_entry| {
                                                 backend_entry.key() == &proxy_key
                                                     && backend_entry.value().iter().any(|backend| {
@@ -213,7 +213,7 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
                                             );
                                             if let Some(node_port) = port_info.node_port {
                                                 let proxy_key =
-                                                    format!("{}_{}", service_name, node_port);
+                                                    format!("{}__{}", service_name, node_port);
                                                 server_backends
                                                     .get(&proxy_key)
                                                     .map(|backends| {

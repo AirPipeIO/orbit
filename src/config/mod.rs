@@ -1,9 +1,9 @@
 // src/config/mod.rs
 pub mod utils;
 pub mod validate;
-
 pub use utils::*;
 
+use crate::container::scaling::manager::ScalingPolicy;
 use crate::container::volumes::VolumeData;
 use crate::container::{rolling_update, Container, IMAGE_CHECK_TASKS};
 use anyhow::{anyhow, Result};
@@ -30,7 +30,7 @@ use validator::Validate;
 use crate::{
     api::status::update_instance_store_cache,
     container::{
-        self, clean_up, manage, remove_container_stats, scale::auto_scale, ContainerInfo,
+        self, clean_up, manage, remove_container_stats, scaling::auto_scale, ContainerInfo,
         ContainerMetadata, ContainerPortMetadata, ContainerStats, InstanceMetadata, INSTANCE_STORE,
         RUNTIME, SCALING_TASKS,
     },
@@ -88,6 +88,41 @@ pub struct InstanceCount {
     pub max: u8,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoDelConfig {
+    /// Target delay threshold in milliseconds
+    #[serde(with = "humantime_serde")]
+    pub target: Duration,
+
+    /// Interval for checking delays in milliseconds
+    #[serde(with = "humantime_serde")]
+    pub interval: Duration,
+
+    /// Number of consecutive intervals above target before scaling
+    #[serde(default = "default_consecutive_intervals")]
+    pub consecutive_intervals: u32,
+
+    /// Maximum instances to scale up at once
+    #[serde(default = "default_max_scale_step")]
+    pub max_scale_step: u32,
+
+    /// Minimum time between scaling actions
+    #[serde(with = "humantime_serde")]
+    pub scale_cooldown: Duration,
+
+    /// HTTP status code to return when overloaded
+    #[serde(default)]
+    pub overload_status_code: Option<u16>,
+}
+
+fn default_consecutive_intervals() -> u32 {
+    3
+}
+
+fn default_max_scale_step() -> u32 {
+    1
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Validate)]
 pub struct ServiceConfig {
     #[validate(length(max = 210))]
@@ -106,6 +141,10 @@ pub struct ServiceConfig {
     pub rolling_update_config: Option<RollingUpdateConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volumes: Option<HashMap<String, VolumeData>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codel: Option<CoDelConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scaling_policy: Option<ScalingPolicy>,
 }
 
 fn default_instance_count() -> bool {
@@ -661,7 +700,7 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
 
         for container in &orphaned_containers {
             if let Ok(parts) = parse_container_name(&container.name) {
-                let network_name = format!("{}_{}", service_name, parts.uuid);
+                let network_name = format!("{}__{}", service_name, parts.uuid);
                 network_containers
                     .entry(network_name)
                     .or_default()
