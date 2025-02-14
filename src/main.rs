@@ -67,8 +67,8 @@ async fn main() -> Result<()> {
     CONFIG_STORE.get_or_init(DashMap::new);
     INSTANCE_STORE.get_or_init(DashMap::new);
     SCALING_TASKS.get_or_init(DashMap::new);
-    CONTAINER_STATS.get_or_init(|| DashMap::new());
-    SERVICE_STATS.get_or_init(|| DashMap::new());
+    CONTAINER_STATS.get_or_init(DashMap::new);
+    SERVICE_STATS.get_or_init(DashMap::new);
     SERVER_TASKS.get_or_init(DashMap::new);
     SERVER_BACKENDS.get_or_init(DashMap::new);
     IMAGE_CHECK_TASKS.get_or_init(DashMap::new);

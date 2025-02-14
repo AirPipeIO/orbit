@@ -8,14 +8,17 @@ use bollard::models::{HostConfig, PortBinding};
 use bollard::network::CreateNetworkOptions;
 use bollard::secret::{DeviceRequest, Mount, MountBindOptions, MountTypeEnum};
 use bollard::Docker;
+use bollard::image::CreateImageOptions;
+use bollard::errors::Error::DockerResponseServerError;
 use dashmap::DashMap;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
+use std::default::Default;
 use uuid::Uuid;
 
-use crate::config::{get_config_by_service, parse_cpu_limit, parse_memory_limit, ServiceConfig};
+use crate::config::{get_config_by_service, parse_cpu_limit, parse_memory_limit, ServiceConfig, PullPolicyValue};
 use crate::container::{
     parse_network_rate, update_container_stats, Container, ContainerInfo, ContainerPortMetadata,
     ContainerRuntime, ContainerStats, NetworkLimit,
@@ -283,6 +286,56 @@ impl DockerRuntime {
         }
 
         Ok((port_bindings, exposed_ports, assigned_port_metadata))
+    }
+
+    pub async fn pull_image(
+        &self,
+        service_name: &str,
+        containers: &Vec<Container>,
+        service_config: &ServiceConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match service_config.pull_policy {
+            Some(PullPolicyValue::Always) => {
+                for container in containers {
+                    let image_name = &container.image.clone();
+                    let options = Some(CreateImageOptions {
+                        from_image: image_name.clone(),
+                        ..Default::default()
+                    });
+
+                    let mut stream = self.client.create_image(options, None, None);
+
+                    while let Some(result) = stream.next().await {
+                        match result {
+                            Ok(progress) => {
+                                slog::debug!(slog_scope::logger(), "Progress pulling image";
+                                    "service" => service_name,
+                                    "image" => image_name,
+                                    "progress" =>  format!("{:?}", progress)
+                                );
+                            }
+                            Err(e) => {
+                                slog::error!(slog_scope::logger(), "Error pulling image";
+                                    "service" => service_name,
+                                    "image" => image_name,
+                                    "error" => e.to_string()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                for container in containers {
+                    slog::debug!(slog_scope::logger(),"Pull policy is set to Neverby default, skipping image pull.";
+                        "service" => service_name,
+                        "image" => container.image.clone()
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -555,11 +608,55 @@ impl ContainerRuntime for DockerRuntime {
                     }
                 }
                 Err(e) => {
-                    slog::error!(slog_scope::logger(), "Failed to create container";
-                        "service" => service_name,
-                        "container" => &container_name,
-                        "error" => e.to_string()
-                    );
+                    match e {
+                        DockerResponseServerError {status_code, ..} => {
+                            if status_code == 404 {
+                                slog::warn!(slog_scope::logger(), "Image not found";
+                                    "service" => service_name,
+                                    "container" => &container_name,
+                                    "error" => e.to_string()
+                                );
+                                match service_config.pull_policy {
+                                    Some(PullPolicyValue::Always) => {
+                                        match self
+                                            .pull_image(service_name, containers, &service_config)
+                                            .await {
+                                                Ok(_) => {}
+                                                _ => {
+                                                    slog::error!(slog_scope::logger(), "Image not pulled";
+                                                        "service" => service_name,
+                                                        "container" => &container_name,
+                                                        "error" => e.to_string()
+                                                    );
+                                                }
+                                            }
+                                    }
+                                    Some(PullPolicyValue::Never) => {
+                                        slog::error!(slog_scope::logger(), "Image not present please check pulled images on docker host";
+                                            "service" => service_name,
+                                            "container" => &container_name,
+                                            "error" => e.to_string()
+                                        );
+                                    }
+                                    None => {
+                                        slog::error!(slog_scope::logger(), "pull_policy not defined by default Never";
+                                            "service" => service_name,
+                                            "container" => &container_name,
+                                            "error" => e.to_string()
+                                        );
+                                    }
+                                }
+
+                            }
+                        }
+                        _ => {
+                            slog::error!(slog_scope::logger(), "Failed to create container";
+                                "service" => service_name,
+                                "container" => &container_name,
+                                "error" => e.to_string()
+                            );
+                        }
+                    }
                     pod_creation_failed = true;
                     break;
                 }
