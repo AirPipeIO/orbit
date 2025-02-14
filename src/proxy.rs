@@ -41,7 +41,6 @@ impl ServiceDiscovery for Discovery {
 pub struct ProxyApp {
     pub loadbalancer: Arc<LoadBalancer<RoundRobin>>,
     pub service_name: String,
-    // pub listener: Option<ListenerEndpoint>,
 }
 
 #[async_trait]
