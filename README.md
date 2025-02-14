@@ -58,6 +58,7 @@ name: web-service
 instance_count:
   min: 2
   max: 5
+pull_policy: Always
 spec:
   containers:
     - name: web
