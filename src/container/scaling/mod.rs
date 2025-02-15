@@ -27,14 +27,11 @@ use crate::{
 
 pub async fn auto_scale(service_name: String) {
     let log = slog_scope::logger();
-    let instance_store = INSTANCE_STORE.get().unwrap();
     let runtime = RUNTIME.get().unwrap().clone();
 
-    // Channel for config updates
     let (tx, mut rx) = mpsc::channel(100);
     CONFIG_UPDATES.get_or_init(|| tx);
 
-    // Initialize the service config and scaling manager
     let mut scaling_paused = false;
     let service_name = Arc::new(service_name);
 
@@ -59,7 +56,7 @@ pub async fn auto_scale(service_name: String) {
             service_name.to_string(),
             config.clone(),
             codel_metrics,
-            config.scaling_policy.clone(), // Pass the user's scaling policy if provided
+            config.scaling_policy.clone(),
         )
     };
 
@@ -74,28 +71,38 @@ pub async fn auto_scale(service_name: String) {
                 }
             };
 
-            let instances = match instance_store.get(&*service_name) {
-                Some(entry) => entry.value().clone(),
-                None => {
-                    slog::debug!(log, "Service removed, stopping auto_scale";
-                        "service" => service_name.as_str());
-                    break;
+            // Clone instance data to minimize lock duration
+            let instances = {
+                let instance_store = INSTANCE_STORE.get().unwrap();
+                match instance_store.get(&*service_name) {
+                    Some(entry) => entry.value().clone(),
+                    None => {
+                        slog::debug!(log, "Service removed, stopping auto_scale";
+                            "service" => service_name.as_str());
+                        break;
+                    }
                 }
             };
 
-            // Collect stats for scaling decision
+            // Collect stats with timeout protection
             let mut pod_stats = HashMap::new();
             let mut missing_containers = Vec::new();
+
             for (&uuid, metadata) in &instances {
                 let mut container_stats = Vec::new();
                 let mut pod_failed = false;
 
                 for container in &metadata.containers {
-                    match runtime.inspect_container(&container.name).await {
-                        Ok(stats) => {
+                    match tokio::time::timeout(
+                        Duration::from_millis(500),
+                        runtime.inspect_container(&container.name),
+                    )
+                    .await
+                    {
+                        Ok(Ok(stats)) => {
                             container_stats.push((uuid, metadata.clone(), stats));
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             if e.to_string().contains("404")
                                 || e.to_string().contains("No such container")
                             {
@@ -103,6 +110,12 @@ pub async fn auto_scale(service_name: String) {
                                 missing_containers.push((uuid, metadata.clone()));
                                 break;
                             }
+                        }
+                        Err(_) => {
+                            slog::warn!(log, "Container inspection timed out";
+                                "service" => service_name.as_str(),
+                                "container" => &container.name
+                            );
                         }
                     }
                 }
@@ -119,9 +132,14 @@ pub async fn auto_scale(service_name: String) {
                 }
             }
 
-            // Get scaling decision
-            match scaling_manager.evaluate(instances.len(), &pod_stats).await {
-                ScalingDecision::ScaleUp(n) => {
+            // Make scaling decision with timeout protection
+            match tokio::time::timeout(
+                Duration::from_secs(1),
+                scaling_manager.evaluate(instances.len(), &pod_stats),
+            )
+            .await
+            {
+                Ok(ScalingDecision::ScaleUp(n)) => {
                     slog::info!(log, "Scaling up service";
                         "service" => service_name.as_str(),
                         "instances" => n,
@@ -141,9 +159,8 @@ pub async fn auto_scale(service_name: String) {
                     }
 
                     run_proxy_for_service(service_name.to_string(), current_config.clone()).await;
-                    scaling_manager.enter_cooldown();
                 }
-                ScalingDecision::ScaleDown(n) => {
+                Ok(ScalingDecision::ScaleDown(n)) => {
                     let current_count = instances.len();
                     let min_count = current_config.instance_count.min as usize;
 
@@ -158,29 +175,24 @@ pub async fn auto_scale(service_name: String) {
 
                     let scale_down_count = (current_count - min_count).min(n as usize);
 
-                    if scale_down_count == 0 {
-                        continue;
-                    }
+                    if scale_down_count > 0 {
+                        slog::info!(log, "Scaling down service";
+                            "service" => service_name.as_str(),
+                            "scale_down_count" => scale_down_count,
+                            "current_instances" => current_count
+                        );
 
-                    slog::info!(log, "Scaling down service";
-                        "service" => service_name.as_str(),
-                        "scale_down_count" => scale_down_count,
-                        "current_instances" => current_count,
-                        "min_instances" => min_count
-                    );
+                        // Find pods with lowest utilization
+                        let mut pods: Vec<_> = pod_stats.iter().collect();
+                        pods.sort_by(|a, b| {
+                            a.1.cpu_percentage.partial_cmp(&b.1.cpu_percentage).unwrap()
+                        });
 
-                    // Find pods with lowest utilization
-                    let mut pods: Vec<_> = pod_stats.iter().collect();
-                    pods.sort_by(|a, b| {
-                        a.1.cpu_percentage.partial_cmp(&b.1.cpu_percentage).unwrap()
-                    });
-
-                    let mut scaled_down = 0;
-                    for _ in 0..scale_down_count {
-                        if let Some((&uuid, _)) = pods.first() {
+                        let mut scaled_down = 0;
+                        for (uuid, _) in pods.iter().take(scale_down_count) {
                             if let Err(e) = scale_down(
                                 &service_name,
-                                uuid,
+                                **uuid,
                                 current_config.clone(),
                                 runtime.clone(),
                             )
@@ -193,22 +205,25 @@ pub async fn auto_scale(service_name: String) {
                                 break;
                             }
                             scaled_down += 1;
-                            pods.remove(0);
+                        }
+
+                        if scaled_down > 0 {
+                            slog::info!(log, "Scale down completed";
+                                "service" => service_name.as_str(),
+                                "scaled_down" => scaled_down.to_string()
+                            );
+
+                            run_proxy_for_service(service_name.to_string(), current_config.clone())
+                                .await;
                         }
                     }
-
-                    if scaled_down > 0 {
-                        slog::info!(log, "Scale down completed";
-                            "service" => service_name.as_str(),
-                            "scaled_down" => scaled_down.to_string()
-                        );
-
-                        run_proxy_for_service(service_name.to_string(), current_config.clone())
-                            .await;
-                        scaling_manager.enter_cooldown();
-                    }
                 }
-                ScalingDecision::NoChange => {}
+                Ok(ScalingDecision::NoChange) => {}
+                Err(_) => {
+                    slog::warn!(log, "Scaling decision timed out";
+                        "service" => service_name.as_str()
+                    );
+                }
             }
         }
 
@@ -219,10 +234,20 @@ pub async fn auto_scale(service_name: String) {
                     slog::debug!(log, "Scaling is paused, skipping iteration";
                         "service" => service_name.as_str());
                 }
-            },
+            }
             Some((name, message)) = rx.recv() => {
                 if name == *service_name {
                     match message {
+                        ScaleMessage::ConfigUpdate => {
+                            scaling_paused = true;
+                            slog::debug!(log, "Scaling paused for config update";
+                                "service" => service_name.as_str());
+                        }
+                        ScaleMessage::Resume => {
+                            scaling_paused = false;
+                            slog::debug!(log, "Scaling resumed";
+                                "service" => service_name.as_str());
+                        }
                         ScaleMessage::RollingUpdate => {
                             scaling_paused = true;
                             slog::debug!(log, "Scaling paused for rolling update");
@@ -230,16 +255,6 @@ pub async fn auto_scale(service_name: String) {
                         ScaleMessage::RollingUpdateComplete => {
                             scaling_paused = false;
                             slog::debug!(log, "Scaling resumed after rolling update");
-                        }
-                        ScaleMessage::ConfigUpdate => {
-                            scaling_paused = true;
-                            slog::debug!(log, "Scaling paused for config update";
-                                "service" => service_name.as_str());
-                        },
-                        ScaleMessage::Resume => {
-                            scaling_paused = false;
-                            slog::debug!(log, "Scaling resumed";
-                                "service" => service_name.as_str());
                         }
                     }
                 }

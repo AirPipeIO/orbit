@@ -1,9 +1,11 @@
 // src/container/mod.rs
+pub mod health;
 pub mod rolling_update;
 mod runtimes;
 pub mod scaling;
 pub mod volumes;
 
+use health::{HealthCheckConfig, HealthState, CONTAINER_HEALTH};
 pub use rolling_update::*;
 pub use runtimes::*;
 
@@ -55,6 +57,8 @@ pub struct Container {
     pub network_limit: Option<NetworkLimit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_thresholds: Option<ResourceThresholds>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_check: Option<HealthCheckConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -514,6 +518,27 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
                             "ip" => ip,
                             "ports" => ?ports
                         );
+
+                        if let Some(container_config) = config
+                            .spec
+                            .containers
+                            .iter()
+                            .find(|c| container_name.contains(&c.name))
+                        {
+                            if let Err(e) = health::initialize_health_monitoring(
+                                service_name,
+                                container_name,
+                                container_config.health_check.clone(),
+                            )
+                            .await
+                            {
+                                slog::error!(log, "Failed to initialize health monitoring";
+                                    "service" => service_name,
+                                    "container" => container_name,
+                                    "error" => e.to_string()
+                                );
+                            }
+                        }
                     }
 
                     if let Some(mut instances) = instance_store.get_mut(service_name) {
@@ -658,6 +683,19 @@ pub async fn clean_up(service_name: &str) {
                 }
                 // Clean up stats for each container
                 remove_container_stats(service_name, &container.name);
+                if let Some(health_store) = CONTAINER_HEALTH.get() {
+                    if let Some(mut health_status) = health_store.get_mut(&container.name) {
+                        health_status.transition_to(
+                            HealthState::Failed,
+                            Some("Container being removed".to_string()),
+                        );
+                    }
+                    health_store.remove(&container.name);
+                    slog::debug!(log, "Removed health monitoring";
+                        "service" => service_name,
+                        "container" => &container.name
+                    );
+                }
 
                 // Stop each container
                 let runtime = runtime.clone();

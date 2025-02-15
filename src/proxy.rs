@@ -127,7 +127,7 @@ impl ProxyHttp for ProxyApp {
 
                 if metrics.should_reject() {
                     if let Some(status_code) = codel_config.overload_status_code {
-                        slog::info!(slog_scope::logger(), "Rejecting request due to CoDel";
+                        slog::debug!(slog_scope::logger(), "Rejecting request due to CoDel";
                             "service" => service_name,
                             "status_code" => status_code
                         );

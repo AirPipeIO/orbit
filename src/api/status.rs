@@ -7,15 +7,68 @@ use std::{
 
 use crate::{
     config::get_config_by_service,
-    container::{self, InstanceMetadata, INSTANCE_STORE},
+    container::{
+        self,
+        health::{self, ContainerHealthState},
+        InstanceMetadata, INSTANCE_STORE,
+    },
     proxy::SERVER_BACKENDS,
 };
 use anyhow::Result;
 use axum::Json;
 use dashmap::DashMap;
 use serde::Serialize;
-use tokio::time::timeout;
 use uuid::Uuid;
+
+#[derive(Serialize)]
+pub struct ServiceUrl {
+    pub url: String,
+    pub node_port: u16,
+}
+
+#[derive(Serialize)]
+pub struct ContainerUrl {
+    pub url: String,
+    pub port: u16,
+    pub target_url: Option<String>,
+    pub target_port: Option<u16>,
+}
+
+#[derive(Serialize)]
+pub struct ServiceStatus {
+    pub service_name: String,
+    pub service_ports: Vec<u16>,
+    pub service_urls: Vec<ServiceUrl>, // Add this field
+    pub pods: Vec<PodStatus>,
+}
+
+#[derive(Serialize)]
+pub struct PortStatus {
+    pub port: u16,
+    pub target_port: Option<u16>,
+    pub node_port: Option<u16>,
+    pub healthy: bool,
+}
+
+#[derive(Serialize)]
+pub struct PodStatus {
+    uuid: Uuid,
+    containers: Vec<ContainerStatus>,
+}
+
+#[derive(Serialize)]
+pub struct ContainerStatus {
+    pub name: String,
+    pub ip_address: String,
+    pub ports: Vec<PortStatus>,
+    pub status: String,
+    pub cpu_percentage: Option<f64>,
+    pub cpu_percentage_relative: Option<f64>,
+    pub memory_usage: Option<u64>,
+    pub memory_limit: Option<u64>,
+    pub urls: Vec<ContainerUrl>,
+    pub health_status: Option<ContainerHealthState>,
+}
 
 #[derive(Debug, Serialize)]
 pub struct ContainerInfo {
@@ -35,20 +88,31 @@ pub static INSTANCE_STORE_CACHE: OnceLock<Arc<DashMap<String, HashMap<Uuid, Inst
 pub fn update_instance_store_cache() -> Result<()> {
     let instance_store = INSTANCE_STORE
         .get()
-        .expect("Instance store not initialised");
+        .ok_or_else(|| anyhow::anyhow!("Instance store not initialized"))?;
+
+    // Create new data structure without holding locks
+    let new_data: HashMap<String, HashMap<Uuid, InstanceMetadata>> = instance_store
+        .iter()
+        .map(|entry| (entry.key().clone(), entry.value().clone()))
+        .collect();
 
     // Create new DashMap
-    let new_cache = Arc::new(DashMap::new());
+    let new_cache = Arc::new(DashMap::from_iter(new_data.clone()));
 
-    // Fill new cache
-    for entry in instance_store.iter() {
-        new_cache.insert(entry.key().clone(), entry.value().clone());
+    // Attempt to set the new cache
+    match INSTANCE_STORE_CACHE.set(new_cache) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            // If we couldn't set it (already set), update the existing one
+            if let Some(existing_cache) = INSTANCE_STORE_CACHE.get() {
+                existing_cache.clear();
+                for (key, value) in new_data {
+                    existing_cache.insert(key, value);
+                }
+            }
+            Ok(())
+        }
     }
-
-    // Replace old cache with new one atomically
-    INSTANCE_STORE_CACHE.get_or_init(|| new_cache);
-
-    Ok(())
 }
 
 pub fn initialize_background_cache_update() {
@@ -56,69 +120,35 @@ pub fn initialize_background_cache_update() {
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(15));
+        let mut consecutive_failures = 0;
+
         loop {
             interval.tick().await;
-            if let Err(e) = update_cache_with_timeout().await {
-                slog::warn!(log, "Cache update failed"; "error" => e.to_string());
+
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(update_instance_store_cache),
+            )
+            .await
+            {
+                Ok(Ok(Ok(_))) => {
+                    consecutive_failures = 0;
+                }
+                error => {
+                    consecutive_failures += 1;
+                    slog::error!(log, "Cache update failed";
+                        "error" => format!("{:?}", error),
+                        "consecutive_failures" => consecutive_failures.to_string()
+                    );
+
+                    // If we've failed multiple times, increase the interval temporarily
+                    if consecutive_failures > 3 {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
             }
         }
     });
-}
-
-// Replace the existing update_instance_store_cache with this version
-async fn update_cache_with_timeout() -> Result<()> {
-    // Add timeout to prevent blocking
-    timeout(Duration::from_secs(5), async {
-        let instance_store = INSTANCE_STORE
-            .get()
-            .expect("Instance store not initialised");
-        let instance_cache = INSTANCE_STORE_CACHE.get_or_init(|| Arc::new(DashMap::new()));
-
-        // Clear existing instance cache
-        instance_cache.clear();
-
-        // Update instance cache in batches
-        for entry in instance_store.iter() {
-            instance_cache.insert(entry.key().clone(), entry.value().clone());
-            tokio::task::yield_now().await; // Allow other tasks to run
-        }
-    })
-    .await?;
-
-    Ok(())
-}
-
-#[derive(Serialize)]
-pub struct ServiceStatus {
-    service_name: String,
-    service_ports: Vec<u16>,
-    pods: Vec<PodStatus>,
-}
-
-#[derive(Serialize)]
-pub struct PortStatus {
-    pub port: u16,
-    pub target_port: Option<u16>,
-    pub node_port: Option<u16>,
-    pub healthy: bool,
-}
-
-#[derive(Serialize)]
-pub struct PodStatus {
-    uuid: Uuid,
-    containers: Vec<ContainerStatus>,
-}
-
-#[derive(Serialize)]
-pub struct ContainerStatus {
-    name: String,
-    ip_address: String,
-    ports: Vec<PortStatus>,
-    status: String,
-    cpu_percentage: Option<f64>,
-    cpu_percentage_relative: Option<f64>,
-    memory_usage: Option<u64>,
-    memory_limit: Option<u64>,
 }
 
 pub async fn get_status() -> Json<Vec<ServiceStatus>> {
@@ -143,14 +173,25 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
         if let Some(config) = service_config {
             let service_stat = service_stats.get(service_name);
 
-            // Collect all service ports
-            let service_ports = config
-                .spec
-                .containers
-                .iter()
-                .flat_map(|c| c.ports.iter().flatten())
-                .map(|p| p.port)
-                .collect::<Vec<_>>();
+            // Collect all service ports and URLs
+            let mut service_ports = Vec::new();
+            let mut service_urls = Vec::new();
+
+            for container in &config.spec.containers {
+                if let Some(ports) = &container.ports {
+                    for port_config in ports {
+                        service_ports.push(port_config.port);
+
+                        // Add service URLs for node ports
+                        if let Some(node_port) = port_config.node_port {
+                            service_urls.push(ServiceUrl {
+                                url: format!("http://localhost:{}", node_port),
+                                node_port,
+                            });
+                        }
+                    }
+                }
+            }
 
             let pods: Vec<PodStatus> = instances
                 .iter()
@@ -162,6 +203,30 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
                             let container_stats = service_stat
                                 .as_ref()
                                 .and_then(|s| s.get_container_stats(&container.name));
+
+                            let mut urls = Vec::new();
+                            for port_info in &container.ports {
+                                let mut container_url = ContainerUrl {
+                                    url: format!(
+                                        "http://{}:{}",
+                                        container.ip_address, port_info.port
+                                    ),
+                                    port: port_info.port,
+                                    target_url: None,
+                                    target_port: None,
+                                };
+
+                                // Add target URL if target_port is defined
+                                if let Some(target_port) = port_info.target_port {
+                                    container_url.target_url = Some(format!(
+                                        "http://{}:{}",
+                                        container.ip_address, target_port
+                                    ));
+                                    container_url.target_port = Some(target_port);
+                                }
+
+                                urls.push(container_url);
+                            }
 
                             let ports = container
                                 .ports
@@ -198,6 +263,8 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
                                 })
                                 .collect();
                             ContainerStatus {
+                                urls,
+                                health_status: health::get_container_health(&container.name),
                                 name: container.name.clone(),
                                 ip_address: container.ip_address.clone(),
                                 ports,
@@ -261,6 +328,7 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
             services.push(ServiceStatus {
                 service_name: service_name.clone(),
                 service_ports,
+                service_urls,
                 pods,
             });
         }

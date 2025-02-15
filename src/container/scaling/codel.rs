@@ -115,7 +115,7 @@ impl CoDelMetrics {
 
     pub fn should_reject(&self) -> bool {
         if self.sojourn_times.len() < 10 {
-            slog::debug!(slog_scope::logger(), "Not enough samples for rejection decision";
+            slog::trace!(slog_scope::logger(), "Not enough samples for rejection decision";
                 "service" => &self.service_name,
                 "samples" => self.sojourn_times.len()
             );
@@ -132,7 +132,7 @@ impl CoDelMetrics {
             .collect();
 
         if recent_samples.is_empty() {
-            slog::debug!(slog_scope::logger(), "No recent samples for rejection decision";
+            slog::trace!(slog_scope::logger(), "No recent samples for rejection decision";
                 "service" => &self.service_name
             );
             return false;
@@ -141,7 +141,7 @@ impl CoDelMetrics {
         let min_sojourn = *recent_samples.iter().min().unwrap();
         let should_reject = min_sojourn > self.config.target;
 
-        slog::debug!(slog_scope::logger(), "Rejection decision";
+        slog::trace!(slog_scope::logger(), "Rejection decision";
             "service" => &self.service_name,
             "min_sojourn_ms" => min_sojourn.as_millis(),
             "target_ms" => self.config.target.as_millis(),

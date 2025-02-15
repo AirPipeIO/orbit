@@ -3,6 +3,7 @@ pub mod utils;
 pub mod validate;
 pub use utils::*;
 
+use crate::container::health::{HealthState, CONTAINER_HEALTH};
 use crate::container::scaling::manager::ScalingPolicy;
 use crate::container::volumes::VolumeData;
 use crate::container::{rolling_update, Container, IMAGE_CHECK_TASKS};
@@ -788,6 +789,19 @@ pub async fn stop_service(service_name: &str) {
 
             // Remove container stats
             remove_container_stats(service_name, &container_name);
+            if let Some(health_store) = CONTAINER_HEALTH.get() {
+                if let Some(mut health_status) = health_store.get_mut(&container_name) {
+                    health_status.transition_to(
+                        HealthState::Failed,
+                        Some("Container being removed".to_string()),
+                    );
+                }
+                health_store.remove(&container_name);
+                slog::debug!(log, "Removed health monitoring";
+                    "service" => service_name,
+                    "container" => &container_name
+                );
+            }
 
             // Stop the container
             if let Err(e) = runtime.stop_container(&container_name).await {
