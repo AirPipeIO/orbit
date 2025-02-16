@@ -75,7 +75,7 @@ impl CoDelMetrics {
         let sojourn_ms = sojourn_time.as_millis() as u64;
         let last_ms = LAST_LOGGED_MS.load(std::sync::atomic::Ordering::Relaxed);
         if (sojourn_ms as i64 - last_ms as i64).abs() > 1000 {
-            slog::info!(slog_scope::logger(), "Significant latency change";
+            slog::trace!(slog_scope::logger(), "Significant latency change";
                 "service" => &self.service_name,
                 "sojourn_ms" => sojourn_ms,
                 "target_ms" => self.config.target.as_millis(),

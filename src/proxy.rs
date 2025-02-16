@@ -1,5 +1,4 @@
 // src/proxy.rs
-use crate::api::status::update_instance_store_cache;
 use crate::config::{get_config_by_service, ServiceConfig};
 use crate::container::scaling::codel::get_service_metrics;
 use crate::container::scaling::scale_up;
@@ -179,6 +178,7 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
     let log: slog::Logger = slog_scope::logger();
     let server_tasks = SERVER_TASKS.get_or_init(DashMap::new);
     let server_backends = SERVER_BACKENDS.get_or_init(DashMap::new);
+    let instance_store = INSTANCE_STORE.get().unwrap();
 
     // Track only node_ports that need external access
     let mut service_ports = HashSet::new();
@@ -198,8 +198,10 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
         let addr = format!("0.0.0.0:{}", node_port);
 
         if let Some(backends) = server_backends.get(&proxy_key) {
-            if let Some(instances) = INSTANCE_STORE.get().unwrap().get(&service_name) {
-                for (_, metadata) in instances.value().iter() {
+            // Get read lock to access instance data
+            let store = instance_store.read().await;
+            if let Some(instances) = store.get(&service_name) {
+                for (_, metadata) in instances {
                     for container in &metadata.containers {
                         for port_info in &container.ports {
                             if let Some(container_node_port) = port_info.node_port {
@@ -223,6 +225,7 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
                     }
                 }
             }
+            // Read lock is dropped here
             continue;
         }
 
@@ -230,16 +233,20 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
         let backends = Arc::new(DashSet::new());
         server_backends.insert(proxy_key.clone(), backends.clone());
 
-        // Add initial backends
-        if let Some(instances) = INSTANCE_STORE.get().unwrap().get(&service_name) {
-            for (_, metadata) in instances.value().iter() {
-                for container in &metadata.containers {
-                    for port_info in &container.ports {
-                        if let Some(container_node_port) = port_info.node_port {
-                            if container_node_port == node_port {
-                                let addr = format!("{}:{}", container.ip_address, port_info.port);
-                                if let Ok(backend) = Backend::new(&addr) {
-                                    backends.insert(backend);
+        // Add initial backends with read lock
+        {
+            let store = instance_store.read().await;
+            if let Some(instances) = store.get(&service_name) {
+                for (_, metadata) in instances {
+                    for container in &metadata.containers {
+                        for port_info in &container.ports {
+                            if let Some(container_node_port) = port_info.node_port {
+                                if container_node_port == node_port {
+                                    let addr =
+                                        format!("{}:{}", container.ip_address, port_info.port);
+                                    if let Ok(backend) = Backend::new(&addr) {
+                                        backends.insert(backend);
+                                    }
                                 }
                             }
                         }
@@ -277,6 +284,4 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
 
         server_tasks.insert(proxy_key.clone(), handle);
     }
-
-    let _ = update_instance_store_cache();
 }

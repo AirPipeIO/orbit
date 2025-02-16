@@ -5,6 +5,7 @@ use anyhow::Result;
 use codel::get_service_metrics;
 use manager::{ScalingDecision, UnifiedScalingManager};
 use pingora_load_balancing::Backend;
+use rustc_hash::FxHashMap;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -19,11 +20,14 @@ use crate::{
         ScaleMessage, ServiceConfig, CONFIG_UPDATES,
     },
     container::{
-        get_next_pod_number, ContainerMetadata, ContainerRuntime, InstanceMetadata, INSTANCE_STORE,
-        RUNTIME,
+        get_next_pod_number,
+        health::{self},
+        ContainerMetadata, ContainerRuntime, InstanceMetadata, INSTANCE_STORE, RUNTIME,
     },
     proxy::{run_proxy_for_service, SERVER_BACKENDS},
 };
+
+use super::health::CONTAINER_HEALTH;
 
 pub async fn auto_scale(service_name: String) {
     let log = slog_scope::logger();
@@ -71,11 +75,12 @@ pub async fn auto_scale(service_name: String) {
                 }
             };
 
-            // Clone instance data to minimize lock duration
+            // Get instance data with read lock
             let instances = {
                 let instance_store = INSTANCE_STORE.get().unwrap();
-                match instance_store.get(&*service_name) {
-                    Some(entry) => entry.value().clone(),
+                let store = instance_store.read().await;
+                match store.get(&*service_name) {
+                    Some(instances) => instances.clone(),
                     None => {
                         slog::debug!(log, "Service removed, stopping auto_scale";
                             "service" => service_name.as_str());
@@ -272,9 +277,13 @@ pub async fn scale_up(
     let instance_store = INSTANCE_STORE.get().unwrap();
     let server_backends = SERVER_BACKENDS.get().unwrap();
 
-    let current_instances = match instance_store.get(service_name) {
-        Some(entry) => entry.value().len(),
-        None => 0,
+    // Check current instance count with read lock
+    let current_instances = {
+        let store = instance_store.read().await;
+        store
+            .get(service_name)
+            .map(|instances| instances.len())
+            .unwrap_or(0)
     };
 
     if current_instances >= config.instance_count.max as usize {
@@ -287,26 +296,61 @@ pub async fn scale_up(
         .start_containers(service_name, pod_number, &config.spec.containers, &config)
         .await?;
 
+    // Initialize health monitoring for new containers
+    for (container_name, _, _) in &started_containers {
+        if let Ok(parts) = parse_container_name(container_name) {
+            if let Some(container_config) = config
+                .spec
+                .containers
+                .iter()
+                .find(|c| c.name == parts.container_name)
+            {
+                slog::debug!(log, "Initializing health monitoring for scaled container";
+                    "service" => service_name,
+                    "container" => container_name,
+                    "config_name" => &container_config.name
+                );
+                if let Err(e) = health::initialize_health_monitoring(
+                    service_name,
+                    container_name,
+                    container_config.health_check.clone(),
+                )
+                .await
+                {
+                    slog::error!(log, "Failed to initialize health monitoring";
+                        "service" => service_name,
+                        "container" => container_name,
+                        "error" => e.to_string()
+                    );
+                }
+            }
+        }
+    }
+
     let container_parts = parse_container_name(&started_containers[0].0)?;
     let uuid = container_parts.uuid;
     let network_name = format!("{}__{}", service_name, uuid);
 
-    if let Some(mut instances) = instance_store.get_mut(service_name) {
-        let now = SystemTime::now();
-        let mut image_hashes = HashMap::new();
-
-        // Get image hashes for containers being started
-        for container in &config.spec.containers {
-            if let Ok(hash) = runtime.get_image_digest(&container.image).await {
-                image_hashes.insert(container.name.clone(), hash);
-            }
+    // Get image hashes
+    let mut image_hashes = HashMap::new();
+    for container in &config.spec.containers {
+        if let Ok(hash) = runtime.get_image_digest(&container.image).await {
+            image_hashes.insert(container.name.clone(), hash);
         }
+    }
 
-        instances.insert(
+    // Update instance store with write lock
+    {
+        let mut store = instance_store.write().await;
+        let service_instances = store
+            .entry(service_name.to_string())
+            .or_insert_with(FxHashMap::default);
+
+        service_instances.insert(
             uuid,
             InstanceMetadata {
                 uuid,
-                created_at: now,
+                created_at: SystemTime::now(),
                 network: network_name.clone(),
                 image_hash: image_hashes,
                 containers: started_containers
@@ -358,21 +402,43 @@ pub async fn scale_down(
     let instance_store = INSTANCE_STORE.get().unwrap();
     let server_backends = SERVER_BACKENDS.get().unwrap();
 
-    let instance_data = match instance_store.get(service_name) {
-        Some(entry) => entry.value().clone(),
-        None => return Ok(()),
+    // Check current instances and get target metadata with read lock
+    let (current_count, target_metadata) = {
+        let store = instance_store.read().await;
+        match store.get(service_name) {
+            Some(instances) => {
+                let count = instances.len();
+                let metadata = instances.get(&target_uuid).cloned();
+                (count, metadata)
+            }
+            None => return Ok(()),
+        }
     };
 
-    if instance_data.len() <= config.instance_count.min as usize {
+    if current_count <= config.instance_count.min as usize {
         return Ok(());
     }
 
-    let target_metadata = match instance_data.get(&target_uuid) {
-        Some(metadata) => metadata.clone(),
+    let target_metadata = match target_metadata {
+        Some(metadata) => metadata,
         None => return Ok(()),
     };
 
-    // Remove containers from load balancer
+    // Remove health monitoring
+    if let Some(health_store) = CONTAINER_HEALTH.get() {
+        let mut health_map = health_store.write().await;
+        // Clone the containers vector to avoid ownership issues
+        let containers = target_metadata.containers.clone();
+        for container in containers {
+            health_map.remove(&container.name);
+            slog::debug!(log, "Removed health monitoring";
+                "service" => service_name,
+                "container" => &container.name
+            );
+        }
+    }
+
+    // Remove from load balancer
     for container in &target_metadata.containers {
         for port_info in &container.ports {
             if let Some(node_port) = port_info.node_port {
@@ -397,9 +463,12 @@ pub async fn scale_down(
     // Wait for in-flight requests
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    // Remove from instance store
-    if let Some(mut instances) = instance_store.get_mut(service_name) {
-        instances.remove(&target_uuid);
+    // Remove from instance store with write lock
+    {
+        let mut store = instance_store.write().await;
+        if let Some(instances) = store.get_mut(service_name) {
+            instances.remove(&target_uuid);
+        }
     }
 
     // Stop containers
@@ -416,7 +485,6 @@ pub async fn scale_down(
 
     // Only try to remove network if it's not a defined network from config
     if config.network.is_none() {
-        // Only then try to remove the auto-generated network
         if let Err(e) = runtime
             .remove_pod_network(&target_metadata.network, service_name)
             .await
@@ -430,62 +498,4 @@ pub async fn scale_down(
     }
 
     Ok(())
-}
-
-// Health check function
-async fn wait_for_container_health(
-    container_name: &str,
-    runtime: Arc<dyn ContainerRuntime>,
-) -> bool {
-    let log = slog_scope::logger();
-
-    // Try up to 30 times with 1 second delay (30 seconds total)
-    for attempt in 1..=30 {
-        match runtime.inspect_container(container_name).await {
-            Ok(stats) => {
-                slog::debug!(log, "Container health check";
-                    "container" => container_name,
-                    "attempt" => attempt.to_string(),
-                    "cpu" => stats.cpu_percentage,
-                    "memory" => stats.memory_usage
-                );
-
-                // Container is considered healthy if we can get stats
-                return true;
-            }
-            Err(e) => {
-                slog::debug!(log, "Container health check failed";
-                    "container" => container_name,
-                    "attempt" => attempt.to_string(),
-                    "error" => e.to_string()
-                );
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
-
-    false
-}
-
-async fn check_application_readiness(addr: &str, port: u16, timeout: Duration) -> bool {
-    use tokio::net::TcpStream;
-
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        match tokio::time::timeout(
-            Duration::from_secs(1),
-            TcpStream::connect(format!("{}:{}", addr, port)),
-        )
-        .await
-        {
-            Ok(Ok(_)) => return true, // Successfully connected
-            _ => {
-                // Only sleep if we still have time remaining
-                if start.elapsed() < timeout {
-                    tokio::time::sleep(Duration::from_millis(1000)).await;
-                }
-            }
-        }
-    }
-    false
 }

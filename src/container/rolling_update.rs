@@ -100,15 +100,16 @@ async fn perform_rolling_update(
         .get()
         .expect("Server backends not initialized");
 
-    let pods: Vec<_> = {
-        let instances = instance_store
-            .get(service_name)
-            .ok_or_else(|| anyhow!("Service not found"))?;
-        instances
-            .value()
-            .iter()
-            .map(|(uuid, metadata)| (*uuid, metadata.clone()))
-            .collect()
+    // Get pods with read lock
+    let pods = {
+        let store = instance_store.read().await;
+        match store.get(service_name) {
+            Some(instances) => instances
+                .iter()
+                .map(|(uuid, metadata)| (*uuid, metadata.clone()))
+                .collect::<Vec<_>>(),
+            None => return Err(anyhow!("Service not found")),
+        }
     };
 
     let total_pods = pods.len();
@@ -124,7 +125,7 @@ async fn perform_rolling_update(
     let mut new_pod_futures = Vec::new();
     let mut pod_numbers = Vec::new();
     for _ in 0..new_pod_count {
-        pod_numbers.push(get_next_pod_number(&service_name).await);
+        pod_numbers.push(get_next_pod_number(service_name).await);
     }
 
     for pod_number in pod_numbers {
@@ -139,7 +140,7 @@ async fn perform_rolling_update(
         }));
     }
 
-    // Collect results and update instance store sequentially
+    // Collect results and update instance store
     let mut new_pods = Vec::new();
     for future in new_pod_futures {
         match future.await? {
@@ -148,26 +149,30 @@ async fn perform_rolling_update(
                     let new_uuid = parse_container_name(&new_containers[0].0)?.uuid;
                     let network_name = format!("{}__{}", service_name, new_uuid);
 
-                    if let Some(mut instances) = instance_store.get_mut(service_name) {
-                        instances.insert(
-                            new_uuid,
-                            InstanceMetadata {
-                                uuid: new_uuid,
-                                created_at: SystemTime::now(),
-                                network: network_name.clone(),
-                                image_hash: new_image_hashes.clone(),
-                                containers: new_containers
-                                    .iter()
-                                    .map(|(name, ip, ports)| ContainerMetadata {
-                                        name: name.clone(),
-                                        network: network_name.clone(),
-                                        ip_address: ip.clone(),
-                                        ports: ports.clone(),
-                                        status: "running".to_string(),
-                                    })
-                                    .collect(),
-                            },
-                        );
+                    // Update instance store with write lock
+                    {
+                        let mut store = instance_store.write().await;
+                        if let Some(instances) = store.get_mut(service_name) {
+                            instances.insert(
+                                new_uuid,
+                                InstanceMetadata {
+                                    uuid: new_uuid,
+                                    created_at: SystemTime::now(),
+                                    network: network_name.clone(),
+                                    image_hash: new_image_hashes.clone(),
+                                    containers: new_containers
+                                        .iter()
+                                        .map(|(name, ip, ports)| ContainerMetadata {
+                                            name: name.clone(),
+                                            network: network_name.clone(),
+                                            ip_address: ip.clone(),
+                                            ports: ports.clone(),
+                                            status: "running".to_string(),
+                                        })
+                                        .collect(),
+                                },
+                            );
+                        }
                     }
                     new_pods.push((new_uuid, new_containers));
                 }
@@ -230,9 +235,12 @@ async fn perform_rolling_update(
 
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        // Remove from instance store
-        if let Some(mut instances) = instance_store.get_mut(service_name) {
-            instances.remove(&old_uuid);
+        // Remove from instance store with write lock
+        {
+            let mut store = instance_store.write().await;
+            if let Some(instances) = store.get_mut(service_name) {
+                instances.remove(&old_uuid);
+            }
         }
 
         // Clean up containers and network

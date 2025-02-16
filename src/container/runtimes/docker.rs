@@ -302,7 +302,7 @@ impl ContainerRuntime for DockerRuntime {
 
     async fn check_image_updates(
         &self,
-        service_name: &str,
+        _service_name: &str,
         containers: &[Container],
         current_hashes: &HashMap<String, String>,
     ) -> Result<HashMap<String, bool>> {

@@ -16,16 +16,17 @@ use async_trait::async_trait;
 use bollard::container::Stats;
 use dashmap::DashMap;
 use pingora_load_balancing::Backend;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use volumes::{detach_volume, VolumeMount};
 
-use crate::api::status::update_instance_store_cache;
 use crate::config::{
     get_config_by_service, parse_container_name, ResourceThresholds, ServiceConfig,
 };
@@ -253,8 +254,9 @@ pub fn initialize_stats() {
 
 pub static RUNTIME: OnceLock<Arc<dyn ContainerRuntime>> = OnceLock::new();
 
-pub static INSTANCE_STORE: OnceLock<DashMap<String, HashMap<Uuid, InstanceMetadata>>> =
-    OnceLock::new();
+pub static INSTANCE_STORE: OnceLock<
+    Arc<RwLock<FxHashMap<String, FxHashMap<Uuid, InstanceMetadata>>>>,
+> = OnceLock::new();
 
 // Global registry for scaling tasks
 pub static SCALING_TASKS: OnceLock<DashMap<String, JoinHandle<()>>> = OnceLock::new();
@@ -470,15 +472,19 @@ pub async fn get_next_pod_number(service_name: &str) -> u8 {
         Err(_) => 0,
     }
 }
+
 pub async fn manage(service_name: &str, config: ServiceConfig) {
     let log = slog_scope::logger();
     let instance_store = INSTANCE_STORE.get().unwrap();
     let runtime = RUNTIME.get().expect("Runtime not initialised").clone();
 
-    let current_instances = instance_store
-        .get(service_name)
-        .map(|entry| entry.value().len())
-        .unwrap_or(0);
+    let current_instances = {
+        let store = instance_store.read().await;
+        store
+            .get(service_name)
+            .map(|instances| instances.len())
+            .unwrap_or(0)
+    };
 
     let target_instances = config.instance_count.min as usize;
     let now = SystemTime::now();
@@ -495,12 +501,6 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
             let uuid = uuid::Uuid::new_v4();
             let network_name = format!("{}__{}", service_name, uuid);
 
-            slog::debug!(log, "Starting new pod instance";
-                "service" => service_name,
-                "pod_number" => pod_number,
-                "uuid" => uuid.to_string()
-            );
-
             match runtime
                 .start_containers(
                     service_name,
@@ -511,95 +511,65 @@ pub async fn manage(service_name: &str, config: ServiceConfig) {
                 .await
             {
                 Ok(started_containers) => {
-                    for (container_name, ip, ports) in &started_containers {
-                        slog::debug!(log, "Container started successfully";
-                            "service" => service_name,
-                            "container" => container_name,
-                            "ip" => ip,
-                            "ports" => ?ports
-                        );
-
-                        if let Some(container_config) = config
-                            .spec
-                            .containers
-                            .iter()
-                            .find(|c| container_name.contains(&c.name))
-                        {
-                            if let Err(e) = health::initialize_health_monitoring(
-                                service_name,
-                                container_name,
-                                container_config.health_check.clone(),
-                            )
-                            .await
+                    // Initialize health monitoring
+                    for (container_name, _, _) in &started_containers {
+                        if let Ok(parts) = parse_container_name(container_name) {
+                            if let Some(container_config) = config
+                                .spec
+                                .containers
+                                .iter()
+                                .find(|c| c.name == parts.container_name)
                             {
-                                slog::error!(log, "Failed to initialize health monitoring";
-                                    "service" => service_name,
-                                    "container" => container_name,
-                                    "error" => e.to_string()
-                                );
+                                if let Err(e) = health::initialize_health_monitoring(
+                                    service_name,
+                                    container_name,
+                                    container_config.health_check.clone(),
+                                )
+                                .await
+                                {
+                                    slog::error!(log, "Failed to initialize health monitoring";
+                                        "service" => service_name,
+                                        "container" => container_name,
+                                        "error" => e.to_string()
+                                    );
+                                }
                             }
                         }
                     }
 
-                    if let Some(mut instances) = instance_store.get_mut(service_name) {
-                        // Get image hashes for started containers
-                        let mut image_hashes = HashMap::new();
-                        for container in &config.spec.containers {
-                            if let Ok(hash) = runtime.get_image_digest(&container.image).await {
-                                image_hashes.insert(container.name.clone(), hash);
-                            }
+                    // Get image hashes
+                    let mut image_hashes = HashMap::new();
+                    for container in &config.spec.containers {
+                        if let Ok(hash) = runtime.get_image_digest(&container.image).await {
+                            image_hashes.insert(container.name.clone(), hash);
                         }
-
-                        instances.insert(
-                            uuid,
-                            InstanceMetadata {
-                                uuid,
-                                created_at: now,
-                                network: network_name.clone(),
-                                image_hash: image_hashes.clone(),
-                                containers: started_containers
-                                    .into_iter()
-                                    .map(|(name, ip, ports)| ContainerMetadata {
-                                        name,
-                                        network: network_name.clone(),
-                                        ip_address: ip,
-                                        ports,
-                                        status: "running".to_string(),
-                                    })
-                                    .collect(),
-                            },
-                        );
-                    } else {
-                        let mut map = HashMap::new();
-                        // Get image hashes for started containers
-                        let mut image_hashes = HashMap::new();
-                        for container in &config.spec.containers {
-                            if let Ok(hash) = runtime.get_image_digest(&container.image).await {
-                                image_hashes.insert(container.name.clone(), hash);
-                            }
-                        }
-
-                        map.insert(
-                            uuid,
-                            InstanceMetadata {
-                                uuid,
-                                created_at: now,
-                                network: network_name.clone(),
-                                image_hash: image_hashes,
-                                containers: started_containers
-                                    .into_iter()
-                                    .map(|(name, ip, ports)| ContainerMetadata {
-                                        name,
-                                        network: network_name.clone(),
-                                        ip_address: ip,
-                                        ports,
-                                        status: "running".to_string(),
-                                    })
-                                    .collect(),
-                            },
-                        );
-                        instance_store.insert(service_name.to_string(), map);
                     }
+
+                    // Update instance store
+                    let mut store = instance_store.write().await;
+                    let service_instances = store
+                        .entry(service_name.to_string())
+                        .or_insert_with(FxHashMap::default);
+
+                    service_instances.insert(
+                        uuid,
+                        InstanceMetadata {
+                            uuid,
+                            created_at: now,
+                            network: network_name.clone(),
+                            image_hash: image_hashes,
+                            containers: started_containers
+                                .into_iter()
+                                .map(|(name, ip, ports)| ContainerMetadata {
+                                    name,
+                                    network: network_name.clone(),
+                                    ip_address: ip,
+                                    ports,
+                                    status: "running".to_string(),
+                                })
+                                .collect(),
+                        },
+                    );
 
                     tokio::task::yield_now().await;
                 }
@@ -628,10 +598,18 @@ pub async fn clean_up(service_name: &str) {
         slog::trace!(log, "Scaling task aborted"; "service" => service_name);
     }
 
-    if let Some((_, instances)) = instance_store.remove(service_name) {
+    // Get write lock and remove service data
+    let mut store = instance_store.write().await;
+    if let Some(instances) = store.remove(service_name) {
+        // Drop the write lock early since we have the data we need
+        drop(store);
+
         for (_uuid, metadata) in instances {
+            // Clone containers to avoid ownership issues
+            let containers = metadata.containers.clone();
+
             // For each container in the pod
-            for container in metadata.containers {
+            for container in containers {
                 // Detach volumes if any
                 if let Some(config) = get_config_by_service(service_name) {
                     if let (Some(container_config), Some(volumes)) = (
@@ -681,16 +659,20 @@ pub async fn clean_up(service_name: &str) {
                         }
                     }
                 }
+
                 // Clean up stats for each container
                 remove_container_stats(service_name, &container.name);
+
+                // Clean up health monitoring
                 if let Some(health_store) = CONTAINER_HEALTH.get() {
-                    if let Some(mut health_status) = health_store.get_mut(&container.name) {
-                        health_status.transition_to(
+                    let mut health_map = health_store.write().await;
+                    if let Some(status) = health_map.get_mut(&container.name) {
+                        status.transition_to(
                             HealthState::Failed,
                             Some("Container being removed".to_string()),
                         );
                     }
-                    health_store.remove(&container.name);
+                    health_map.remove(&container.name);
                     slog::debug!(log, "Removed health monitoring";
                         "service" => service_name,
                         "container" => &container.name
@@ -698,7 +680,6 @@ pub async fn clean_up(service_name: &str) {
                 }
 
                 // Stop each container
-                let runtime = runtime.clone();
                 if let Err(e) = runtime.stop_container(&container.name).await {
                     slog::error!(log, "Failed to stop container";
                         "service" => service_name,
@@ -707,6 +688,18 @@ pub async fn clean_up(service_name: &str) {
                     );
                 }
             }
+
+            // Clean up network if needed
+            if let Err(e) = runtime
+                .remove_pod_network(&metadata.network, service_name)
+                .await
+            {
+                slog::error!(log, "Failed to remove network";
+                    "service" => service_name,
+                    "network" => &metadata.network,
+                    "error" => e.to_string()
+                );
+            }
         }
 
         // Clean up entire service stats after all containers are stopped
@@ -714,6 +707,4 @@ pub async fn clean_up(service_name: &str) {
             service_stats.remove(service_name);
         }
     }
-
-    let _ = update_instance_store_cache();
 }

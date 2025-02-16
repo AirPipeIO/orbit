@@ -1,6 +1,7 @@
 // src/config/mod.rs
 pub mod utils;
 pub mod validate;
+use rustc_hash::FxHashMap;
 pub use utils::*;
 
 use crate::container::health::{HealthState, CONTAINER_HEALTH};
@@ -29,7 +30,6 @@ use validate::{
 use validator::Validate;
 
 use crate::{
-    api::status::update_instance_store_cache,
     container::{
         self, clean_up, manage, remove_container_stats, scaling::auto_scale, ContainerInfo,
         ContainerMetadata, ContainerPortMetadata, ContainerStats, InstanceMetadata, INSTANCE_STORE,
@@ -556,7 +556,10 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
     }
 
     let orphan_count = orphaned_containers.len();
-    slog::info!(log, "Found orphaned containers"; "service" => service_name, "count" => orphan_count);
+    slog::info!(log, "Found orphaned containers";
+        "service" => service_name,
+        "count" => orphan_count
+    );
 
     if config.adopt_orphans {
         let mut pod_containers: HashMap<Uuid, Vec<ContainerInfo>> = HashMap::new();
@@ -608,58 +611,19 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
             pod_containers.remove(&uuid);
         }
 
-        let mut instances = instance_store.entry(service_name.to_string()).or_default();
-        let mut adopted_count = 0;
+        // Update instance store with write lock
+        {
+            let mut store = instance_store.write().await;
+            let instances = store
+                .entry(service_name.to_string())
+                .or_insert_with(FxHashMap::default);
 
-        for (uuid, containers) in &pod_containers {
-            let network_name = format!("{}__{}", service_name, uuid);
-            let mut pod_metadata = Vec::new();
+            let mut adopted_count = 0;
 
-            for container in containers {
-                if let Ok(parts) = parse_container_name(&container.name) {
-                    if let Some(container_config) = config
-                        .spec
-                        .containers
-                        .iter()
-                        .find(|c| c.name == parts.container_name)
-                    {
-                        if let Some(port_configs) = &container_config.ports {
-                            if let Ok(container_data) =
-                                runtime.inspect_container(&container.name).await
-                            {
-                                let port_metadata: Vec<ContainerPortMetadata> = port_configs
-                                    .iter()
-                                    .map(|p| ContainerPortMetadata {
-                                        port: p.port,
-                                        target_port: p.target_port,
-                                        node_port: p.node_port,
-                                    })
-                                    .collect();
+            for (uuid, containers) in &pod_containers {
+                let network_name = format!("{}__{}", service_name, uuid);
+                let mut pod_metadata = Vec::new();
 
-                                pod_metadata.push(ContainerMetadata {
-                                    name: container.name.clone(),
-                                    network: network_name.clone(),
-                                    ip_address: container_data.ip_address,
-                                    ports: port_metadata,
-                                    status: "adopted".to_string(),
-                                });
-                                adopted_count += 1;
-                            } else {
-                                slog::error!(log, "Failed to inspect container";
-                                    "service" => service_name,
-                                    "container" => &container.name,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            if !pod_metadata.is_empty() {
-                let now = SystemTime::now();
-                let mut image_hashes = HashMap::new();
-
-                // Try to get image hashes for existing containers
                 for container in containers {
                     if let Ok(parts) = parse_container_name(&container.name) {
                         if let Some(container_config) = config
@@ -668,33 +632,79 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
                             .iter()
                             .find(|c| c.name == parts.container_name)
                         {
-                            if let Ok(hash) =
-                                runtime.get_image_digest(&container_config.image).await
-                            {
-                                image_hashes.insert(container_config.name.clone(), hash);
+                            if let Some(port_configs) = &container_config.ports {
+                                if let Ok(container_data) =
+                                    runtime.inspect_container(&container.name).await
+                                {
+                                    let port_metadata: Vec<ContainerPortMetadata> = port_configs
+                                        .iter()
+                                        .map(|p| ContainerPortMetadata {
+                                            port: p.port,
+                                            target_port: p.target_port,
+                                            node_port: p.node_port,
+                                        })
+                                        .collect();
+
+                                    pod_metadata.push(ContainerMetadata {
+                                        name: container.name.clone(),
+                                        network: network_name.clone(),
+                                        ip_address: container_data.ip_address,
+                                        ports: port_metadata,
+                                        status: "adopted".to_string(),
+                                    });
+                                    adopted_count += 1;
+                                } else {
+                                    slog::error!(log, "Failed to inspect container";
+                                        "service" => service_name,
+                                        "container" => &container.name,
+                                    );
+                                }
                             }
                         }
                     }
                 }
 
-                instances.insert(
-                    *uuid,
-                    InstanceMetadata {
-                        uuid: *uuid,
-                        created_at: now,
-                        network: network_name,
-                        image_hash: image_hashes,
-                        containers: pod_metadata,
-                    },
-                );
-            }
-        }
+                if !pod_metadata.is_empty() {
+                    let now = SystemTime::now();
+                    let mut image_hashes = HashMap::new();
 
-        slog::info!(log, "Adopted orphaned containers";
-            "service" => service_name,
-            "adopted_pods" => pod_containers.len(),
-            "adopted_containers" => adopted_count.to_string()
-        );
+                    // Try to get image hashes for existing containers
+                    for container in containers {
+                        if let Ok(parts) = parse_container_name(&container.name) {
+                            if let Some(container_config) = config
+                                .spec
+                                .containers
+                                .iter()
+                                .find(|c| c.name == parts.container_name)
+                            {
+                                if let Ok(hash) =
+                                    runtime.get_image_digest(&container_config.image).await
+                                {
+                                    image_hashes.insert(container_config.name.clone(), hash);
+                                }
+                            }
+                        }
+                    }
+
+                    instances.insert(
+                        *uuid,
+                        InstanceMetadata {
+                            uuid: *uuid,
+                            created_at: now,
+                            network: network_name,
+                            image_hash: image_hashes,
+                            containers: pod_metadata,
+                        },
+                    );
+                }
+            }
+
+            slog::info!(log, "Adopted orphaned containers";
+                "service" => service_name,
+                "adopted_pods" => pod_containers.len(),
+                "adopted_containers" => adopted_count.to_string()
+            );
+        }
     } else {
         // Group containers by their network
         let mut network_containers: HashMap<String, Vec<String>> = HashMap::new();
@@ -781,46 +791,70 @@ pub async fn stop_service(service_name: &str) {
     // Remove from load balancer
     server_backends.remove(service_name);
 
-    // Clean up instance store and stop containers
-    if let Some((_, instances)) = instance_store.remove(service_name) {
-        for (uuid, _metadata) in instances {
+    // Get instance data and remove from store with write lock
+    let instances = {
+        let mut store = instance_store.write().await;
+        store.remove(service_name)
+    };
+
+    // Clean up instances if they exist
+    if let Some(instances) = instances {
+        for (uuid, metadata) in instances {
             let container_name = format!("{}__{}", service_name, uuid);
             let runtime = RUNTIME.get().unwrap().clone();
 
             // Remove container stats
             remove_container_stats(service_name, &container_name);
+
+            // Handle health status
             if let Some(health_store) = CONTAINER_HEALTH.get() {
-                if let Some(mut health_status) = health_store.get_mut(&container_name) {
-                    health_status.transition_to(
-                        HealthState::Failed,
-                        Some("Container being removed".to_string()),
+                let mut health_map = health_store.write().await;
+                // Clone containers to avoid ownership issues
+                let containers = metadata.containers.clone();
+                for container in containers {
+                    if let Some(status) = health_map.get_mut(&container.name) {
+                        status.transition_to(
+                            HealthState::Failed,
+                            Some("Container being removed".to_string()),
+                        );
+                    }
+                    health_map.remove(&container.name);
+                    slog::debug!(log, "Removed health monitoring";
+                        "service" => service_name,
+                        "container" => &container.name
                     );
                 }
-                health_store.remove(&container_name);
-                slog::debug!(log, "Removed health monitoring";
-                    "service" => service_name,
-                    "container" => &container_name
-                );
             }
 
-            // Stop the container
-            if let Err(e) = runtime.stop_container(&container_name).await {
-                slog::error!(log, "Failed to stop container during service cleanup";
+            // Stop each container in the metadata
+            for container in &metadata.containers {
+                if let Err(e) = runtime.stop_container(&container.name).await {
+                    slog::error!(log, "Failed to stop container during service cleanup";
+                        "service" => service_name,
+                        "container" => &container.name,
+                        "error" => e.to_string()
+                    );
+                } else {
+                    slog::debug!(log, "Container stopped successfully";
+                        "service" => service_name,
+                        "container" => &container.name
+                    );
+                }
+            }
+
+            // Clean up network
+            if let Err(e) = runtime
+                .remove_pod_network(&metadata.network, service_name)
+                .await
+            {
+                slog::error!(log, "Failed to remove network";
                     "service" => service_name,
-                    "container" => &container_name,
+                    "network" => &metadata.network,
                     "error" => e.to_string()
-                );
-            } else {
-                slog::debug!(log, "Container stopped successfully";
-                    "service" => service_name,
-                    "container" => &container_name
                 );
             }
         }
     }
-
-    // Update instance store cache
-    let _ = update_instance_store_cache();
 
     slog::info!(log, "Service stopped and cleaned up"; "service" => service_name);
 }
