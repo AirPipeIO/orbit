@@ -74,6 +74,14 @@ pub enum ScaleMessage {
     RollingUpdate,
     RollingUpdateComplete,
 }
+
+// pull policy value
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub enum PullPolicyValue {
+    Always,
+    Never
+}
+
 // Change CONFIG_UPDATES to use ScaleMessage
 pub static CONFIG_UPDATES: OnceLock<mpsc::Sender<(String, ScaleMessage)>> = OnceLock::new();
 
@@ -131,6 +139,7 @@ pub struct ServiceConfig {
     pub network: Option<String>,
     pub spec: ServiceSpec,
     pub memory_limit: Option<Value>,
+    pub pull_policy: Option<PullPolicyValue>,
     pub cpu_limit: Option<Value>,
     pub resource_thresholds: Option<ResourceThresholds>,
     pub instance_count: InstanceCount,
@@ -499,7 +508,7 @@ pub async fn read_yaml_config(
                     "cpu_relative" => thresholds.cpu_percentage_relative,
                     "memory_percentage" => thresholds.memory_percentage);
         }
-
+        
         return Ok(config);
     }
 
