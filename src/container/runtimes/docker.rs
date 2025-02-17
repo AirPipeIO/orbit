@@ -15,7 +15,6 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::config::{get_config_by_service, parse_cpu_limit, parse_memory_limit, ServiceConfig};
-
 use crate::container::{
     parse_network_rate, update_container_stats, Container, ContainerInfo, ContainerPortMetadata,
     ContainerRuntime, ContainerStats, NetworkLimit,
