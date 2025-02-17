@@ -21,6 +21,8 @@ spec:
       # Container-specific limits override global
       cpu_limit: 0.2              # 20% of a CPU core
       memory_limit: 128M          # 128MB memory
+      privileged: true            # Required for tc traffic control
+      pull_policy: Always         # Always pull new image version
       # Network rate limiting
       network_limit:
         ingress_rate: "10Mbps"    # Incoming traffic limit

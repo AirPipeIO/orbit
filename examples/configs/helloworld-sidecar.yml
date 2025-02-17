@@ -1,13 +1,14 @@
 name: helloworld2
-cpu_limit: 0.5 # global set to all containers
-memory_limit: 100M # global set to all containers
+cpu_limit: 0.5                  # global set to all containers
+memory_limit: 100M              # global set to all containers
 resource_thresholds:
-  cpu_percentage: 80 # Threshold for CPU percent
-  cpu_percentage_relative: 30 # Threshold for CPU perc relative to the cpu_limit
-  memory_percentage: 30 # Threshold for memory utilisation percentage.
+  cpu_percentage: 80            # Threshold for CPU percent
+  cpu_percentage_relative: 30   # Threshold for CPU perc relative to the cpu_limit
+  memory_percentage: 30         # Threshold for memory utilisation percentage.
 instance_count:
-  min: 2 # Number of instances to spawn at start.
-  max: 10 # Maximum number of instances allowed.
+  min: 2                       # Number of instances to spawn at start.
+  max: 10                       # Maximum number of instances allowed.
+
 spec:
   containers:
     - name: main
@@ -24,10 +25,11 @@ spec:
         - name: nginx-config
           mount_path: /etc/nginx/nginx.conf
           sub_path: nginx.conf
+
 volumes:
   nginx-config:
     files:
-      nginx.conf: |-
+      nginx.conf: |
         events {}
         http {
             server {

@@ -79,10 +79,9 @@ pub enum ScaleMessage {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum PullPolicyValue {
     Always,
-    Never
+    Never,
 }
 
-// Change CONFIG_UPDATES to use ScaleMessage
 pub static CONFIG_UPDATES: OnceLock<mpsc::Sender<(String, ScaleMessage)>> = OnceLock::new();
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -508,7 +507,7 @@ pub async fn read_yaml_config(
                     "cpu_relative" => thresholds.cpu_percentage_relative,
                     "memory_percentage" => thresholds.memory_percentage);
         }
-        
+
         return Ok(config);
     }
 

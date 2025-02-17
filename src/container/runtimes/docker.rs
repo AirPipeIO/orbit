@@ -4,21 +4,22 @@ use async_trait::async_trait;
 use bollard::container::{
     Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions, StatsOptions,
 };
+use bollard::errors::Error::DockerResponseServerError;
+use bollard::image::CreateImageOptions;
 use bollard::models::{HostConfig, PortBinding};
 use bollard::network::CreateNetworkOptions;
 use bollard::secret::{DeviceRequest, Mount, MountBindOptions, MountTypeEnum};
 use bollard::Docker;
-use bollard::image::CreateImageOptions;
-use bollard::errors::Error::DockerResponseServerError;
-use dashmap::DashMap;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
+use std::default::Default;
 use std::path::Path;
 use std::time::Duration;
-use std::default::Default;
 use uuid::Uuid;
 
-use crate::config::{get_config_by_service, parse_cpu_limit, parse_memory_limit, ServiceConfig, PullPolicyValue};
+use crate::config::{
+    get_config_by_service, parse_cpu_limit, parse_memory_limit, PullPolicyValue, ServiceConfig,
+};
 use crate::container::{
     parse_network_rate, update_container_stats, Container, ContainerInfo, ContainerPortMetadata,
     ContainerRuntime, ContainerStats, NetworkLimit,
@@ -613,7 +614,7 @@ impl ContainerRuntime for DockerRuntime {
                 }
                 Err(e) => {
                     match e {
-                        DockerResponseServerError {status_code, ..} => {
+                        DockerResponseServerError { status_code, .. } => {
                             if status_code == 404 {
                                 slog::warn!(slog_scope::logger(), "Image not found";
                                     "service" => service_name,
@@ -624,16 +625,17 @@ impl ContainerRuntime for DockerRuntime {
                                     Some(PullPolicyValue::Always) => {
                                         match self
                                             .pull_image(service_name, containers, &service_config)
-                                            .await {
-                                                Ok(_) => {}
-                                                _ => {
-                                                    slog::error!(slog_scope::logger(), "Image not pulled";
-                                                        "service" => service_name,
-                                                        "container" => &container_name,
-                                                        "error" => e.to_string()
-                                                    );
-                                                }
+                                            .await
+                                        {
+                                            Ok(_) => {}
+                                            _ => {
+                                                slog::error!(slog_scope::logger(), "Image not pulled";
+                                                    "service" => service_name,
+                                                    "container" => &container_name,
+                                                    "error" => e.to_string()
+                                                );
                                             }
+                                        }
                                     }
                                     Some(PullPolicyValue::Never) => {
                                         slog::error!(slog_scope::logger(), "Image not present please check pulled images on docker host";
@@ -650,7 +652,6 @@ impl ContainerRuntime for DockerRuntime {
                                         );
                                     }
                                 }
-
                             }
                         }
                         _ => {
@@ -791,7 +792,7 @@ impl ContainerRuntime for DockerRuntime {
         let containers = self
             .client
             .list_containers(Some(bollard::container::ListContainersOptions {
-                all: false, // Change to only get running containers
+                all: false, // only get running containers
                 filters,
                 ..Default::default()
             }))
