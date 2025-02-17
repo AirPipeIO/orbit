@@ -36,7 +36,7 @@ jobs:
           cd ../../..
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: orbit-${{ matrix.target }}
           path: orbit-${{ matrix.target }}.tar.gz
@@ -62,7 +62,7 @@ jobs:
           cd ../../..
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: orbit-aarch64-apple-darwin
           path: orbit-aarch64-apple-darwin.tar.gz
@@ -76,17 +76,17 @@ jobs:
           fetch-depth: 0
 
       - name: Download Artifacts (Linux x86_64)
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: orbit-x86_64-unknown-linux-musl
 
       - name: Download Artifacts (Linux ARM64)
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: orbit-aarch64-unknown-linux-musl
 
       - name: Download Artifacts (macOS ARM64)
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: orbit-aarch64-apple-darwin
 

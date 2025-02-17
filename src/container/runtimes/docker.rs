@@ -39,8 +39,10 @@ impl DockerRuntime {
     }
 
     async fn track_network_usage(&self, network_name: &str, service_name: &str) {
-        let network_usage = NETWORK_USAGE.get_or_init(DashMap::new);
-        network_usage
+        let network_usage = NETWORK_USAGE.get().expect("Network usage not initialized");
+        let mut usage = network_usage.write().await;
+
+        usage
             .entry(network_name.to_string())
             .or_insert_with(HashSet::new)
             .insert(service_name.to_string());
@@ -48,11 +50,12 @@ impl DockerRuntime {
 
     async fn untrack_network_usage(&self, network_name: &str, service_name: &str) -> bool {
         let network_usage = NETWORK_USAGE.get().expect("Network usage not initialized");
+        let mut usage = network_usage.write().await;
 
-        if let Some(mut services) = network_usage.get_mut(network_name) {
+        if let Some(services) = usage.get_mut(network_name) {
             services.remove(service_name);
             if services.is_empty() {
-                network_usage.remove(network_name);
+                usage.remove(network_name);
                 return true; // Network has no more users
             }
         }
@@ -525,6 +528,7 @@ impl ContainerRuntime for DockerRuntime {
                 memory: Some(memory_limit.try_into().unwrap()),
                 nano_cpus: Some(cpu_limit as i64),
                 network_mode: network_name.clone().or(Some("bridge".to_string())),
+                privileged: container.privileged,
                 ..Default::default()
             };
 
@@ -762,7 +766,7 @@ impl ContainerRuntime for DockerRuntime {
             .next()
             .expect("Split always returns at least one element");
 
-        let service_cfg = get_config_by_service(service_name).unwrap();
+        let service_cfg = get_config_by_service(service_name).await.unwrap();
 
         let nano_cpus = service_cfg
             .cpu_limit

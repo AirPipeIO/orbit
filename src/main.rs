@@ -11,14 +11,16 @@ use axum::{routing::get, Router};
 use clap::Parser;
 use config::CONFIG_STORE;
 use container::{
-    create_runtime, volumes::initialize_volume_store, CONTAINER_STATS, IMAGE_CHECK_TASKS,
-    INSTANCE_STORE, NETWORK_USAGE, RUNTIME, SCALING_TASKS, SERVICE_STATS,
+    create_runtime, health::CONTAINER_HEALTH, scaling::codel::initialize_codel_metrics,
+    volumes::initialize_volume_store, CONTAINER_STATS, IMAGE_CHECK_TASKS, INSTANCE_STORE,
+    NETWORK_USAGE, RUNTIME, SCALING_TASKS, SERVICE_STATS,
 };
-use dashmap::DashMap;
 use logger::setup_logger;
 use metrics::{volumes::start_volume_metrics_task, MetricsUpdate};
 use proxy::{SERVER_BACKENDS, SERVER_TASKS};
-use std::{fs, path::PathBuf, process, time::Duration};
+use rustc_hash::FxHashMap;
+use std::{fs, path::PathBuf, process, sync::Arc, time::Duration};
+use tokio::sync::RwLock;
 
 macro_rules! crate_version {
     () => {
@@ -64,15 +66,18 @@ pub struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize the global stores
-    CONFIG_STORE.get_or_init(DashMap::new);
-    INSTANCE_STORE.get_or_init(DashMap::new);
-    SCALING_TASKS.get_or_init(DashMap::new);
-    CONTAINER_STATS.get_or_init(DashMap::new);
-    SERVICE_STATS.get_or_init(DashMap::new);
-    SERVER_TASKS.get_or_init(DashMap::new);
-    SERVER_BACKENDS.get_or_init(DashMap::new);
-    IMAGE_CHECK_TASKS.get_or_init(DashMap::new);
-    NETWORK_USAGE.get_or_init(DashMap::new);
+    CONFIG_STORE.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+    INSTANCE_STORE.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+    CONTAINER_HEALTH.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+    CONTAINER_STATS.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+    SCALING_TASKS.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+    SERVICE_STATS.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+    SERVER_TASKS.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+    SERVER_BACKENDS.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+    IMAGE_CHECK_TASKS.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+    NETWORK_USAGE.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+
+    initialize_codel_metrics();
 
     // Parse command line arguments
     let args = Args::parse();
@@ -122,9 +127,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Initialize background cache update
-    api::status::initialize_background_cache_update();
-
     // Initialize metrics system
     let _ = metrics::initialize_metrics();
 
@@ -137,11 +139,13 @@ async fn main() -> Result<()> {
                 .get()
                 .expect("Instance store not initialized");
 
-            // Collect total counts without holding locks for long
-            let total_services = instance_store.len();
-            let total_instances: usize =
-                instance_store.iter().map(|entry| entry.value().len()).sum();
+            // Get a read lock and calculate totals
+            let store = instance_store.read().await;
+            let total_services = store.len();
+            let total_instances: usize = store.values().map(|instances| instances.len()).sum();
 
+            // Explicitly drop the read lock
+            drop(store);
             // Send updates asynchronously
             let _ =
                 metrics::send_metrics_update(MetricsUpdate::TotalServices(total_services)).await;

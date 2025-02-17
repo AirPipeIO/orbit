@@ -27,9 +27,9 @@ pub struct ServiceStats {
 // Global metrics
 
 // Per-service metrics
-pub static SERVICE_CPU_USAGE: OnceLock<GaugeVec> = OnceLock::new();
-pub static SERVICE_MEMORY_USAGE: OnceLock<GaugeVec> = OnceLock::new();
-pub static SERVICE_ACTIVE_CONNECTIONS: OnceLock<IntGaugeVec> = OnceLock::new();
+// pub static SERVICE_CPU_USAGE: OnceLock<GaugeVec> = OnceLock::new();
+// pub static SERVICE_MEMORY_USAGE: OnceLock<GaugeVec> = OnceLock::new();
+// pub static SERVICE_ACTIVE_CONNECTIONS: OnceLock<IntGaugeVec> = OnceLock::new();
 
 // Global registry
 pub static REGISTRY: OnceLock<Registry> = OnceLock::new();

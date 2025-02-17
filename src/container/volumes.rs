@@ -1,13 +1,14 @@
 // src/container/volumes.rs
-use dashmap::DashMap;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::SystemTime;
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
-pub static VOLUME_STORE: OnceLock<DashMap<String, VolumeMetadata>> = OnceLock::new();
+pub static VOLUME_STORE: OnceLock<Arc<RwLock<FxHashMap<String, VolumeMetadata>>>> = OnceLock::new();
 pub static VOLUME_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -56,7 +57,8 @@ use std::path::Path;
 use tokio::fs;
 
 pub async fn initialize_volume_store(volume_path: &Path) -> Result<()> {
-    VOLUME_STORE.get_or_init(DashMap::new);
+    let store = Arc::new(RwLock::new(FxHashMap::default()));
+    VOLUME_STORE.set(store).unwrap();
     VOLUME_PATH.get_or_init(|| volume_path.to_path_buf());
 
     fs::create_dir_all(volume_path).await?;
@@ -73,10 +75,8 @@ pub async fn initialize_volume_store(volume_path: &Path) -> Result<()> {
             if metadata_path.exists() {
                 let metadata = fs::read_to_string(&metadata_path).await?;
                 let volume_metadata: VolumeMetadata = serde_json::from_str(&metadata)?;
-                VOLUME_STORE
-                    .get()
-                    .unwrap()
-                    .insert(volume_name, volume_metadata);
+                let mut store = VOLUME_STORE.get().unwrap().write().await;
+                store.insert(volume_name, volume_metadata);
             }
         }
     }
@@ -90,10 +90,13 @@ pub async fn create_named_volume(
     let volume_store = VOLUME_STORE.get().expect("Volume store not initialized");
     let volume_path = VOLUME_PATH.get().expect("Volume path not initialized");
 
-    if volume_store.contains_key(name) {
-        return Err(anyhow!("Volume {} already exists", name));
+    // Check existence with read lock first
+    {
+        let store = volume_store.read().await;
+        if store.contains_key(name) {
+            return Err(anyhow!("Volume {} already exists", name));
+        }
     }
-
     let volume_id = Uuid::new_v4();
     let volume_dir = volume_path.join(name);
     fs::create_dir_all(&volume_dir).await?;
@@ -112,34 +115,55 @@ pub async fn create_named_volume(
     let metadata_path = volume_dir.join("metadata.json");
     fs::write(&metadata_path, serde_json::to_string(&metadata)?).await?;
 
-    volume_store.insert(name.to_string(), metadata.clone());
+    // Insert with write lock
+    {
+        let mut store = volume_store.write().await;
+        store.insert(name.to_string(), metadata.clone());
+    }
+
     Ok(metadata)
 }
 
 pub async fn remove_named_volume(name: &str, force: bool) -> Result<()> {
     let volume_store = VOLUME_STORE.get().expect("Volume store not initialized");
 
-    if let Some(metadata) = volume_store.get(name) {
-        if !metadata.used_by.is_empty() && !force {
-            return Err(anyhow!("Volume {} is still in use", name));
+    // Check volume with read lock first
+    let should_remove = {
+        let store = volume_store.read().await;
+        match store.get(name) {
+            Some(metadata) => {
+                if !metadata.used_by.is_empty() && !force {
+                    return Err(anyhow!("Volume {} is still in use", name));
+                }
+                Some(metadata.path.clone())
+            }
+            None => None,
         }
+    };
 
-        fs::remove_dir_all(&metadata.path).await?;
-        volume_store.remove(name);
+    if let Some(path) = should_remove {
+        fs::remove_dir_all(&path).await?;
+        // Remove from store with write lock
+        let mut store = volume_store.write().await;
+        store.remove(name);
     }
     Ok(())
 }
 
 pub async fn attach_volume(name: &str, container_id: &str) -> Result<()> {
     let volume_store = VOLUME_STORE.get().expect("Volume store not initialized");
+    let container_id = container_id.to_string();
 
-    if let Some(mut metadata) = volume_store.get_mut(name) {
-        if !metadata.used_by.contains(&container_id.to_string()) {
-            metadata.used_by.push(container_id.to_string());
+    // Acquire write lock once for all operations
+    let mut store = volume_store.write().await;
+
+    if let Some(metadata) = store.get_mut(name) {
+        if !metadata.used_by.contains(&container_id) {
+            metadata.used_by.push(container_id);
 
             // Update metadata file
             let metadata_path = metadata.path.join("metadata.json");
-            fs::write(&metadata_path, serde_json::to_string(&metadata.value())?).await?;
+            fs::write(&metadata_path, serde_json::to_string(&metadata)?).await?;
         }
         Ok(())
     } else {
@@ -150,12 +174,15 @@ pub async fn attach_volume(name: &str, container_id: &str) -> Result<()> {
 pub async fn detach_volume(name: &str, container_id: &str) -> Result<()> {
     let volume_store = VOLUME_STORE.get().expect("Volume store not initialized");
 
-    if let Some(mut metadata) = volume_store.get_mut(name) {
+    // Acquire write lock once for all operations
+    let mut store = volume_store.write().await;
+
+    if let Some(metadata) = store.get_mut(name) {
         metadata.used_by.retain(|id| id != container_id);
 
         // Update metadata file
         let metadata_path = metadata.path.join("metadata.json");
-        fs::write(&metadata_path, serde_json::to_string(&metadata.value())?).await?;
+        fs::write(&metadata_path, serde_json::to_string(&metadata)?).await?;
         Ok(())
     } else {
         Err(anyhow!("Volume {} not found", name))

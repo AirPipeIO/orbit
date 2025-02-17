@@ -44,22 +44,25 @@ pub fn parse_container_name(container_name: &str) -> Result<ContainerNameParts> 
 }
 
 // Helper functions to access configs
-pub fn get_config_by_path(path: &str) -> Option<ServiceConfig> {
-    CONFIG_STORE
-        .get()
-        .and_then(|store| store.get(path).map(|entry| entry.value().1.clone()))
+pub async fn get_config_by_path(path: &str) -> Option<ServiceConfig> {
+    if let Some(store) = CONFIG_STORE.get() {
+        let store = store.read().await;
+        store.get(path).map(|(_, config)| config.clone())
+    } else {
+        None
+    }
 }
 
-pub fn get_config_by_service(service_name: &str) -> Option<ServiceConfig> {
-    CONFIG_STORE.get().and_then(|store| {
-        store.iter().find_map(|entry| {
-            if entry.value().1.name == service_name {
-                Some(entry.value().1.clone())
-            } else {
-                None
-            }
-        })
-    })
+pub async fn get_config_by_service(service_name: &str) -> Option<ServiceConfig> {
+    if let Some(store) = CONFIG_STORE.get() {
+        let store = store.read().await;
+        store
+            .values()
+            .find(|(_, config)| config.name == service_name)
+            .map(|(_, config)| config.clone())
+    } else {
+        None
+    }
 }
 
 pub fn get_relative_config_path(full_path: &PathBuf, config_dir: &PathBuf) -> Option<String> {
