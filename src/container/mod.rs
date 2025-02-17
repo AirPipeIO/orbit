@@ -677,7 +677,8 @@ pub async fn clean_up(service_name: &str) {
                         if let Some(backends) = backends {
                             let addr = format!("{}:{}", container.ip_address, port_metadata.port);
                             if let Ok(backend) = Backend::new(&addr) {
-                                backends.remove(&backend);
+                                let mut backend_set = backends.write().await;
+                                backend_set.remove(&backend);
                                 slog::debug!(log, "Removed backend from load balancer";
                                     "service" => service_name,
                                     "container" => &container.name,

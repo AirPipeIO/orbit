@@ -196,7 +196,8 @@ async fn perform_rolling_update(
                     if let Some(backends) = backends {
                         let addr = format!("{}:{}", ip, port_info.port);
                         if let Ok(backend) = Backend::new(&addr) {
-                            backends.insert(backend);
+                            let mut backend_set = backends.write().await;
+                            backend_set.insert(backend);
                         }
                     }
                 }
@@ -238,7 +239,8 @@ async fn perform_rolling_update(
                     if let Some(backends) = backends {
                         let addr = format!("{}:{}", container.ip_address, port_info.port);
                         if let Ok(backend) = Backend::new(&addr) {
-                            backends.remove(&backend);
+                            let mut backend_set = backends.write().await;
+                            backend_set.remove(&backend);
                         }
                     }
                 }

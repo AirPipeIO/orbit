@@ -144,24 +144,22 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
                             urls.push(container_url);
                         }
 
-                        let ports = container
-                            .ports
-                            .iter()
-                            .map(|port_info| {
+                        let ports = futures::future::join_all(container.ports.iter().map(
+                            |port_info| async {
                                 let container_addr =
                                     format!("{}:{}", container.ip_address, port_info.port);
                                 let healthy = match port_info.node_port {
                                     Some(node_port) => {
                                         let proxy_key = format!("{}__{}", service_name, node_port);
-                                        // Use the already acquired read lock on backends_map
-                                        backends_map
-                                            .get(&proxy_key)
-                                            .map(|backends| {
-                                                backends.iter().any(|backend| {
-                                                    backend.addr.to_string() == container_addr
-                                                })
+                                        if let Some(backends) = backends_map.get(&proxy_key) {
+                                            let backend_set = backends.read().await;
+                                            // Check if container_addr matches any backend addr
+                                            backend_set.iter().any(|backend| {
+                                                backend.addr.to_string() == container_addr
                                             })
-                                            .unwrap_or(false)
+                                        } else {
+                                            false
+                                        }
                                     }
                                     None => {
                                         !container_addr.is_empty()
@@ -176,8 +174,9 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
                                     node_port: port_info.node_port,
                                     healthy,
                                 }
-                            })
-                            .collect();
+                            },
+                        ))
+                        .await;
 
                         let health_status = health::get_container_health(&container.name).await;
 
@@ -191,25 +190,26 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
                                 let has_node_port =
                                     container.ports.iter().any(|p| p.node_port.is_some());
                                 if has_node_port {
-                                    if container.ports.iter().any(|port_info| {
+                                    let mut running = false;
+                                    for port_info in &container.ports {
                                         let addr =
                                             format!("{}:{}", container.ip_address, port_info.port);
                                         if let Some(node_port) = port_info.node_port {
                                             let proxy_key =
                                                 format!("{}__{}", service_name, node_port);
-                                            // Use the already acquired read lock on backends_map
-                                            backends_map
-                                                .get(&proxy_key)
-                                                .map(|backends| {
-                                                    backends.iter().any(|backend| {
-                                                        backend.addr.to_string() == addr
-                                                    })
-                                                })
-                                                .unwrap_or(false)
-                                        } else {
-                                            false
+                                            if let Some(backends) = backends_map.get(&proxy_key) {
+                                                let backend_set = backends.read().await;
+                                                if backend_set
+                                                    .iter()
+                                                    .any(|backend| backend.addr.to_string() == addr)
+                                                {
+                                                    running = true;
+                                                    break;
+                                                }
+                                            }
                                         }
-                                    }) {
+                                    }
+                                    if running {
                                         "running".to_string()
                                     } else {
                                         "stopped".to_string()

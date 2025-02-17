@@ -380,7 +380,8 @@ pub async fn scale_up(
                 if let Some(backends) = backends {
                     let addr = format!("{}:{}", ip, port_info.port);
                     if let Ok(backend) = Backend::new(&addr) {
-                        backends.insert(backend);
+                        let mut backend_set = backends.write().await;
+                        backend_set.insert(backend);
                         slog::info!(log, "Added backend to load balancer";
                             "service" => service_name,
                             "container" => &container_name,
@@ -457,7 +458,8 @@ pub async fn scale_down(
                 if let Some(backends) = backends {
                     let addr = format!("{}:{}", container.ip_address, port_info.port);
                     if let Ok(backend) = Backend::new(&addr) {
-                        backends.remove(&backend);
+                        let mut backend_set = backends.write().await;
+                        backend_set.remove(&backend);
                         slog::debug!(log, "Removed backend from load balancer";
                             "service" => service_name,
                             "container" => &container.name,

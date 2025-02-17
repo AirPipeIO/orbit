@@ -1,15 +1,16 @@
 // src/container/scaling/codel.rs
-use dashmap::DashMap;
+use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use crate::config::CoDelConfig;
 
 // Global store for CoDel metrics
-pub static CODEL_METRICS: OnceLock<Arc<DashMap<String, Arc<Mutex<CoDelMetrics>>>>> =
+pub static CODEL_METRICS: OnceLock<Arc<RwLock<FxHashMap<String, Arc<Mutex<CoDelMetrics>>>>>> =
     OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -292,7 +293,7 @@ impl CoDelMetrics {
 
 // Function to initialize CoDel metrics tracking
 pub fn initialize_codel_metrics() {
-    CODEL_METRICS.get_or_init(|| Arc::new(DashMap::new()));
+    CODEL_METRICS.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
 }
 
 // Function to get or create metrics for a service
@@ -302,14 +303,21 @@ pub async fn get_service_metrics(
 ) -> Arc<Mutex<CoDelMetrics>> {
     let metrics_store = CODEL_METRICS.get().expect("CoDel metrics not initialized");
 
-    if let Some(metrics) = metrics_store.get(service_name) {
-        metrics.value().clone()
-    } else {
-        let metrics = Arc::new(Mutex::new(CoDelMetrics::new(
-            service_name.to_string(),
-            config.clone(),
-        )));
-        metrics_store.insert(service_name.to_string(), metrics.clone());
-        metrics
+    // First try with just a read lock
+    {
+        let store = metrics_store.read().await;
+        if let Some(metrics) = store.get(service_name) {
+            return metrics.clone();
+        }
     }
+
+    // If not found, create new metrics with write lock
+    let mut store = metrics_store.write().await;
+    let metrics = Arc::new(Mutex::new(CoDelMetrics::new(
+        service_name.to_string(),
+        config.clone(),
+    )));
+
+    store.insert(service_name.to_string(), metrics.clone());
+    metrics
 }

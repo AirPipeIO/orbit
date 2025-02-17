@@ -5,7 +5,6 @@ use crate::container::scaling::scale_up;
 use crate::container::{INSTANCE_STORE, RUNTIME};
 use crate::metrics::{SERVICE_REQUEST_DURATION, SERVICE_REQUEST_TOTAL, TOTAL_REQUESTS};
 use async_trait::async_trait;
-use dashmap::DashSet;
 use pingora::http::ResponseHeader;
 use pingora::lb::discovery::ServiceDiscovery;
 use pingora::lb::{Backend, Backends, LoadBalancer};
@@ -15,7 +14,7 @@ use pingora::server::Server;
 use pingora::services::background::background_service;
 use pingora::upstreams::peer::HttpPeer;
 use pingora_load_balancing::health_check;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::RwLock;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -27,16 +26,17 @@ use tokio::task::{self, JoinHandle};
 
 // Global OnceLock for storing server instances and backends
 pub static SERVER_TASKS: OnceLock<Arc<RwLock<FxHashMap<String, JoinHandle<()>>>>> = OnceLock::new();
-pub static SERVER_BACKENDS: OnceLock<Arc<RwLock<FxHashMap<String, Arc<DashSet<Backend>>>>>> =
-    OnceLock::new();
-
-pub struct Discovery(Arc<DashSet<Backend>>);
+pub static SERVER_BACKENDS: OnceLock<
+    Arc<RwLock<FxHashMap<String, Arc<RwLock<FxHashSet<Backend>>>>>>,
+> = OnceLock::new();
+pub struct Discovery(Arc<RwLock<FxHashSet<Backend>>>);
 
 #[async_trait]
 impl ServiceDiscovery for Discovery {
     async fn discover(&self) -> pingora::Result<(BTreeSet<Backend>, HashMap<u64, bool>)> {
         let mut backends = BTreeSet::new();
-        for backend in self.0.iter() {
+        let backend_set = self.0.read().await;
+        for backend in backend_set.iter() {
             backends.insert(backend.clone());
         }
         Ok((backends, HashMap::new()))
@@ -218,7 +218,8 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
                                     let addr =
                                         format!("{}:{}", container.ip_address, port_info.port);
                                     if let Ok(backend) = Backend::new(&addr) {
-                                        backends.insert(backend);
+                                        let mut backend_set = backends.write().await;
+                                        backend_set.insert(backend);
                                         slog::debug!(log, "Updated backend configuration";
                                             "service" => &service_name,
                                             "container" => &container.name,
@@ -238,7 +239,7 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
         }
 
         // Initialize backends for this service-port with write lock
-        let backends = Arc::new(DashSet::new());
+        let backends = Arc::new(RwLock::new(FxHashSet::default()));
         {
             let mut backends_map = server_backends.write().await;
             backends_map.insert(proxy_key.clone(), backends.clone());
@@ -255,7 +256,8 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
                                     let addr =
                                         format!("{}:{}", container.ip_address, port_info.port);
                                     if let Ok(backend) = Backend::new(&addr) {
-                                        backends.insert(backend);
+                                        let mut backend_set = backends.write().await;
+                                        backend_set.insert(backend);
                                     }
                                 }
                             }
