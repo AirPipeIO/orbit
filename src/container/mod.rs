@@ -14,7 +14,6 @@ use docker::DockerRuntime;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bollard::container::Stats;
-use dashmap::DashMap;
 use pingora_load_balancing::Backend;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -35,7 +34,10 @@ use crate::proxy::SERVER_BACKENDS;
 const MAX_SERVICE_NAME_LENGTH: usize = 60; // Common k8s practice
 const MAX_CONTAINER_NAME_LENGTH: usize = 60; // This gives us plenty of room
 
-pub static IMAGE_CHECK_TASKS: OnceLock<DashMap<String, JoinHandle<()>>> = OnceLock::new();
+pub static IMAGE_CHECK_TASKS: OnceLock<Arc<RwLock<FxHashMap<String, JoinHandle<()>>>>> =
+    OnceLock::new();
+pub static CONTAINER_STATS: OnceLock<Arc<RwLock<FxHashMap<String, StatsEntry>>>> = OnceLock::new();
+pub static SERVICE_STATS: OnceLock<Arc<RwLock<FxHashMap<String, ServiceStats>>>> = OnceLock::new();
 
 // Update Container struct to include volume mounts
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -124,31 +126,29 @@ impl Container {
 
 #[derive(Clone, Debug)]
 pub struct ServiceStats {
-    container_stats: DashMap<String, ContainerStats>,
+    container_stats: FxHashMap<String, ContainerStats>,
 }
 
 impl ServiceStats {
     fn new() -> Self {
         Self {
-            container_stats: DashMap::new(),
+            container_stats: FxHashMap::default(),
         }
     }
 
-    pub fn update_stats(&self, container_name: &str, stats: ContainerStats) {
+    pub fn update_stats(&mut self, container_name: &str, stats: ContainerStats) {
         self.container_stats
             .insert(container_name.to_string(), stats);
     }
 
-    pub fn remove_container(&self, container_name: &str) {
+    pub fn remove_container(&mut self, container_name: &str) {
         self.container_stats.remove(container_name);
     }
 
     pub fn get_container_stats(&self, container_name: &str) -> Option<ContainerStats> {
-        self.container_stats.get(container_name).map(|s| s.clone())
+        self.container_stats.get(container_name).cloned()
     }
 }
-
-pub static SERVICE_STATS: OnceLock<DashMap<String, ServiceStats>> = OnceLock::new();
 
 // Update the update_container_stats function to use service-level stats
 pub async fn update_container_stats(
@@ -166,35 +166,35 @@ pub async fn update_container_stats(
     let online_cpus = stats.cpu_stats.online_cpus.unwrap_or(1) as f64;
 
     // Get previous stats with minimal lock time
-    let previous_stats = stats_store.get(container_name).map(|entry| {
-        (
-            StatsEntry {
-                timestamp: entry.timestamp,
-                cpu_total_usage: entry.cpu_total_usage,
-                system_cpu_usage: entry.system_cpu_usage,
-            },
-            // Get previous container stats for network rate calculation
-            service_stats
-                .get(service_name)
-                .and_then(|s| s.get_container_stats(container_name)),
-        )
-    });
+    let previous_stats = {
+        let store = stats_store.read().await;
+        store.get(container_name).map(|stats_entry| StatsEntry {
+            timestamp: stats_entry.timestamp,
+            cpu_total_usage: stats_entry.cpu_total_usage,
+            system_cpu_usage: stats_entry.system_cpu_usage,
+        })
+    };
 
     let (cpu_percentage, cpu_percentage_relative) = calculate_cpu_percentages(
-        previous_stats.as_ref().map(|(entry, _)| entry),
+        previous_stats.as_ref(),
         cpu_total,
         system_cpu,
         online_cpus,
         nano_cpus,
     );
 
-    // Update historical stats
-    let stats_entry = StatsEntry {
-        timestamp: now,
-        cpu_total_usage: cpu_total,
-        system_cpu_usage: system_cpu,
-    };
-    stats_store.insert(container_name.to_string(), stats_entry);
+    // Update historical stats with write lock
+    {
+        let mut store = stats_store.write().await;
+        store.insert(
+            container_name.to_string(),
+            StatsEntry {
+                timestamp: now,
+                cpu_total_usage: cpu_total,
+                system_cpu_usage: system_cpu,
+            },
+        );
+    }
 
     let mut container_stats = ContainerStats {
         id: stats.id.clone(),
@@ -211,20 +211,25 @@ pub async fn update_container_stats(
         timestamp: now,
     };
 
-    // Update network stats using previous container stats if available
-    container_stats.update_network_stats(
-        &stats,
-        previous_stats
-            .as_ref()
-            .map(|(_, prev)| prev.as_ref())
-            .flatten(),
-    );
+    // Get previous container stats for network calculations
+    let previous_container_stats = {
+        let services = service_stats.read().await;
+        services
+            .get(service_name)
+            .and_then(|service| service.get_container_stats(container_name))
+    };
 
-    // Update service-level stats
-    service_stats
-        .entry(service_name.to_string())
-        .or_insert_with(ServiceStats::new)
-        .update_stats(container_name, container_stats.clone());
+    // Update network stats using previous container stats if available
+    container_stats.update_network_stats(&stats, previous_container_stats.as_ref());
+
+    // Update service-level stats with write lock
+    {
+        let mut services = service_stats.write().await;
+        let service_stats_entry = services
+            .entry(service_name.to_string())
+            .or_insert_with(ServiceStats::new);
+        service_stats_entry.update_stats(container_name, container_stats.clone());
+    }
 
     container_stats
 }
@@ -234,22 +239,22 @@ pub fn find_host_port(stats: &ContainerStats, container_port: u16) -> Option<u16
 }
 
 // Update remove_container_stats to handle service-level cleanup
-pub fn remove_container_stats(service_name: &str, container_name: &str) {
+pub async fn remove_container_stats(service_name: &str, container_name: &str) {
     if let Some(stats_store) = CONTAINER_STATS.get() {
-        stats_store.remove(container_name);
+        let mut store = stats_store.write().await;
+        store.remove(container_name);
     }
 
     if let Some(service_stats) = SERVICE_STATS.get() {
-        if let Some(stats) = service_stats.get(service_name) {
+        let mut services = service_stats.write().await;
+        if let Some(stats) = services.get_mut(service_name) {
             stats.remove_container(container_name);
+            // If no containers left, remove the service entry
+            if stats.container_stats.is_empty() {
+                services.remove(service_name);
+            }
         }
     }
-}
-
-// Initialize service stats in main.rs
-pub fn initialize_stats() {
-    SERVICE_STATS.get_or_init(DashMap::new);
-    CONTAINER_STATS.get_or_init(DashMap::new);
 }
 
 pub static RUNTIME: OnceLock<Arc<dyn ContainerRuntime>> = OnceLock::new();
@@ -259,7 +264,8 @@ pub static INSTANCE_STORE: OnceLock<
 > = OnceLock::new();
 
 // Global registry for scaling tasks
-pub static SCALING_TASKS: OnceLock<DashMap<String, JoinHandle<()>>> = OnceLock::new();
+pub static SCALING_TASKS: OnceLock<Arc<RwLock<FxHashMap<String, JoinHandle<()>>>>> =
+    OnceLock::new();
 
 // Global stats history store
 #[derive(Clone, Deserialize, Serialize)]
@@ -268,9 +274,6 @@ pub struct StatsEntry {
     pub cpu_total_usage: u64,
     pub system_cpu_usage: u64,
 }
-
-// Global stats history store
-pub static CONTAINER_STATS: OnceLock<DashMap<String, StatsEntry>> = OnceLock::new();
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ContainerMetadata {
@@ -590,12 +593,32 @@ pub async fn clean_up(service_name: &str) {
         .get()
         .expect("Instance store not initialised");
     let runtime = RUNTIME.get().expect("Runtime not initialised").clone();
-    let scaling_tasks = SCALING_TASKS.get().unwrap();
+    let scaling_tasks = SCALING_TASKS.get().expect("Scaling tasks not initialized");
+    let image_check_tasks = IMAGE_CHECK_TASKS
+        .get()
+        .expect("Image check tasks not initialized");
+    let server_backends = SERVER_BACKENDS
+        .get()
+        .expect("Server backends not initialized");
 
-    // Stop the auto-scaling task
-    if let Some((_, handle)) = scaling_tasks.remove(service_name) {
-        handle.abort();
-        slog::trace!(log, "Scaling task aborted"; "service" => service_name);
+    // Stop the auto-scaling task with write lock
+    {
+        let mut tasks = scaling_tasks.write().await;
+        if let Some(handle) = tasks.remove(service_name) {
+            handle.abort();
+            slog::trace!(log, "Scaling task aborted"; "service" => service_name);
+        }
+    }
+
+    // Stop the image check task with write lock
+    {
+        let mut tasks = image_check_tasks.write().await;
+        if let Some(handle) = tasks.remove(service_name) {
+            handle.abort();
+            slog::debug!(log, "Image check task aborted";
+                "service" => service_name
+            );
+        }
     }
 
     // Get write lock and remove service data
@@ -611,7 +634,7 @@ pub async fn clean_up(service_name: &str) {
             // For each container in the pod
             for container in containers {
                 // Detach volumes if any
-                if let Some(config) = get_config_by_service(service_name) {
+                if let Some(config) = get_config_by_service(service_name).await {
                     if let (Some(container_config), Some(volumes)) = (
                         config
                             .spec
@@ -645,7 +668,13 @@ pub async fn clean_up(service_name: &str) {
                 for port_metadata in &container.ports {
                     if let Some(node_port) = port_metadata.node_port {
                         let proxy_key = format!("{}__{}", service_name, node_port);
-                        if let Some(backends) = SERVER_BACKENDS.get().unwrap().get(&proxy_key) {
+
+                        let backends = {
+                            let backends_map = server_backends.read().await;
+                            backends_map.get(&proxy_key).cloned()
+                        };
+
+                        if let Some(backends) = backends {
                             let addr = format!("{}:{}", container.ip_address, port_metadata.port);
                             if let Ok(backend) = Backend::new(&addr) {
                                 backends.remove(&backend);
@@ -661,7 +690,7 @@ pub async fn clean_up(service_name: &str) {
                 }
 
                 // Clean up stats for each container
-                remove_container_stats(service_name, &container.name);
+                remove_container_stats(service_name, &container.name).await;
 
                 // Clean up health monitoring
                 if let Some(health_store) = CONTAINER_HEALTH.get() {
@@ -702,9 +731,10 @@ pub async fn clean_up(service_name: &str) {
             }
         }
 
-        // Clean up entire service stats after all containers are stopped
+        // Clean up entire service stats
         if let Some(service_stats) = SERVICE_STATS.get() {
-            service_stats.remove(service_name);
+            let mut services = service_stats.write().await;
+            services.remove(service_name);
         }
     }
 }

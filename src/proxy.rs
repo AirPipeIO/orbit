@@ -5,7 +5,6 @@ use crate::container::scaling::scale_up;
 use crate::container::{INSTANCE_STORE, RUNTIME};
 use crate::metrics::{SERVICE_REQUEST_DURATION, SERVICE_REQUEST_TOTAL, TOTAL_REQUESTS};
 use async_trait::async_trait;
-use dashmap::DashMap;
 use dashmap::DashSet;
 use pingora::http::ResponseHeader;
 use pingora::lb::discovery::ServiceDiscovery;
@@ -16,13 +15,20 @@ use pingora::server::Server;
 use pingora::services::background::background_service;
 use pingora::upstreams::peer::HttpPeer;
 use pingora_load_balancing::health_check;
+use rustc_hash::FxHashMap;
+use tokio::sync::RwLock;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 #[cfg(unix)]
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
-use tokio::task;
+use tokio::task::{self, JoinHandle};
+
+// Global OnceLock for storing server instances and backends
+pub static SERVER_TASKS: OnceLock<Arc<RwLock<FxHashMap<String, JoinHandle<()>>>>> = OnceLock::new();
+pub static SERVER_BACKENDS: OnceLock<Arc<RwLock<FxHashMap<String, Arc<DashSet<Backend>>>>>> =
+    OnceLock::new();
 
 pub struct Discovery(Arc<DashSet<Backend>>);
 
@@ -61,7 +67,7 @@ impl ProxyHttp for ProxyApp {
         let service_name = self.service_name.split_once("__").unwrap().0;
 
         // Get service configuration and check CoDel metrics here since we now have the complete request time
-        if let Some(config) = get_config_by_service(service_name) {
+        if let Some(config) = get_config_by_service(service_name).await {
             if let Some(codel_config) = config.codel.clone() {
                 let metrics = get_service_metrics(service_name, &codel_config).await;
                 let mut metrics = metrics.lock().await;
@@ -119,7 +125,7 @@ impl ProxyHttp for ProxyApp {
         let service_name = self.service_name.split_once("__").unwrap().0;
 
         // Check if we should reject the request based on recent metrics
-        if let Some(config) = get_config_by_service(service_name) {
+        if let Some(config) = get_config_by_service(service_name).await {
             if let Some(codel_config) = config.codel.clone() {
                 let metrics = get_service_metrics(service_name, &codel_config).await;
                 let metrics = metrics.lock().await;
@@ -170,14 +176,11 @@ impl ProxyHttp for ProxyApp {
     }
 }
 
-// Global OnceLock for storing server instances and backends
-pub static SERVER_TASKS: OnceLock<DashMap<String, task::JoinHandle<()>>> = OnceLock::new();
-pub static SERVER_BACKENDS: OnceLock<DashMap<String, Arc<DashSet<Backend>>>> = OnceLock::new();
-
 pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) {
     let log: slog::Logger = slog_scope::logger();
-    let server_tasks = SERVER_TASKS.get_or_init(DashMap::new);
-    let server_backends = SERVER_BACKENDS.get_or_init(DashMap::new);
+    let server_tasks = SERVER_TASKS.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+    let server_backends =
+        SERVER_BACKENDS.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
     let instance_store = INSTANCE_STORE.get().unwrap();
 
     // Track only node_ports that need external access
@@ -197,7 +200,13 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
         let proxy_key = format!("{}__{}", service_name, node_port);
         let addr = format!("0.0.0.0:{}", node_port);
 
-        if let Some(backends) = server_backends.get(&proxy_key) {
+        // Get read lock to check for existing backends
+        let backends = {
+            let backends_map = server_backends.read().await;
+            backends_map.get(&proxy_key).cloned()
+        };
+
+        if let Some(backends) = backends {
             // Get read lock to access instance data
             let store = instance_store.read().await;
             if let Some(instances) = store.get(&service_name) {
@@ -225,14 +234,15 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
                     }
                 }
             }
-            // Read lock is dropped here
             continue;
         }
 
-        // Initialize backends for this service-port
+        // Initialize backends for this service-port with write lock
         let backends = Arc::new(DashSet::new());
-        server_backends.insert(proxy_key.clone(), backends.clone());
-
+        {
+            let mut backends_map = server_backends.write().await;
+            backends_map.insert(proxy_key.clone(), backends.clone());
+        }
         // Add initial backends with read lock
         {
             let store = instance_store.read().await;
@@ -282,6 +292,10 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
             server.run_forever();
         });
 
-        server_tasks.insert(proxy_key.clone(), handle);
+        // Store server task with write lock
+        {
+            let mut tasks = server_tasks.write().await;
+            tasks.insert(proxy_key.clone(), handle);
+        }
     }
 }

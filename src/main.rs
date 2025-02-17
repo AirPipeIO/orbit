@@ -15,7 +15,6 @@ use container::{
     volumes::initialize_volume_store, CONTAINER_STATS, IMAGE_CHECK_TASKS, INSTANCE_STORE,
     NETWORK_USAGE, RUNTIME, SCALING_TASKS, SERVICE_STATS,
 };
-use dashmap::DashMap;
 use logger::setup_logger;
 use metrics::{volumes::start_volume_metrics_task, MetricsUpdate};
 use proxy::{SERVER_BACKENDS, SERVER_TASKS};
@@ -67,16 +66,17 @@ pub struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize the global stores
-    CONFIG_STORE.get_or_init(DashMap::new);
+    CONFIG_STORE.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
     INSTANCE_STORE.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
     CONTAINER_HEALTH.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
-    SCALING_TASKS.get_or_init(DashMap::new);
-    CONTAINER_STATS.get_or_init(|| DashMap::new());
-    SERVICE_STATS.get_or_init(|| DashMap::new());
-    SERVER_TASKS.get_or_init(DashMap::new);
-    SERVER_BACKENDS.get_or_init(DashMap::new);
-    IMAGE_CHECK_TASKS.get_or_init(DashMap::new);
-    NETWORK_USAGE.get_or_init(DashMap::new);
+    CONTAINER_STATS.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+    SCALING_TASKS.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+    SERVICE_STATS.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+    SERVER_TASKS.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+    SERVER_BACKENDS.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+    IMAGE_CHECK_TASKS.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+    NETWORK_USAGE.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+
     initialize_codel_metrics();
 
     // Parse command line arguments

@@ -3,9 +3,8 @@
 use crate::{
     config::get_config_by_service,
     container::{
-        self,
         health::{self, ContainerHealthState},
-        INSTANCE_STORE,
+        INSTANCE_STORE, SERVICE_STATS,
     },
     proxy::SERVER_BACKENDS,
 };
@@ -81,20 +80,22 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
     let server_backends = SERVER_BACKENDS
         .get()
         .expect("Server backends not initialized");
-    let service_stats = container::SERVICE_STATS
-        .get()
-        .expect("Service stats not initialized");
+    let service_stats = SERVICE_STATS.get().expect("Service stats not initialized");
 
     let mut services = Vec::new();
 
     // Get read lock for instance store
     let store_map = instance_store.read().await;
+    // Get read lock for service stats once
+    let service_stats_read = service_stats.read().await;
+    let backends_map = server_backends.read().await;
 
     for (service_name, instances) in store_map.iter() {
-        let service_config = get_config_by_service(service_name);
+        let service_config = get_config_by_service(service_name).await;
 
         if let Some(config) = service_config {
-            let service_stat = service_stats.get(service_name);
+            // Get service stats if available, using the existing read lock
+            let service_stat = service_stats_read.get(service_name);
 
             // Collect all service ports and URLs
             let mut service_ports = Vec::new();
@@ -119,9 +120,9 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
             let pods = futures::future::join_all(instances.iter().map(|(uuid, metadata)| async {
                 let containers =
                     futures::future::join_all(metadata.containers.iter().map(|container| async {
-                        let container_stats = service_stat
-                            .as_ref()
-                            .and_then(|s| s.get_container_stats(&container.name));
+                        // Use service_stat from the outer scope, which is using the existing read lock
+                        let container_stats =
+                            service_stat.and_then(|s| s.get_container_stats(&container.name));
 
                         let mut urls = Vec::new();
                         for port_info in &container.ports {
@@ -152,12 +153,15 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
                                 let healthy = match port_info.node_port {
                                     Some(node_port) => {
                                         let proxy_key = format!("{}__{}", service_name, node_port);
-                                        server_backends.iter().any(|backend_entry| {
-                                            backend_entry.key() == &proxy_key
-                                                && backend_entry.value().iter().any(|backend| {
+                                        // Use the already acquired read lock on backends_map
+                                        backends_map
+                                            .get(&proxy_key)
+                                            .map(|backends| {
+                                                backends.iter().any(|backend| {
                                                     backend.addr.to_string() == container_addr
                                                 })
-                                        })
+                                            })
+                                            .unwrap_or(false)
                                     }
                                     None => {
                                         !container_addr.is_empty()
@@ -193,7 +197,8 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
                                         if let Some(node_port) = port_info.node_port {
                                             let proxy_key =
                                                 format!("{}__{}", service_name, node_port);
-                                            server_backends
+                                            // Use the already acquired read lock on backends_map
+                                            backends_map
                                                 .get(&proxy_key)
                                                 .map(|backends| {
                                                     backends.iter().any(|backend| {
@@ -244,7 +249,9 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
         }
     }
 
-    // Drop read lock explicitly here (though it would happen automatically)
+    // Drop read locks explicitly
+    drop(backends_map);
+    drop(service_stats_read);
     drop(store_map);
 
     Json(services)

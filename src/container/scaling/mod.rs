@@ -41,7 +41,7 @@ pub async fn auto_scale(service_name: String) {
 
     // Initialize the scaling manager
     let mut scaling_manager = {
-        let config = match get_config_by_service(&service_name) {
+        let config = match get_config_by_service(&service_name).await {
             Some(cfg) => cfg,
             None => {
                 slog::error!(log, "Service config not found, stopping auto_scale";
@@ -66,7 +66,7 @@ pub async fn auto_scale(service_name: String) {
 
     loop {
         if !scaling_paused {
-            let current_config = match get_config_by_service(&service_name) {
+            let current_config = match get_config_by_service(&service_name).await {
                 Some(cfg) => cfg,
                 None => {
                     slog::error!(log, "Service config not found, stopping auto_scale";
@@ -372,7 +372,12 @@ pub async fn scale_up(
         for port_info in port_metadata {
             if let Some(node_port) = port_info.node_port {
                 let proxy_key = format!("{}__{}", service_name, node_port);
-                if let Some(backends) = server_backends.get(&proxy_key) {
+                let backends = {
+                    let backends_map = server_backends.read().await;
+                    backends_map.get(&proxy_key).cloned()
+                };
+
+                if let Some(backends) = backends {
                     let addr = format!("{}:{}", ip, port_info.port);
                     if let Ok(backend) = Backend::new(&addr) {
                         backends.insert(backend);
@@ -443,7 +448,13 @@ pub async fn scale_down(
         for port_info in &container.ports {
             if let Some(node_port) = port_info.node_port {
                 let proxy_key = format!("{}__{}", service_name, node_port);
-                if let Some(backends) = server_backends.get(&proxy_key) {
+
+                let backends = {
+                    let backends_map = server_backends.read().await;
+                    backends_map.get(&proxy_key).cloned()
+                };
+
+                if let Some(backends) = backends {
                     let addr = format!("{}:{}", container.ip_address, port_info.port);
                     if let Ok(backend) = Backend::new(&addr) {
                         backends.remove(&backend);

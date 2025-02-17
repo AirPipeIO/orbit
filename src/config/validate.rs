@@ -71,12 +71,12 @@ pub fn validate_service_ports(config: &ServiceConfig) -> Result<(), PortValidati
     Ok(())
 }
 
-// Check for port conflicts between services
-pub fn check_port_conflicts(
+pub async fn check_port_conflicts(
     new_config: &ServiceConfig,
     exclude_service: Option<&str>,
 ) -> Result<(), PortValidationError> {
     let config_store = CONFIG_STORE.get().expect("Config store not initialized");
+    let store = config_store.read().await;
 
     // Collect ports from new config
     let mut new_target_ports = HashSet::new();
@@ -96,9 +96,7 @@ pub fn check_port_conflicts(
     }
 
     // Check against all existing services
-    for entry in config_store.iter() {
-        let existing_config = &entry.value().1;
-
+    for (_, (_, existing_config)) in store.iter() {
         // Skip if this is the service we're updating
         if let Some(exclude) = exclude_service {
             if existing_config.name == exclude {
@@ -174,18 +172,18 @@ pub fn validate_container_name(name: &str) -> Result<(), ConfigValidationError> 
 }
 
 // Add this function to check for duplicate service names
-pub fn check_service_name_uniqueness(
+pub async fn check_service_name_uniqueness(
     config: &ServiceConfig,
     exclude_service: Option<&str>,
 ) -> Result<(), ConfigValidationError> {
     let config_store = CONFIG_STORE.get().expect("Config store not initialized");
+    let store = config_store.read().await;
 
     // Check if any existing config has the same name, excluding the service being updated
-    for existing_config in config_store.iter() {
-        if existing_config.value().1.name == config.name {
+    for (_, (_, existing_config)) in store.iter() {
+        if existing_config.name == config.name {
             // Skip if this is the service we're updating
             if let Some(exclude) = exclude_service {
-                // println!("\n\n{:?} : {:?} \n\n", exclude, config.name);
                 if exclude == config.name {
                     continue;
                 }

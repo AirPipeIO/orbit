@@ -41,7 +41,7 @@ pub async fn start_image_check_task(service_name: String, config: ServiceConfig)
     loop {
         interval.tick().await;
 
-        let current_config = match get_config_by_service(&service_name) {
+        let current_config = match get_config_by_service(&service_name).await {
             Some(cfg) => cfg,
             None => break,
         };
@@ -187,7 +187,13 @@ async fn perform_rolling_update(
             for port_info in ports {
                 if let Some(node_port) = port_info.node_port {
                     let proxy_key = format!("{}__{}", service_name, node_port);
-                    if let Some(backends) = server_backends.get(&proxy_key) {
+
+                    let backends = {
+                        let backends_map = server_backends.read().await;
+                        backends_map.get(&proxy_key).cloned()
+                    };
+
+                    if let Some(backends) = backends {
                         let addr = format!("{}:{}", ip, port_info.port);
                         if let Ok(backend) = Backend::new(&addr) {
                             backends.insert(backend);
@@ -223,7 +229,13 @@ async fn perform_rolling_update(
             for port_info in &container.ports {
                 if let Some(node_port) = port_info.node_port {
                     let proxy_key = format!("{}__{}", service_name, node_port);
-                    if let Some(backends) = server_backends.get(&proxy_key) {
+
+                    let backends = {
+                        let backends_map = server_backends.read().await;
+                        backends_map.get(&proxy_key).cloned()
+                    };
+
+                    if let Some(backends) = backends {
                         let addr = format!("{}:{}", container.ip_address, port_info.port);
                         if let Ok(backend) = Backend::new(&addr) {
                             backends.remove(&backend);
