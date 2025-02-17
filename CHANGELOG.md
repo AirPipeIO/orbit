@@ -2,11 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.3] - 2025-02-17
+
+### 🚀 Features
+
+- Update download artifact to v4
+- Version bump
+
 ## [0.2.2] - 2025-02-17
 
 ### 🚀 Features
 
 - Bump version
+
+### 📚 Documentation
+
+- Update changelog for v0.2.2
 
 ## [0.2.0] - 2025-02-17
 
