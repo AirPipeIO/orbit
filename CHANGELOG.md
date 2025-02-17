@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.2] - 2025-02-17
+
+### 🚀 Features
+
+- Bump version
+
 ## [0.2.0] - 2025-02-17
 
 ### 🚀 Features
@@ -13,10 +19,12 @@ All notable changes to this project will be documented in this file.
 - Volume store, and fxhashset for proxy update
 - Merge
 - Bump to 0.2.0
+- Update workflows
 
 ### 📚 Documentation
 
 - Update
+- Update changelog for v0.2.0
 
 ### ⚙️ Miscellaneous Tasks
 
