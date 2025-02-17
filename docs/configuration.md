@@ -1,188 +1,142 @@
 # Orbit Configuration Reference
 
-This document details all available configuration options for Orbit services.
+This document provides a comprehensive reference for Orbit's configuration options. For practical examples and quick-start configurations, see our [Examples Directory](examples/).
 
-## Service Configuration Structure
+## Basic Configuration Structure
 
-Service configurations are defined in YAML files and support the following top-level fields:
+Service configurations are YAML files containing:
+- Service metadata and scaling parameters
+- Resource limits and thresholds
+- Container specifications
+- Optional volume and network configurations
+
+## Configuration Reference
 
 ### Core Service Fields
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | string | Yes | Service name (must be a valid DNS label: lowercase alphanumeric characters or '-', starting and ending with alphanumeric) |
-| `network` | string | No | Name of network to use for containers. If not specified, a dedicated network is created for multi-container pods |
-| `adopt_orphans` | boolean | No | Whether to adopt existing containers that match the service pattern (default: false) |
-| `instance_count` | object | Yes | Defines scaling boundaries |
-| `memory_limit` | string/number | No | Service-level memory limit (e.g., "2Gi", "512Mi") |
+| `name` | string | Yes | Service name (must be DNS label compatible) |
+| `instance_count` | object | Yes | Scaling boundaries (min/max) |
 | `cpu_limit` | string/number | No | Service-level CPU limit (e.g., "1.0" = 1 core) |
-| `image_check_interval` | duration | No | Interval for checking container image updates |
-| `rolling_update_config` | object | No | Configuration for rolling updates |
-| `resource_thresholds` | object | No | Resource thresholds for autoscaling |
-| `volumes` | object | No | Named volume definitions |
-
-### Instance Count Configuration
-
-```yaml
-instance_count:
-  min: 1  # Minimum number of instances to maintain
-  max: 5  # Maximum number of instances allowed
-```
+| `memory_limit` | string/number | No | Service-level memory limit (e.g., "512M", "1G") |
+| `resource_thresholds` | object | No | Scaling thresholds |
+| `network` | string | No | Custom network name |
+| `volumes` | object | No | Volume definitions |
+| `scaling_policy` | object | No | Scaling behavior configuration |
+| `codel` | object | No | CoDel-based autoscaling configuration |
 
 ### Resource Thresholds
 
+Control when scaling actions are triggered:
+
 ```yaml
 resource_thresholds:
-  cpu_percentage: 80         # CPU usage threshold (percentage)
-  cpu_percentage_relative: 90 # CPU usage relative to limit
-  memory_percentage: 85      # Memory usage threshold
-  metrics_strategy: max      # Strategy for pod metrics (max/average)
+  cpu_percentage: 80            # CPU usage threshold
+  cpu_percentage_relative: 90   # CPU usage relative to limit
+  memory_percentage: 85         # Memory usage threshold
+  metrics_strategy: max         # How to aggregate pod metrics (max/average)
 ```
 
-### Rolling Update Configuration
+### Advanced Scaling Configuration
+
+#### CoDel-based (Controlled Delay) Autoscaling
+
+See https://en.wikipedia.org/wiki/CoDel for more information.
+
+Adaptive scaling based on request latency:
 
 ```yaml
-rolling_update_config:
-  max_unavailable: 1    # Maximum pods that can be unavailable during update
-  max_surge: 1         # Maximum extra pods that can be created during update
-  timeout: 5m         # Timeout for update process
+codel:
+  target: 100ms                # Target latency threshold
+  interval: 1s                 # Check interval
+  consecutive_intervals: 3      # Intervals above target before scaling
+  max_scale_step: 1            # Max instances to add at once
+  scale_cooldown: 30s          # Time between scaling actions
+  overload_status_code: 503    # Response code when overloaded
+```
+
+#### Scaling Policy
+
+Fine-tune scaling behavior:
+
+```yaml
+scaling_policy:
+  cooldown_duration: 60s
+  scale_down_threshold_percentage: 50.0
 ```
 
 ### Container Configuration
 
-Each service defines one or more containers under the `spec.containers` field:
+Detailed container settings:
 
 ```yaml
 spec:
   containers:
     - name: app
-      image: nginx:latest
-      command: ["/bin/sh", "-c", "nginx"]
+      image: airpipeio/infoapp:latest
+      command: ["/app/server"]      # Optional command override
       ports:
-        - port: 80
-          target_port: 8080
-          node_port: 30080
-      memory_limit: "1Gi"
-      cpu_limit: "0.5"
-      network_limit:
+        - port: 80                  # Container port
+          target_port: 8080         # Optional host port mapping
+          node_port: 30080          # Optional external access port
+      memory_limit: "1G"            # Container-specific limit
+      cpu_limit: "0.5"             # Container-specific CPU limit
+      network_limit:                # Optional rate limiting
         ingress_rate: "10Mbps"
         egress_rate: "5Mbps"
-      volume_mounts:
+      health_check:                 # Health monitoring
+        tcp_check:
+          port: 80
+          timeout: 5s
+      volume_mounts:                # Optional volume mounts
         - name: config
-          mount_path: /etc/nginx/conf.d
+          mount_path: /etc/config
           read_only: true
-```
-
-#### Container Fields
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` | string | Container name (must be DNS label compatible) |
-| `image` | string | Container image to use |
-| `command` | array | Optional command override |
-| `ports` | array | Port configurations |
-| `volume_mounts` | array | Volume mount configurations |
-| `memory_limit` | string/number | Container-specific memory limit |
-| `cpu_limit` | string/number | Container-specific CPU limit |
-| `network_limit` | object | Network rate limiting configuration |
-
-### Port Configuration
-
-```yaml
-ports:
-  - port: 80          # Container port
-    target_port: 8080 # Host port mapping (optional)
-    node_port: 30080  # External access port (optional) (this enables the pingora proxy for the service)
-    protocol: TCP     # Protocol (TCP/UDP)
 ```
 
 ### Volume Configuration
 
+Different volume types:
+
 ```yaml
 volumes:
-  config:
+  config-files:                    # Inline files
     files:
-      "nginx.conf": |
-        server {
-          listen 80;
-          location / {
-            proxy_pass http://service-containername;
-          }
-        }
-    host_path: "/path/on/host"  # Optional host path mounting
-    permissions: "0644"         # Optional file permissions
-    named_volume:              # Optional named volume configuration
-      name: "nginx-config"
+      "config.json": |
+        {"key": "value"}
+  
+  persistent-data:                 # Named volume
+    named_volume:
+      name: "myapp-data"
       labels:
         environment: "prod"
+  
+  host-mount:                      # Host path mounting
+    host_path: "/path/on/host"
+    permissions: "0644"
 ```
 
-## Example Configurations
+### Rolling Updates
 
-### Simple Web Service
+Configure update behavior:
 
 ```yaml
-name: web-service
-instance_count:
-  min: 2
-  max: 5
-spec:
-  containers:
-    - name: mywebservice
-      image: airpipeio/infoapp:latest
-      ports:
-        - port: 80
-          node_port: 30080
+rolling_update_config:
+  max_unavailable: 1              # Max pods down during update
+  max_surge: 1                    # Max extra pods during update
+  timeout: 5m                     # Update timeout
 ```
 
-### Multi-Container Service with Resource Limits
+## Testing Your Configuration
 
-```yaml
-name: backend-service
-instance_count:
-  min: 1
-  max: 3
-memory_limit: "4Gi"
-cpu_limit: "2.0"
-resource_thresholds:
-  cpu_percentage: 80
-  memory_percentage: 85
-spec:
-  containers:
-    - name: app
-      image: my-app:latest
-      ports:
-        - port: 8080
-          node_port: 30088
-      memory_limit: "2Gi"
-      cpu_limit: "1.0"
-    - name: cache
-      image: redis:latest
-      ports:
-        - port: 6379
-      memory_limit: "1Gi"
-```
+The `airpipeio/infoapp:latest` image provides several endpoints for testing:
 
-### Service with Volume Mounts
+- `/` - Basic container info
+- `/sleep?duration=1000` - Simulate CPU load
+- `/?size=1048576` - Return large response (1MB)
+- `/tc?action=add&delay=50` - Add network delay (requires privileged mode)
 
-```yaml
-name: database
-instance_count:
-  min: 1
-  max: 1
-volumes:
-  data:
-    named_volume:
-      name: "db-data"
-      labels:
-        type: "persistent"
-spec:
-  containers:
-    - name: postgres
-      image: postgres:13
-      ports:
-        - port: 5432
-      volume_mounts:
-        - name: data
-          mount_path: /var/lib/postgresql/data
-```
+## Additional Examples
+
+For more complex configurations and real-world examples, check our [examples directory](examples/configs):

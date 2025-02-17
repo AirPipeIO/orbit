@@ -1,11 +1,11 @@
 // src/proxy.rs
-use crate::api::status::update_instance_store_cache;
-use crate::config::ServiceConfig;
-use crate::container::INSTANCE_STORE;
+use crate::config::{get_config_by_service, ServiceConfig};
+use crate::container::scaling::codel::get_service_metrics;
+use crate::container::scaling::scale_up;
+use crate::container::{INSTANCE_STORE, RUNTIME};
 use crate::metrics::{SERVICE_REQUEST_DURATION, SERVICE_REQUEST_TOTAL, TOTAL_REQUESTS};
 use async_trait::async_trait;
-use dashmap::DashMap;
-use dashmap::DashSet;
+use pingora::http::ResponseHeader;
 use pingora::lb::discovery::ServiceDiscovery;
 use pingora::lb::{Backend, Backends, LoadBalancer};
 use pingora::prelude::RoundRobin;
@@ -13,21 +13,30 @@ use pingora::proxy::{http_proxy_service, ProxyHttp, Session};
 use pingora::server::Server;
 use pingora::services::background::background_service;
 use pingora::upstreams::peer::HttpPeer;
-use pingora_http::ResponseHeader;
 use pingora_load_balancing::health_check;
+use rustc_hash::{FxHashMap, FxHashSet};
+use tokio::sync::RwLock;
+
 use std::collections::{BTreeSet, HashMap, HashSet};
+#[cfg(unix)]
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
-use tokio::task;
+use tokio::task::{self, JoinHandle};
 
-pub struct Discovery(Arc<DashSet<Backend>>);
+// Global OnceLock for storing server instances and backends
+pub static SERVER_TASKS: OnceLock<Arc<RwLock<FxHashMap<String, JoinHandle<()>>>>> = OnceLock::new();
+pub static SERVER_BACKENDS: OnceLock<
+    Arc<RwLock<FxHashMap<String, Arc<RwLock<FxHashSet<Backend>>>>>>,
+> = OnceLock::new();
+pub struct Discovery(Arc<RwLock<FxHashSet<Backend>>>);
 
 #[async_trait]
 impl ServiceDiscovery for Discovery {
     async fn discover(&self) -> pingora::Result<(BTreeSet<Backend>, HashMap<u64, bool>)> {
         let mut backends = BTreeSet::new();
-        for backend in self.0.iter() {
+        let backend_set = self.0.read().await;
+        for backend in backend_set.iter() {
             backends.insert(backend.clone());
         }
         Ok((backends, HashMap::new()))
@@ -48,43 +57,47 @@ impl ProxyHttp for ProxyApp {
         Instant::now()
     }
 
-    async fn upstream_peer(
-        &self,
-        _session: &mut Session,
-        _ctx: &mut Instant,
-    ) -> pingora::Result<Box<HttpPeer>> {
-        match self.loadbalancer.select(b"", 256) {
-            Some(upstream) => Ok(Box::new(HttpPeer::new(
-                upstream,
-                false,
-                "host.name".to_string(),
-            ))),
-            None => {
-                let error = pingora::Error {
-                    etype: pingora::ErrorType::CustomCode("no_upstream", 503),
-                    esource: pingora::ErrorSource::Unset,
-                    retry: pingora::RetryType::Decided(false),
-                    cause: None,
-                    context: Some(pingora::ImmutStr::Static("No upstream available")),
-                };
-                Err(Box::new(error))
-            }
-        }
-    }
-
     async fn response_filter(
         &self,
         _session: &mut Session,
         response: &mut ResponseHeader,
         ctx: &mut Instant,
     ) -> pingora::Result<()> {
-        // Get response status
+        let total_time = ctx.elapsed();
+        let service_name = self.service_name.split_once("__").unwrap().0;
+
+        // Get service configuration and check CoDel metrics here since we now have the complete request time
+        if let Some(config) = get_config_by_service(service_name).await {
+            if let Some(codel_config) = config.codel.clone() {
+                let metrics = get_service_metrics(service_name, &codel_config).await;
+                let mut metrics = metrics.lock().await;
+
+                // Record the total request time
+                metrics.record_sojourn(total_time);
+
+                // Check if we need to take action
+                if let Some(_action) = metrics.check_state() {
+                    // Spawn scaling as a background task
+                    let config_clone = config.clone();
+                    let service_name_clone = service_name.to_string();
+                    let runtime = RUNTIME.get().unwrap().clone();
+
+                    tokio::spawn(async move {
+                        if let Err(e) = scale_up(&service_name_clone, config_clone, runtime).await {
+                            slog::error!(slog_scope::logger(), "Failed to scale up service";
+                                "service" => service_name_clone,
+                                "error" => e.to_string()
+                            );
+                        }
+                    });
+                }
+            }
+        }
+
+        // Original metrics recording
         let status = response.status.as_u16().to_string();
+        let duration = total_time.as_secs_f64();
 
-        // Calculate request duration
-        let duration = ctx.elapsed().as_secs_f64();
-
-        // Update metrics
         if let Some(total_requests) = TOTAL_REQUESTS.get() {
             total_requests.inc();
         }
@@ -103,16 +116,72 @@ impl ProxyHttp for ProxyApp {
 
         Ok(())
     }
-}
 
-// Global OnceLock for storing server instances and backends
-pub static SERVER_TASKS: OnceLock<DashMap<String, task::JoinHandle<()>>> = OnceLock::new();
-pub static SERVER_BACKENDS: OnceLock<DashMap<String, Arc<DashSet<Backend>>>> = OnceLock::new();
+    async fn upstream_peer(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Instant,
+    ) -> pingora::Result<Box<HttpPeer>> {
+        let service_name = self.service_name.split_once("__").unwrap().0;
+
+        // Check if we should reject the request based on recent metrics
+        if let Some(config) = get_config_by_service(service_name).await {
+            if let Some(codel_config) = config.codel.clone() {
+                let metrics = get_service_metrics(service_name, &codel_config).await;
+                let metrics = metrics.lock().await;
+
+                if metrics.should_reject() {
+                    if let Some(status_code) = codel_config.overload_status_code {
+                        slog::debug!(slog_scope::logger(), "Rejecting request due to CoDel";
+                            "service" => service_name,
+                            "status_code" => status_code
+                        );
+
+                        let response = ResponseHeader::build(status_code, Some(0))?;
+                        session
+                            .write_response_header(Box::new(response), true)
+                            .await?;
+
+                        let error = pingora::Error {
+                            etype: pingora::ErrorType::CustomCode("overloaded", status_code),
+                            esource: pingora::ErrorSource::Unset,
+                            retry: pingora::RetryType::Decided(false),
+                            cause: None,
+                            context: Some(pingora::ImmutStr::Static("Service overloaded")),
+                        };
+                        return Err(Box::new(error));
+                    }
+                }
+            }
+        }
+
+        // Proceed with backend selection
+        match self.loadbalancer.select(b"", 256) {
+            Some(upstream) => Ok(Box::new(HttpPeer::new(
+                upstream,
+                false,
+                "host.name".to_string(),
+            ))),
+            None => {
+                let error = pingora::Error {
+                    etype: pingora::ErrorType::CustomCode("no_upstream", 503),
+                    esource: pingora::ErrorSource::Unset,
+                    retry: pingora::RetryType::Decided(false),
+                    cause: None,
+                    context: Some(pingora::ImmutStr::Static("No upstream available")),
+                };
+                Err(Box::new(error))
+            }
+        }
+    }
+}
 
 pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) {
     let log: slog::Logger = slog_scope::logger();
-    let server_tasks = SERVER_TASKS.get_or_init(DashMap::new);
-    let server_backends = SERVER_BACKENDS.get_or_init(DashMap::new);
+    let server_tasks = SERVER_TASKS.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+    let server_backends =
+        SERVER_BACKENDS.get_or_init(|| Arc::new(RwLock::new(FxHashMap::default())));
+    let instance_store = INSTANCE_STORE.get().unwrap();
 
     // Track only node_ports that need external access
     let mut service_ports = HashSet::new();
@@ -128,11 +197,20 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
 
     // Only create proxies for containers requesting external access
     for (node_port, _container_port) in service_ports {
-        let proxy_key = format!("{}_{}", service_name, node_port);
+        let proxy_key = format!("{}__{}", service_name, node_port);
+        let addr = format!("0.0.0.0:{}", node_port);
 
-        if let Some(backends) = server_backends.get(&proxy_key) {
-            if let Some(instances) = INSTANCE_STORE.get().unwrap().get(&service_name) {
-                for (_, metadata) in instances.value().iter() {
+        // Get read lock to check for existing backends
+        let backends = {
+            let backends_map = server_backends.read().await;
+            backends_map.get(&proxy_key).cloned()
+        };
+
+        if let Some(backends) = backends {
+            // Get read lock to access instance data
+            let store = instance_store.read().await;
+            if let Some(instances) = store.get(&service_name) {
+                for (_, metadata) in instances {
                     for container in &metadata.containers {
                         for port_info in &container.ports {
                             if let Some(container_node_port) = port_info.node_port {
@@ -140,8 +218,9 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
                                     let addr =
                                         format!("{}:{}", container.ip_address, port_info.port);
                                     if let Ok(backend) = Backend::new(&addr) {
-                                        backends.insert(backend);
-                                        slog::debug!(log, "Added backend";
+                                        let mut backend_set = backends.write().await;
+                                        backend_set.insert(backend);
+                                        slog::debug!(log, "Updated backend configuration";
                                             "service" => &service_name,
                                             "container" => &container.name,
                                             "ip" => &container.ip_address,
@@ -159,20 +238,27 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
             continue;
         }
 
-        // Initialize backends for this service-port
-        let backends = Arc::new(DashSet::new());
-        server_backends.insert(proxy_key.clone(), backends.clone());
-
-        // Add initial backends
-        if let Some(instances) = INSTANCE_STORE.get().unwrap().get(&service_name) {
-            for (_, metadata) in instances.value().iter() {
-                for container in &metadata.containers {
-                    for port_info in &container.ports {
-                        if let Some(container_node_port) = port_info.node_port {
-                            if container_node_port == node_port {
-                                let addr = format!("{}:{}", container.ip_address, port_info.port);
-                                if let Ok(backend) = Backend::new(&addr) {
-                                    backends.insert(backend);
+        // Initialize backends for this service-port with write lock
+        let backends = Arc::new(RwLock::new(FxHashSet::default()));
+        {
+            let mut backends_map = server_backends.write().await;
+            backends_map.insert(proxy_key.clone(), backends.clone());
+        }
+        // Add initial backends with read lock
+        {
+            let store = instance_store.read().await;
+            if let Some(instances) = store.get(&service_name) {
+                for (_, metadata) in instances {
+                    for container in &metadata.containers {
+                        for port_info in &container.ports {
+                            if let Some(container_node_port) = port_info.node_port {
+                                if container_node_port == node_port {
+                                    let addr =
+                                        format!("{}:{}", container.ip_address, port_info.port);
+                                    if let Ok(backend) = Backend::new(&addr) {
+                                        let mut backend_set = backends.write().await;
+                                        backend_set.insert(backend);
+                                    }
                                 }
                             }
                         }
@@ -197,7 +283,7 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
         };
 
         let mut router_service = http_proxy_service(&Server::new(None).unwrap().configuration, app);
-        router_service.add_tcp(&format!("0.0.0.0:{}", node_port));
+        router_service.add_tcp(&addr);
 
         let mut server = Server::new(None).expect("Failed to initialise Pingora server");
         server.bootstrap();
@@ -208,8 +294,10 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
             server.run_forever();
         });
 
-        server_tasks.insert(proxy_key.clone(), handle);
+        // Store server task with write lock
+        {
+            let mut tasks = server_tasks.write().await;
+            tasks.insert(proxy_key.clone(), handle);
+        }
     }
-
-    let _ = update_instance_store_cache();
 }

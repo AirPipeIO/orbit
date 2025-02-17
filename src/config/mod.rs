@@ -1,25 +1,27 @@
 // src/config/mod.rs
 pub mod utils;
 pub mod validate;
-
+use rustc_hash::FxHashMap;
 pub use utils::*;
 
+use crate::container::health::{HealthState, CONTAINER_HEALTH};
+use crate::container::scaling::manager::ScalingPolicy;
 use crate::container::volumes::VolumeData;
 use crate::container::{rolling_update, Container, IMAGE_CHECK_TASKS};
 use anyhow::{anyhow, Result};
-use dashmap::DashMap;
 use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, DebouncedEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
+use std::sync::Arc;
 use std::{
     collections::HashMap,
     path::PathBuf,
     sync::OnceLock,
     time::{Duration, SystemTime},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 use validate::{
     check_container_name_uniqueness, check_port_conflicts, check_service_name_uniqueness,
@@ -28,9 +30,8 @@ use validate::{
 use validator::Validate;
 
 use crate::{
-    api::status::update_instance_store_cache,
     container::{
-        self, clean_up, manage, remove_container_stats, scale::auto_scale, ContainerInfo,
+        self, clean_up, manage, remove_container_stats, scaling::auto_scale, ContainerInfo,
         ContainerMetadata, ContainerPortMetadata, ContainerStats, InstanceMetadata, INSTANCE_STORE,
         RUNTIME, SCALING_TASKS,
     },
@@ -88,6 +89,41 @@ pub struct InstanceCount {
     pub max: u8,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoDelConfig {
+    /// Target delay threshold in milliseconds
+    #[serde(with = "humantime_serde")]
+    pub target: Duration,
+
+    /// Interval for checking delays in milliseconds
+    #[serde(with = "humantime_serde")]
+    pub interval: Duration,
+
+    /// Number of consecutive intervals above target before scaling
+    #[serde(default = "default_consecutive_intervals")]
+    pub consecutive_intervals: u32,
+
+    /// Maximum instances to scale up at once
+    #[serde(default = "default_max_scale_step")]
+    pub max_scale_step: u32,
+
+    /// Minimum time between scaling actions
+    #[serde(with = "humantime_serde")]
+    pub scale_cooldown: Duration,
+
+    /// HTTP status code to return when overloaded
+    #[serde(default)]
+    pub overload_status_code: Option<u16>,
+}
+
+fn default_consecutive_intervals() -> u32 {
+    3
+}
+
+fn default_max_scale_step() -> u32 {
+    1
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Validate)]
 pub struct ServiceConfig {
     #[validate(length(max = 210))]
@@ -106,6 +142,10 @@ pub struct ServiceConfig {
     pub rolling_update_config: Option<RollingUpdateConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volumes: Option<HashMap<String, VolumeData>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codel: Option<CoDelConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scaling_policy: Option<ScalingPolicy>,
 }
 
 fn default_instance_count() -> bool {
@@ -200,7 +240,8 @@ pub fn aggregate_pod_stats(
     }
 }
 
-pub static CONFIG_STORE: OnceLock<DashMap<String, (PathBuf, ServiceConfig)>> = OnceLock::new();
+pub static CONFIG_STORE: OnceLock<Arc<RwLock<FxHashMap<String, (PathBuf, ServiceConfig)>>>> =
+    OnceLock::new();
 
 pub async fn watch_directory(config_dir: PathBuf) -> notify::Result<()> {
     let log: slog::Logger = slog_scope::logger();
@@ -265,11 +306,10 @@ async fn process_event(event: DebouncedEvent, config_dir: &PathBuf) {
 
                     let existing_service = match event.kind {
                         EventKind::Modify(_) => {
-                            if let Some(config) = get_config_by_path(&rel_config_path) {
-                                Some(config.name)
-                            } else {
-                                None
-                            }
+                            let store = config_store.read().await;
+                            store
+                                .get(&rel_config_path)
+                                .map(|(_, config)| config.name.clone())
                         }
                         _ => None,
                     };
@@ -283,16 +323,21 @@ async fn process_event(event: DebouncedEvent, config_dir: &PathBuf) {
                                 "path" => path.to_str()
                             );
 
-                            // Store config
-                            config_store
-                                .insert(rel_config_path, (path.to_path_buf(), config.clone()));
+                            // Store config with write lock
+                            {
+                                let mut store = config_store.write().await;
+                                store.insert(rel_config_path, (path.to_path_buf(), config.clone()));
+                            }
 
-                            // Stop existing scaling task if it exists
-                            if let Some((_, handle)) = scaling_tasks.remove(&service_name) {
-                                handle.abort();
-                                slog::debug!(slog_scope::logger(), "Aborted existing scaling task";
-                                    "service" => &service_name
-                                );
+                            // Stop existing scaling task if it exists using write lock
+                            {
+                                let mut tasks = scaling_tasks.write().await;
+                                if let Some(handle) = tasks.remove(&service_name) {
+                                    handle.abort();
+                                    slog::debug!(slog_scope::logger(), "Aborted existing scaling task";
+                                        "service" => &service_name
+                                    );
+                                }
                             }
 
                             // Start containers and proxy
@@ -306,7 +351,12 @@ async fn process_event(event: DebouncedEvent, config_dir: &PathBuf) {
                             let handle = tokio::spawn(async move {
                                 auto_scale(svc_name).await;
                             });
-                            scaling_tasks.insert(service_name.clone(), handle);
+
+                            // Store new task handle with write lock
+                            {
+                                let mut tasks = scaling_tasks.write().await;
+                                tasks.insert(service_name.clone(), handle);
+                            }
 
                             slog::info!(slog_scope::logger(), "Service initialization complete";
                                 "service" => &service_name
@@ -322,17 +372,32 @@ async fn process_event(event: DebouncedEvent, config_dir: &PathBuf) {
                 }
             }
             EventKind::Remove(_) => {
-                // Handle explicit removal events
-                if let Some((_, (_, config))) = config_store.remove(&path.display().to_string()) {
-                    let service_name = config.name.clone();
+                // Handle explicit removal events with read lock first
+                let config_to_remove = {
+                    let store = config_store.read().await;
+                    store
+                        .get(&path.display().to_string())
+                        .map(|(_, config)| config.name.clone())
+                };
+
+                if let Some(service_name) = config_to_remove {
+                    // Then use write lock to remove
+                    {
+                        let mut store = config_store.write().await;
+                        store.remove(&path.display().to_string());
+                    }
+
                     slog::info!(slog_scope::logger(), "Config file removed, cleaning up service";
                         "service" => &service_name,
                         "path" => path.to_str()
                     );
 
-                    // Stop scaling task
-                    if let Some((_, handle)) = scaling_tasks.remove(&service_name) {
-                        handle.abort();
+                    // Stop scaling task with write lock
+                    {
+                        let mut tasks = scaling_tasks.write().await;
+                        if let Some(handle) = tasks.remove(&service_name) {
+                            handle.abort();
+                        }
                     }
 
                     tokio::spawn(async move {
@@ -350,36 +415,42 @@ async fn process_event(event: DebouncedEvent, config_dir: &PathBuf) {
     }
 
     // After processing the event, verify all tracked configs still exist
-    let services_to_cleanup: Vec<_> = config_store
-        .iter()
-        .filter_map(|entry| {
-            let path = &entry.value().0;
-            let config = &entry.value().1;
-
-            if !path.exists()
-                || !matches!(
-                    path.extension().and_then(|e| e.to_str()),
-                    Some("yml") | Some("yaml")
-                )
-            {
-                Some((path.clone(), config.name.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
-
+    let services_to_cleanup = {
+        let store = config_store.read().await;
+        store
+            .iter()
+            .filter_map(|(_path_str, (path, config))| {
+                if !path.exists()
+                    || !matches!(
+                        path.extension().and_then(|e| e.to_str()),
+                        Some("yml") | Some("yaml")
+                    )
+                {
+                    Some((path.clone(), config.name.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
     for (path, service_name) in services_to_cleanup {
         slog::info!(slog_scope::logger(), "Config file no longer valid, cleaning up service";
             "service" => &service_name,
             "path" => path.to_str()
         );
 
-        config_store.remove(&path.display().to_string());
+        // Remove from config store with write lock
+        {
+            let mut store = config_store.write().await;
+            store.remove(&path.display().to_string());
+        }
 
-        // Stop scaling task
-        if let Some((_, handle)) = scaling_tasks.remove(&service_name) {
-            handle.abort();
+        // Stop scaling task with write lock
+        {
+            let mut tasks = scaling_tasks.write().await;
+            if let Some(handle) = tasks.remove(&service_name) {
+                handle.abort();
+            }
         }
 
         let service_name_clone = service_name.clone();
@@ -409,7 +480,7 @@ pub async fn read_yaml_config(
         validate_service_name(&config.name)?;
 
         // Check for duplicate service names (no exclusion for new configs)
-        check_service_name_uniqueness(&config, exclude_service)?;
+        check_service_name_uniqueness(&config, exclude_service).await?;
 
         // Check for duplicate container names
         check_container_name_uniqueness(&config)?;
@@ -418,7 +489,7 @@ pub async fn read_yaml_config(
         validate_service_ports(&config)?;
 
         // Check for conflicts with other services
-        check_port_conflicts(&config, None)?;
+        check_port_conflicts(&config, None).await?;
 
         // Debug log the parsed thresholds
         if let Some(thresholds) = &config.resource_thresholds {
@@ -437,6 +508,10 @@ pub async fn read_yaml_config(
 
 pub async fn initialize_configs(config_dir: &PathBuf) -> Result<()> {
     let config_store = CONFIG_STORE.get().unwrap();
+    let scaling_tasks = SCALING_TASKS.get().expect("Scaling tasks not initialized");
+    let image_check_tasks = IMAGE_CHECK_TASKS
+        .get()
+        .expect("Image check tasks not initialized");
     let log = slog_scope::logger();
 
     for entry in fs::read_dir(config_dir)? {
@@ -453,27 +528,33 @@ pub async fn initialize_configs(config_dir: &PathBuf) -> Result<()> {
                         "path" => path.display().to_string()
                     );
 
-                    config_store.insert(path.display().to_string(), (path.clone(), config.clone()));
+                    // Insert with write lock
+                    {
+                        let mut store = config_store.write().await;
+                        store.insert(path.display().to_string(), (path.clone(), config.clone()));
+                    }
+
                     // Handle orphaned containers based on the adopt_orphans flag
                     handle_orphans(&config).await?;
 
                     container::manage(&config.name, config.clone()).await;
                     proxy::run_proxy_for_service(config.name.to_string(), config.clone()).await;
 
-                    // Start auto-scaling task
                     let service_name: String = config.name.clone();
 
+                    // Start auto-scaling task
+                    // Update scaling task creation:
+                    let service_name_clone = service_name.clone();
                     let handle = tokio::spawn(async move {
-                        auto_scale(service_name.clone()).await;
+                        auto_scale(service_name_clone).await;
                     });
 
-                    // Store the task handle
-                    SCALING_TASKS
-                        .get()
-                        .unwrap()
-                        .insert(config.name.clone(), handle);
+                    // Store the task handle with write lock
+                    {
+                        let mut tasks = scaling_tasks.write().await;
+                        tasks.insert(service_name.clone(), handle);
+                    }
 
-                    let service_name: String = config.name.clone();
                     let svc_name: String = config.name.clone();
 
                     let handle = tokio::spawn(async move {
@@ -486,10 +567,12 @@ pub async fn initialize_configs(config_dir: &PathBuf) -> Result<()> {
                             );
                         }
                     });
-                    IMAGE_CHECK_TASKS
-                        .get()
-                        .unwrap()
-                        .insert(svc_name.clone(), handle);
+
+                    // Store the task handle with write lock
+                    {
+                        let mut tasks = image_check_tasks.write().await;
+                        tasks.insert(svc_name.clone(), handle);
+                    }
                 }
                 Err(e) => {
                     slog::error!(log, "Failed to load config";
@@ -516,7 +599,10 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
     }
 
     let orphan_count = orphaned_containers.len();
-    slog::info!(log, "Found orphaned containers"; "service" => service_name, "count" => orphan_count);
+    slog::info!(log, "Found orphaned containers";
+        "service" => service_name,
+        "count" => orphan_count
+    );
 
     if config.adopt_orphans {
         let mut pod_containers: HashMap<Uuid, Vec<ContainerInfo>> = HashMap::new();
@@ -568,58 +654,19 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
             pod_containers.remove(&uuid);
         }
 
-        let mut instances = instance_store.entry(service_name.to_string()).or_default();
-        let mut adopted_count = 0;
+        // Update instance store with write lock
+        {
+            let mut store = instance_store.write().await;
+            let instances = store
+                .entry(service_name.to_string())
+                .or_insert_with(FxHashMap::default);
 
-        for (uuid, containers) in &pod_containers {
-            let network_name = format!("{}__{}", service_name, uuid);
-            let mut pod_metadata = Vec::new();
+            let mut adopted_count = 0;
 
-            for container in containers {
-                if let Ok(parts) = parse_container_name(&container.name) {
-                    if let Some(container_config) = config
-                        .spec
-                        .containers
-                        .iter()
-                        .find(|c| c.name == parts.container_name)
-                    {
-                        if let Some(port_configs) = &container_config.ports {
-                            if let Ok(container_data) =
-                                runtime.inspect_container(&container.name).await
-                            {
-                                let port_metadata: Vec<ContainerPortMetadata> = port_configs
-                                    .iter()
-                                    .map(|p| ContainerPortMetadata {
-                                        port: p.port,
-                                        target_port: p.target_port,
-                                        node_port: p.node_port,
-                                    })
-                                    .collect();
+            for (uuid, containers) in &pod_containers {
+                let network_name = format!("{}__{}", service_name, uuid);
+                let mut pod_metadata = Vec::new();
 
-                                pod_metadata.push(ContainerMetadata {
-                                    name: container.name.clone(),
-                                    network: network_name.clone(),
-                                    ip_address: container_data.ip_address,
-                                    ports: port_metadata,
-                                    status: "adopted".to_string(),
-                                });
-                                adopted_count += 1;
-                            } else {
-                                slog::error!(log, "Failed to inspect container";
-                                    "service" => service_name,
-                                    "container" => &container.name,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            if !pod_metadata.is_empty() {
-                let now = SystemTime::now();
-                let mut image_hashes = HashMap::new();
-
-                // Try to get image hashes for existing containers
                 for container in containers {
                     if let Ok(parts) = parse_container_name(&container.name) {
                         if let Some(container_config) = config
@@ -628,40 +675,86 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
                             .iter()
                             .find(|c| c.name == parts.container_name)
                         {
-                            if let Ok(hash) =
-                                runtime.get_image_digest(&container_config.image).await
-                            {
-                                image_hashes.insert(container_config.name.clone(), hash);
+                            if let Some(port_configs) = &container_config.ports {
+                                if let Ok(container_data) =
+                                    runtime.inspect_container(&container.name).await
+                                {
+                                    let port_metadata: Vec<ContainerPortMetadata> = port_configs
+                                        .iter()
+                                        .map(|p| ContainerPortMetadata {
+                                            port: p.port,
+                                            target_port: p.target_port,
+                                            node_port: p.node_port,
+                                        })
+                                        .collect();
+
+                                    pod_metadata.push(ContainerMetadata {
+                                        name: container.name.clone(),
+                                        network: network_name.clone(),
+                                        ip_address: container_data.ip_address,
+                                        ports: port_metadata,
+                                        status: "adopted".to_string(),
+                                    });
+                                    adopted_count += 1;
+                                } else {
+                                    slog::error!(log, "Failed to inspect container";
+                                        "service" => service_name,
+                                        "container" => &container.name,
+                                    );
+                                }
                             }
                         }
                     }
                 }
 
-                instances.insert(
-                    *uuid,
-                    InstanceMetadata {
-                        uuid: *uuid,
-                        created_at: now,
-                        network: network_name,
-                        image_hash: image_hashes,
-                        containers: pod_metadata,
-                    },
-                );
-            }
-        }
+                if !pod_metadata.is_empty() {
+                    let now = SystemTime::now();
+                    let mut image_hashes = HashMap::new();
 
-        slog::info!(log, "Adopted orphaned containers";
-            "service" => service_name,
-            "adopted_pods" => pod_containers.len(),
-            "adopted_containers" => adopted_count.to_string()
-        );
+                    // Try to get image hashes for existing containers
+                    for container in containers {
+                        if let Ok(parts) = parse_container_name(&container.name) {
+                            if let Some(container_config) = config
+                                .spec
+                                .containers
+                                .iter()
+                                .find(|c| c.name == parts.container_name)
+                            {
+                                if let Ok(hash) =
+                                    runtime.get_image_digest(&container_config.image).await
+                                {
+                                    image_hashes.insert(container_config.name.clone(), hash);
+                                }
+                            }
+                        }
+                    }
+
+                    instances.insert(
+                        *uuid,
+                        InstanceMetadata {
+                            uuid: *uuid,
+                            created_at: now,
+                            network: network_name,
+                            image_hash: image_hashes,
+                            containers: pod_metadata,
+                        },
+                    );
+                }
+            }
+
+            slog::info!(log, "Adopted orphaned containers";
+                "service" => service_name,
+                "adopted_pods" => pod_containers.len(),
+                "adopted_containers" => adopted_count.to_string()
+            );
+        }
     } else {
         // Group containers by their network
         let mut network_containers: HashMap<String, Vec<String>> = HashMap::new();
 
         for container in &orphaned_containers {
             if let Ok(parts) = parse_container_name(&container.name) {
-                let network_name = format!("{}_{}", service_name, parts.uuid);
+                let network_name = format!("{}__{}", service_name, parts.uuid);
                 network_containers
                     .entry(network_name)
                     .or_default()
@@ -721,53 +814,110 @@ pub async fn stop_service(service_name: &str) {
     let server_backends = SERVER_BACKENDS.get().unwrap();
 
     // Stop the scaling task
-    // Stop both the scaling task and image checker
-    for task_name in [service_name, &format!("{}_updater", service_name)] {
-        if let Some((_, handle)) = scaling_tasks.remove(task_name) {
+    // Stop both the scaling task and image checker with write lock
+    {
+        let mut tasks = scaling_tasks.write().await;
+        // Stop main scaling task
+        if let Some(handle) = tasks.remove(service_name) {
             handle.abort();
-            slog::debug!(log, "Task aborted";
-                "service" => service_name,
-                "task" => task_name
+            slog::debug!(log, "Scaling task aborted";
+                "service" => service_name
+            );
+        }
+        // Stop updater task if it exists
+        let updater_key = format!("{}_updater", service_name);
+        if let Some(handle) = tasks.remove(&updater_key) {
+            handle.abort();
+            slog::debug!(log, "Updater task aborted";
+                "service" => service_name
             );
         }
     }
 
-    // Stop the image check task
-    if let Some((_, handle)) = IMAGE_CHECK_TASKS.get().unwrap().remove(service_name) {
-        handle.abort();
-        slog::debug!(log, "Image check task aborted"; "service" => service_name);
+    // Stop the image check task with write lock
+    {
+        let image_check_tasks = IMAGE_CHECK_TASKS
+            .get()
+            .expect("Image check tasks not initialized");
+        let mut tasks = image_check_tasks.write().await;
+        if let Some(handle) = tasks.remove(service_name) {
+            handle.abort();
+            slog::debug!(log, "Image check task aborted";
+                "service" => service_name
+            );
+        }
     }
 
     // Remove from load balancer
-    server_backends.remove(service_name);
+    {
+        let mut backends_map = server_backends.write().await;
+        backends_map.remove(service_name);
+    }
 
-    // Clean up instance store and stop containers
-    if let Some((_, instances)) = instance_store.remove(service_name) {
-        for (uuid, _metadata) in instances {
+    // Get instance data and remove from store with write lock
+    let instances = {
+        let mut store = instance_store.write().await;
+        store.remove(service_name)
+    };
+
+    // Clean up instances if they exist
+    if let Some(instances) = instances {
+        for (uuid, metadata) in instances {
             let container_name = format!("{}__{}", service_name, uuid);
             let runtime = RUNTIME.get().unwrap().clone();
 
             // Remove container stats
-            remove_container_stats(service_name, &container_name);
+            remove_container_stats(service_name, &container_name).await;
 
-            // Stop the container
-            if let Err(e) = runtime.stop_container(&container_name).await {
-                slog::error!(log, "Failed to stop container during service cleanup";
+            // Handle health status
+            if let Some(health_store) = CONTAINER_HEALTH.get() {
+                let mut health_map = health_store.write().await;
+                // Clone containers to avoid ownership issues
+                let containers = metadata.containers.clone();
+                for container in containers {
+                    if let Some(status) = health_map.get_mut(&container.name) {
+                        status.transition_to(
+                            HealthState::Failed,
+                            Some("Container being removed".to_string()),
+                        );
+                    }
+                    health_map.remove(&container.name);
+                    slog::debug!(log, "Removed health monitoring";
+                        "service" => service_name,
+                        "container" => &container.name
+                    );
+                }
+            }
+
+            // Stop each container in the metadata
+            for container in &metadata.containers {
+                if let Err(e) = runtime.stop_container(&container.name).await {
+                    slog::error!(log, "Failed to stop container during service cleanup";
+                        "service" => service_name,
+                        "container" => &container.name,
+                        "error" => e.to_string()
+                    );
+                } else {
+                    slog::debug!(log, "Container stopped successfully";
+                        "service" => service_name,
+                        "container" => &container.name
+                    );
+                }
+            }
+
+            // Clean up network
+            if let Err(e) = runtime
+                .remove_pod_network(&metadata.network, service_name)
+                .await
+            {
+                slog::error!(log, "Failed to remove network";
                     "service" => service_name,
-                    "container" => &container_name,
+                    "network" => &metadata.network,
                     "error" => e.to_string()
-                );
-            } else {
-                slog::debug!(log, "Container stopped successfully";
-                    "service" => service_name,
-                    "container" => &container_name
                 );
             }
         }
     }
-
-    // Update instance store cache
-    let _ = update_instance_store_cache();
 
     slog::info!(log, "Service stopped and cleaned up"; "service" => service_name);
 }
@@ -815,10 +965,9 @@ pub fn parse_cpu_limit(cpu_limit: &serde_json::Value) -> Result<u64> {
     }
 }
 
-// In config.rs, modify handle_config_update
-
 pub async fn handle_config_update(service_name: &str, config: ServiceConfig) -> Result<()> {
     let log = slog_scope::logger();
+    let scaling_tasks = SCALING_TASKS.get().unwrap();
 
     // Validate service name format
     validate_service_name(&config.name)?;
@@ -830,21 +979,22 @@ pub async fn handle_config_update(service_name: &str, config: ServiceConfig) -> 
     validate_service_ports(&config)?;
 
     // Check for conflicts with other services
-    check_port_conflicts(&config, None)?;
+    check_port_conflicts(&config, None).await?;
 
     // Only check for service name uniqueness if it's different from the current name
     if service_name != config.name {
-        check_service_name_uniqueness(&config, Some(service_name))?;
+        check_service_name_uniqueness(&config, Some(service_name)).await?;
     }
-
-    let scaling_tasks = SCALING_TASKS.get().unwrap();
 
     slog::debug!(log, "Starting config update process";
         "service" => service_name,
         "thresholds" => format!("{:?}", config.resource_thresholds));
 
     // Check if this is a new service (no existing scaling task)
-    let is_new_service = !scaling_tasks.contains_key(service_name);
+    let is_new_service = {
+        let tasks = scaling_tasks.read().await;
+        !tasks.contains_key(service_name)
+    };
 
     if is_new_service {
         slog::info!(log, "Detected new service, initializing scaling task";
@@ -856,7 +1006,12 @@ pub async fn handle_config_update(service_name: &str, config: ServiceConfig) -> 
         let handle = tokio::spawn(async move {
             auto_scale(service_name_clone).await;
         });
-        scaling_tasks.insert(service_name.to_string(), handle);
+
+        // Store new task handle with write lock
+        {
+            let mut tasks = scaling_tasks.write().await;
+            tasks.insert(service_name.to_string(), handle);
+        }
     } else {
         // Existing service - send pause signal
         if let Some(sender) = CONFIG_UPDATES.get() {
@@ -869,9 +1024,11 @@ pub async fn handle_config_update(service_name: &str, config: ServiceConfig) -> 
 
     // Update config in store
     if let Some(config_store) = CONFIG_STORE.get() {
-        for mut entry in config_store.iter_mut() {
-            if entry.value().1.name == service_name {
-                entry.value_mut().1 = config.clone();
+        let mut store = config_store.write().await;
+        // Iterate through FxHashMap and update the matching config
+        for (_path, (_file_path, existing_config)) in store.iter_mut() {
+            if existing_config.name == service_name {
+                *existing_config = config.clone();
                 break;
             }
         }

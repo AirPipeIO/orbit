@@ -1,98 +1,37 @@
 // src/api/status.rs
-use std::{
-    collections::HashMap,
-    sync::{Arc, OnceLock},
-    time::Duration,
-};
 
 use crate::{
     config::get_config_by_service,
-    container::{self, InstanceMetadata, INSTANCE_STORE},
+    container::{
+        health::{self, ContainerHealthState},
+        INSTANCE_STORE, SERVICE_STATS,
+    },
     proxy::SERVER_BACKENDS,
 };
-use anyhow::Result;
 use axum::Json;
-use dashmap::DashMap;
 use serde::Serialize;
-use tokio::time::timeout;
 use uuid::Uuid;
 
-#[derive(Debug, Serialize)]
-pub struct ContainerInfo {
-    uuid: Uuid,
-    exposed_port: u16,
-    status: String,
-    cpu_percentage: Option<f64>,
-    cpu_percentage_relative: Option<f64>,
-    memory_usage: Option<u64>,
-    memory_limit: Option<u64>,
+#[derive(Serialize)]
+pub struct ServiceUrl {
+    pub url: String,
+    pub node_port: u16,
 }
 
-// Global cache for instance store data
-pub static INSTANCE_STORE_CACHE: OnceLock<Arc<DashMap<String, HashMap<Uuid, InstanceMetadata>>>> =
-    OnceLock::new();
-
-pub fn update_instance_store_cache() -> Result<()> {
-    let instance_store = INSTANCE_STORE
-        .get()
-        .expect("Instance store not initialised");
-
-    // Create new DashMap
-    let new_cache = Arc::new(DashMap::new());
-
-    // Fill new cache
-    for entry in instance_store.iter() {
-        new_cache.insert(entry.key().clone(), entry.value().clone());
-    }
-
-    // Replace old cache with new one atomically
-    INSTANCE_STORE_CACHE.get_or_init(|| new_cache);
-
-    Ok(())
-}
-
-pub fn initialize_background_cache_update() {
-    let log = slog_scope::logger();
-
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(15));
-        loop {
-            interval.tick().await;
-            if let Err(e) = update_cache_with_timeout().await {
-                slog::warn!(log, "Cache update failed"; "error" => e.to_string());
-            }
-        }
-    });
-}
-
-// Replace the existing update_instance_store_cache with this version
-async fn update_cache_with_timeout() -> Result<()> {
-    // Add timeout to prevent blocking
-    timeout(Duration::from_secs(5), async {
-        let instance_store = INSTANCE_STORE
-            .get()
-            .expect("Instance store not initialised");
-        let instance_cache = INSTANCE_STORE_CACHE.get_or_init(|| Arc::new(DashMap::new()));
-
-        // Clear existing instance cache
-        instance_cache.clear();
-
-        // Update instance cache in batches
-        for entry in instance_store.iter() {
-            instance_cache.insert(entry.key().clone(), entry.value().clone());
-            tokio::task::yield_now().await; // Allow other tasks to run
-        }
-    })
-    .await?;
-
-    Ok(())
+#[derive(Serialize)]
+pub struct ContainerUrl {
+    pub url: String,
+    pub port: u16,
+    pub target_url: Option<String>,
+    pub target_port: Option<u16>,
 }
 
 #[derive(Serialize)]
 pub struct ServiceStatus {
-    service_name: String,
-    service_ports: Vec<u16>,
-    pods: Vec<PodStatus>,
+    pub service_name: String,
+    pub service_ports: Vec<u16>,
+    pub service_urls: Vec<ServiceUrl>, // Add this field
+    pub pods: Vec<PodStatus>,
 }
 
 #[derive(Serialize)]
@@ -111,9 +50,22 @@ pub struct PodStatus {
 
 #[derive(Serialize)]
 pub struct ContainerStatus {
-    name: String,
-    ip_address: String,
-    ports: Vec<PortStatus>,
+    pub name: String,
+    pub ip_address: String,
+    pub ports: Vec<PortStatus>,
+    pub status: String,
+    pub cpu_percentage: Option<f64>,
+    pub cpu_percentage_relative: Option<f64>,
+    pub memory_usage: Option<u64>,
+    pub memory_limit: Option<u64>,
+    pub urls: Vec<ContainerUrl>,
+    pub health_status: Option<ContainerHealthState>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContainerInfo {
+    uuid: Uuid,
+    exposed_port: u16,
     status: String,
     cpu_percentage: Option<f64>,
     cpu_percentage_relative: Option<f64>,
@@ -122,149 +74,185 @@ pub struct ContainerStatus {
 }
 
 pub async fn get_status() -> Json<Vec<ServiceStatus>> {
-    let instance_cache = INSTANCE_STORE_CACHE
+    let instance_store = INSTANCE_STORE
         .get()
-        .expect("Instance cache not initialized");
+        .expect("Instance store not initialized");
     let server_backends = SERVER_BACKENDS
         .get()
         .expect("Server backends not initialized");
-    let service_stats = container::SERVICE_STATS
-        .get()
-        .expect("Service stats not initialized");
+    let service_stats = SERVICE_STATS.get().expect("Service stats not initialized");
 
     let mut services = Vec::new();
 
-    for entry in instance_cache.iter() {
-        let service_name = entry.key();
-        let instances = entry.value();
+    // Get read lock for instance store
+    let store_map = instance_store.read().await;
+    // Get read lock for service stats once
+    let service_stats_read = service_stats.read().await;
+    let backends_map = server_backends.read().await;
 
-        let service_config = get_config_by_service(service_name);
+    for (service_name, instances) in store_map.iter() {
+        let service_config = get_config_by_service(service_name).await;
 
         if let Some(config) = service_config {
-            let service_stat = service_stats.get(service_name);
+            // Get service stats if available, using the existing read lock
+            let service_stat = service_stats_read.get(service_name);
 
-            // Collect all service ports
-            let service_ports = config
-                .spec
-                .containers
-                .iter()
-                .flat_map(|c| c.ports.iter().flatten())
-                .map(|p| p.port)
-                .collect::<Vec<_>>();
+            // Collect all service ports and URLs
+            let mut service_ports = Vec::new();
+            let mut service_urls = Vec::new();
 
-            let pods: Vec<PodStatus> = instances
-                .iter()
-                .map(|(uuid, metadata)| {
-                    let containers = metadata
-                        .containers
-                        .iter()
-                        .map(|container| {
-                            let container_stats = service_stat
-                                .as_ref()
-                                .and_then(|s| s.get_container_stats(&container.name));
+            for container in &config.spec.containers {
+                if let Some(ports) = &container.ports {
+                    for port_config in ports {
+                        service_ports.push(port_config.port);
 
-                            let ports = container
-                                .ports
-                                .iter()
-                                .map(|port_info| {
-                                    let container_addr =
-                                        format!("{}:{}", container.ip_address, port_info.port);
-                                    let healthy = match port_info.node_port {
-                                        Some(node_port) => {
-                                            // Check load balancer registration for node_port
-                                            let proxy_key =
-                                                format!("{}_{}", service_name, node_port);
-                                            server_backends.iter().any(|backend_entry| {
-                                                backend_entry.key() == &proxy_key
-                                                    && backend_entry.value().iter().any(|backend| {
-                                                        backend.addr.to_string() == container_addr
-                                                    })
-                                            })
-                                        }
-                                        None => {
-                                            // For target_port, check if IP and port are valid
-                                            !container_addr.is_empty()
-                                                && container.ip_address != "0.0.0.0"
-                                                && port_info.target_port.is_some()
-                                        }
-                                    };
-
-                                    PortStatus {
-                                        port: port_info.port,
-                                        target_port: port_info.target_port,
-                                        node_port: port_info.node_port,
-                                        healthy,
-                                    }
-                                })
-                                .collect();
-                            ContainerStatus {
-                                name: container.name.clone(),
-                                ip_address: container.ip_address.clone(),
-                                ports,
-                                status: {
-                                    let has_node_port =
-                                        container.ports.iter().any(|p| p.node_port.is_some());
-                                    if has_node_port {
-                                        // For containers with node_ports, check if registered with load balancer
-                                        if container.ports.iter().any(|port_info| {
-                                            let addr = format!(
-                                                "{}:{}",
-                                                container.ip_address, port_info.port
-                                            );
-                                            if let Some(node_port) = port_info.node_port {
-                                                let proxy_key =
-                                                    format!("{}_{}", service_name, node_port);
-                                                server_backends
-                                                    .get(&proxy_key)
-                                                    .map(|backends| {
-                                                        backends.iter().any(|backend| {
-                                                            backend.addr.to_string() == addr
-                                                        })
-                                                    })
-                                                    .unwrap_or(false)
-                                            } else {
-                                                false
-                                            }
-                                        }) {
-                                            "running".to_string()
-                                        } else {
-                                            "stopped".to_string()
-                                        }
-                                    } else {
-                                        // For containers without node_ports, consider running if they have valid ports
-                                        if container.ports.is_empty()
-                                            || container.ip_address.is_empty()
-                                        {
-                                            "stopped".to_string()
-                                        } else {
-                                            "running".to_string()
-                                        }
-                                    }
-                                },
-                                cpu_percentage: container_stats.as_ref().map(|s| s.cpu_percentage),
-                                cpu_percentage_relative: container_stats
-                                    .as_ref()
-                                    .map(|s| s.cpu_percentage_relative),
-                                memory_usage: container_stats.as_ref().map(|s| s.memory_usage),
-                                memory_limit: container_stats.as_ref().map(|s| s.memory_limit),
-                            }
-                        })
-                        .collect();
-
-                    PodStatus {
-                        uuid: *uuid,
-                        containers,
+                        // Add service URLs for node ports
+                        if let Some(node_port) = port_config.node_port {
+                            service_urls.push(ServiceUrl {
+                                url: format!("http://localhost:{}", node_port),
+                                node_port,
+                            });
+                        }
                     }
-                })
-                .collect();
+                }
+            }
+
+            let pods = futures::future::join_all(instances.iter().map(|(uuid, metadata)| async {
+                let containers =
+                    futures::future::join_all(metadata.containers.iter().map(|container| async {
+                        // Use service_stat from the outer scope, which is using the existing read lock
+                        let container_stats =
+                            service_stat.and_then(|s| s.get_container_stats(&container.name));
+
+                        let mut urls = Vec::new();
+                        for port_info in &container.ports {
+                            let mut container_url = ContainerUrl {
+                                url: format!("http://{}:{}", container.ip_address, port_info.port),
+                                port: port_info.port,
+                                target_url: None,
+                                target_port: None,
+                            };
+
+                            if let Some(target_port) = port_info.target_port {
+                                container_url.target_url = Some(format!(
+                                    "http://{}:{}",
+                                    container.ip_address, target_port
+                                ));
+                                container_url.target_port = Some(target_port);
+                            }
+
+                            urls.push(container_url);
+                        }
+
+                        let ports = futures::future::join_all(container.ports.iter().map(
+                            |port_info| async {
+                                let container_addr =
+                                    format!("{}:{}", container.ip_address, port_info.port);
+                                let healthy = match port_info.node_port {
+                                    Some(node_port) => {
+                                        let proxy_key = format!("{}__{}", service_name, node_port);
+                                        if let Some(backends) = backends_map.get(&proxy_key) {
+                                            let backend_set = backends.read().await;
+                                            // Check if container_addr matches any backend addr
+                                            backend_set.iter().any(|backend| {
+                                                backend.addr.to_string() == container_addr
+                                            })
+                                        } else {
+                                            false
+                                        }
+                                    }
+                                    None => {
+                                        !container_addr.is_empty()
+                                            && container.ip_address != "0.0.0.0"
+                                            && port_info.target_port.is_some()
+                                    }
+                                };
+
+                                PortStatus {
+                                    port: port_info.port,
+                                    target_port: port_info.target_port,
+                                    node_port: port_info.node_port,
+                                    healthy,
+                                }
+                            },
+                        ))
+                        .await;
+
+                        let health_status = health::get_container_health(&container.name).await;
+
+                        ContainerStatus {
+                            urls,
+                            health_status,
+                            name: container.name.clone(),
+                            ip_address: container.ip_address.clone(),
+                            ports,
+                            status: {
+                                let has_node_port =
+                                    container.ports.iter().any(|p| p.node_port.is_some());
+                                if has_node_port {
+                                    let mut running = false;
+                                    for port_info in &container.ports {
+                                        let addr =
+                                            format!("{}:{}", container.ip_address, port_info.port);
+                                        if let Some(node_port) = port_info.node_port {
+                                            let proxy_key =
+                                                format!("{}__{}", service_name, node_port);
+                                            if let Some(backends) = backends_map.get(&proxy_key) {
+                                                let backend_set = backends.read().await;
+                                                if backend_set
+                                                    .iter()
+                                                    .any(|backend| backend.addr.to_string() == addr)
+                                                {
+                                                    running = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if running {
+                                        "running".to_string()
+                                    } else {
+                                        "stopped".to_string()
+                                    }
+                                } else {
+                                    if container.ports.is_empty() || container.ip_address.is_empty()
+                                    {
+                                        "stopped".to_string()
+                                    } else {
+                                        "running".to_string()
+                                    }
+                                }
+                            },
+                            cpu_percentage: container_stats.as_ref().map(|s| s.cpu_percentage),
+                            cpu_percentage_relative: container_stats
+                                .as_ref()
+                                .map(|s| s.cpu_percentage_relative),
+                            memory_usage: container_stats.as_ref().map(|s| s.memory_usage),
+                            memory_limit: container_stats.as_ref().map(|s| s.memory_limit),
+                        }
+                    }))
+                    .await;
+
+                PodStatus {
+                    uuid: *uuid,
+                    containers,
+                }
+            }))
+            .await;
 
             services.push(ServiceStatus {
                 service_name: service_name.clone(),
                 service_ports,
+                service_urls,
                 pods,
             });
         }
     }
+
+    // Drop read locks explicitly
+    drop(backends_map);
+    drop(service_stats_read);
+    drop(store_map);
 
     Json(services)
 }

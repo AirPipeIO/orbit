@@ -1,0 +1,30 @@
+name: resource-demo
+# Global limits applied to all containers
+cpu_limit: 0.5                    # Half a CPU core
+memory_limit: 256M                # 256MB memory
+
+# Thresholds that trigger scaling
+resource_thresholds:
+  cpu_percentage: 80              # Scale up if CPU > 80%
+  cpu_percentage_relative: 90     # Scale up if using 90% of CPU limit
+  memory_percentage: 85           # Scale up if memory > 85%
+  metrics_strategy: max           # Use maximum value across containers
+
+instance_count:
+  min: 2
+  max: 10
+
+spec:
+  containers:
+    - name: main
+      image: airpipeio/infoapp:latest
+      # Container-specific limits override global
+      cpu_limit: 0.2              # 20% of a CPU core
+      memory_limit: 128M          # 128MB memory
+      # Network rate limiting
+      network_limit:
+        ingress_rate: "10Mbps"    # Incoming traffic limit
+        egress_rate: "5Mbps"      # Outgoing traffic limit
+      ports:
+        - port: 80
+          node_port: 4334
