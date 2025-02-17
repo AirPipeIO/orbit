@@ -23,9 +23,22 @@ Orbit is a simple, lightweight solution for scaling containers with built-in ser
   - Automatic container registration
   - Dynamic proxy configuration
 - Container Management:
-  - Automated scaling based on resource usage
-  - Rolling updates with configurable strategies
-  - Volume management
+ - Intelligent Autoscaling:
+    - CoDel-based (controlled delay) adaptive scaling for latency management (experimental)
+      - See https://en.wikipedia.org/wiki/CoDel for more
+    - Resource-based scaling with configurable thresholds
+    - Relative CPU metrics support
+  - Health Monitoring:
+    - TCP health checks
+    - Customizable health check parameters
+    - Automatic container recovery
+  - Resource Management:
+    - Flexible resource limits (CPU, Memory)
+    - Network rate limiting
+    - Volume management with multiple types
+  - Rolling Updates(experimental):
+    - Automated image update detection
+    - Zero-downtime deployments
 - Configuration:
   - Simple YAML-based service definitions
   - Hot reload support

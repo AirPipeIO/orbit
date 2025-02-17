@@ -1,0 +1,30 @@
+name: adaptive-scaling
+instance_count:
+  min: 2
+  max: 10
+
+# CoDel-based adaptive scaling based on request latency
+codel:
+  target: 100ms                   # Target latency threshold
+  interval: 1s                    # Interval for checking delays
+  consecutive_intervals: 3        # Number of intervals above target before scaling
+  max_scale_step: 1              # Maximum instances to scale up at once
+  scale_cooldown: 30s            # Minimum time between scaling actions
+  overload_status_code: 503      # Return 503 when overloaded
+
+# Fine-tune scaling behavior
+scaling_policy:
+  cooldown_duration: 60s         # Wait time between scaling actions
+  scale_down_threshold_percentage: 50.0  # Scale down if usage below 50%
+
+spec:
+  containers:
+    - name: main
+      image: airpipeio/infoapp:latest
+      ports:
+        - port: 80
+          node_port: 4335
+      
+      # Test scaling with:
+      # 1. Generate load: curl "http://localhost:4335/sleep?duration=150"
+      # 2. Check latency: curl -w "%{time_total}\n" "http://localhost:4335/"

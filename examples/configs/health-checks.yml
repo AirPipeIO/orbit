@@ -1,0 +1,35 @@
+name: health-monitored
+instance_count:
+  min: 2
+  max: 5
+
+# Rolling update configuration for zero-downtime updates
+rolling_update_config:
+  max_unavailable: 1              # Max pods that can be unavailable
+  max_surge: 1                    # Max extra pods during update
+  timeout: 5m                     # Update timeout
+
+spec:
+  containers:
+    - name: main
+      image: airpipeio/infoapp:latest
+      ports:
+        - port: 80
+          node_port: 4336
+      
+      # Health check configuration
+      health_check:
+        # Initial startup checks
+        startup_timeout: 30s
+        startup_failure_threshold: 3
+        
+        # Ongoing health monitoring
+        liveness_period: 10s
+        liveness_failure_threshold: 3
+        
+        # TCP health check
+        tcp_check:
+          port: 80                # Port to check
+          timeout: 5s             # Check timeout
+          period: 10s             # Check interval
+          failure_threshold: 3     # Failures before unhealthy
