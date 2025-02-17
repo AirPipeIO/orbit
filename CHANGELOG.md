@@ -2,12 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2025-02-17
+
+### 🚀 Features
+
+- Add pull_policy
+
+### 📚 Documentation
+
+- Add pull_policy and container config
+- Fix file name
+
 ## [0.2.3] - 2025-02-17
 
 ### 🚀 Features
 
 - Update download artifact to v4
 - Version bump
+
+### 📚 Documentation
+
+- Update changelog for v0.2.3
 
 ## [0.2.2] - 2025-02-17
 
