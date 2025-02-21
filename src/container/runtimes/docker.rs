@@ -482,7 +482,7 @@ impl ContainerRuntime for DockerRuntime {
 
             // Setup volume mounts first and keep temp_dir alive
             let (temp_dir, mounts) = self
-                .setup_volume_mounts(container, &container_name, &service_config)
+                .setup_volume_mounts(container, &container_name, service_config)
                 .await?;
             if let Some(dir) = temp_dir {
                 temp_dirs.push(dir);
@@ -624,7 +624,7 @@ impl ContainerRuntime for DockerRuntime {
                                 match service_config.pull_policy {
                                     Some(PullPolicyValue::Always) => {
                                         match self
-                                            .pull_image(service_name, containers, &service_config)
+                                            .pull_image(service_name, containers, service_config)
                                             .await
                                         {
                                             Ok(_) => {}
@@ -763,10 +763,9 @@ impl ContainerRuntime for DockerRuntime {
         }
 
         let service_name = name
-            .splitn(2, "__")
+            .split("__")
             .next()
             .expect("Split always returns at least one element");
-
         let service_cfg = get_config_by_service(service_name).await.unwrap();
 
         let nano_cpus = service_cfg
@@ -820,7 +819,7 @@ impl ContainerRuntime for DockerRuntime {
                 port: c
                     .ports
                     .unwrap_or_default()
-                    .get(0)
+                    .first()
                     .and_then(|p| p.public_port)
                     .unwrap_or(0),
             })
