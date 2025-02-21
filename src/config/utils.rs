@@ -1,5 +1,5 @@
 // src/config/utils.rs
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::{anyhow, Result};
 use uuid::Uuid;
@@ -65,7 +65,7 @@ pub async fn get_config_by_service(service_name: &str) -> Option<ServiceConfig> 
     }
 }
 
-pub fn get_relative_config_path(full_path: &PathBuf, config_dir: &PathBuf) -> Option<String> {
+pub fn get_relative_config_path(full_path: &Path, config_dir: &Path) -> Option<String> {
     let config_dir_str = config_dir.to_str()?;
     let full_path_str = full_path.to_str()?;
 

@@ -214,14 +214,12 @@ pub async fn get_status() -> Json<Vec<ServiceStatus>> {
                                     } else {
                                         "stopped".to_string()
                                     }
+                                } else if container.ports.is_empty() || container.ip_address.is_empty() {
+                                    "stopped".to_string()
                                 } else {
-                                    if container.ports.is_empty() || container.ip_address.is_empty()
-                                    {
-                                        "stopped".to_string()
-                                    } else {
-                                        "running".to_string()
-                                    }
+                                    "running".to_string()
                                 }
+                                
                             },
                             cpu_percentage: container_stats.as_ref().map(|s| s.cpu_percentage),
                             cpu_percentage_relative: container_stats

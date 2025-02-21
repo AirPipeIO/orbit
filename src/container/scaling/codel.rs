@@ -224,16 +224,15 @@ impl CoDelMetrics {
                     status_code: None,
                 });
             }
-        } else {
-            if self.first_above_time.is_some() {
-                slog::info!(slog_scope::logger(), "Latency back below target";
-                    "service" => &self.service_name,
-                    "min_sojourn_ms" => min_sojourn.as_millis(),
-                    "avg_sojourn_ms" => avg_sojourn.as_millis()
-                );
-                self.first_above_time = None;
-            }
+        } else if self.first_above_time.is_some() {
+            slog::info!(slog_scope::logger(), "Latency back below target";
+                "service" => &self.service_name,
+                "min_sojourn_ms" => min_sojourn.as_millis(),
+                "avg_sojourn_ms" => avg_sojourn.as_millis()
+            );
+            self.first_above_time = None;
         }
+        
 
         None
     }

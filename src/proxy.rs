@@ -210,7 +210,7 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
             // Get read lock to access instance data
             let store = instance_store.read().await;
             if let Some(instances) = store.get(&service_name) {
-                for (_, metadata) in instances {
+                for metadata in instances.values() {
                     for container in &metadata.containers {
                         for port_info in &container.ports {
                             if let Some(container_node_port) = port_info.node_port {
@@ -248,7 +248,7 @@ pub async fn run_proxy_for_service(service_name: String, config: ServiceConfig) 
         {
             let store = instance_store.read().await;
             if let Some(instances) = store.get(&service_name) {
-                for (_, metadata) in instances {
+                for metadata in instances.values() {
                     for container in &metadata.containers {
                         for port_info in &container.ports {
                             if let Some(container_node_port) = port_info.node_port {

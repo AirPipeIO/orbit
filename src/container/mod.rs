@@ -412,7 +412,7 @@ fn calculate_cpu_percentages(
                     // Since absolute_cpu is across all cores, we need to compare with allocated_cpu * 100
                     let relative = (absolute_cpu / online_cpus) / allocated_cpu;
                     // Convert to percentage and clamp between 0-100
-                    (relative * 100.0).max(0.0).min(100.0)
+                    (relative * 100.0).clamp(0.0,100.0)
                 } else {
                     0.0 // Avoid division by zero
                 }

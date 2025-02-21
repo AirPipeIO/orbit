@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::{
     collections::HashMap,
     path::PathBuf,
+    path::Path,
     sync::OnceLock,
     time::{Duration, SystemTime},
 };
@@ -289,7 +290,7 @@ pub async fn watch_directory(config_dir: PathBuf) -> notify::Result<()> {
     Ok(())
 }
 
-async fn process_event(event: DebouncedEvent, config_dir: &PathBuf) {
+async fn process_event(event: DebouncedEvent, config_dir: &Path) {
     let config_store = CONFIG_STORE.get().unwrap();
     let scaling_tasks = SCALING_TASKS.get().unwrap();
 
@@ -646,7 +647,7 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
                 }
 
                 if let Err(e) = runtime
-                    .remove_pod_network(&network_name, &service_name)
+                    .remove_pod_network(&network_name, service_name)
                     .await
                 {
                     slog::error!(log, "Failed to remove network";
@@ -799,7 +800,7 @@ pub async fn handle_orphans(config: &ServiceConfig) -> Result<()> {
 
             // Then try to remove the network
             if let Err(e) = runtime
-                .remove_pod_network(&network_name, &service_name)
+                .remove_pod_network(&network_name, service_name)
                 .await
             {
                 slog::error!(slog_scope::logger(), "Failed to remove orphaned network";
