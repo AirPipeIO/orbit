@@ -331,7 +331,7 @@ impl DockerRuntime {
             }
             _ => {
                 for container in containers {
-                    slog::debug!(slog_scope::logger(),"Pull policy is set to Neverby default, skipping image pull.";
+                    slog::debug!(slog_scope::logger(), "Pull policy is set to Never by default, skipping image pull.";
                         "service" => service_name,
                         "image" => container.image.clone()
                     );
