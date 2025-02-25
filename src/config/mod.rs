@@ -1062,3 +1062,114 @@ pub async fn handle_config_update(service_name: &str, config: ServiceConfig) -> 
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::container::scaling::manager::UnifiedScalingManager;
+    use crate::container::scaling::manager::ScalingDecision;
+    use std::collections::HashMap;
+    use std::time::{Duration};
+    use uuid::Uuid;
+    use serde_json::Value;
+
+    fn mock_service_config() -> ServiceConfig {
+        ServiceConfig {
+            name: "test_service".to_string(),
+            network: Some("test_network".to_string()),
+            spec: ServiceSpec { containers: vec![] },
+            memory_limit: Some(Value::Number(1000.into())),
+            pull_policy: None,
+            cpu_limit: Some(Value::Number(2.into())),
+            resource_thresholds: Some(ResourceThresholds {
+                cpu_percentage: Some(70),
+                cpu_percentage_relative: Some(80),
+                memory_percentage: Some(75),
+                metrics_strategy: PodMetricsStrategy::Maximum,
+            }),
+            instance_count: InstanceCount { min: 1, max: 10 },
+            adopt_orphans: false,
+            interval_seconds: Some(30),
+            image_check_interval: Some(Duration::from_secs(300)),
+            rolling_update_config: None,
+            volumes: None,
+            codel: None,
+            scaling_policy: Some(ScalingPolicy {
+                cooldown_duration: Some(Duration::from_secs(60)),
+                scale_down_threshold_percentage: Some(50.0),
+            }),
+        }
+    }
+
+    #[test]
+    fn test_scaling_policy_defaults() {
+        let policy = ScalingPolicy::default();
+        assert_eq!(policy.get_cooldown_duration(), Duration::from_secs(60));
+        assert_eq!(policy.get_scale_down_threshold(), 50.0);
+    }
+
+    #[tokio::test]
+    async fn test_unified_scaling_manager_no_change_on_cooldown() {
+        let config = mock_service_config();
+        let mut manager = UnifiedScalingManager::new(
+            "test_service".to_string(),
+            config,
+            None,
+            None,
+        );
+
+        let result = manager.evaluate(3, &HashMap::new()).await;
+        assert!(matches!(result, ScalingDecision::NoChange));
+    }
+
+    #[tokio::test]
+    async fn test_unified_scaling_manager_scale_up() {
+        let config = mock_service_config();
+        let mut manager = UnifiedScalingManager::new(
+            "test_service".to_string(),
+            config,
+            None,
+            None,
+        );
+
+        let mut pod_stats = HashMap::new();
+        pod_stats.insert(Uuid::new_v4(), PodStats {
+            cpu_percentage: 85.0,
+            cpu_percentage_relative: 90.0,
+            memory_usage: 900,
+            memory_limit: 1000,
+        });
+
+        let result = manager.evaluate(3, &pod_stats).await;
+        assert!(matches!(result, ScalingDecision::NoChange));
+    }
+
+    #[tokio::test]
+    async fn test_unified_scaling_manager_scale_down() {
+        let config = mock_service_config();
+        let mut manager = UnifiedScalingManager::new(
+            "test_service".to_string(),
+            config,
+            None,
+            None,
+        );
+
+        let mut pod_stats = HashMap::new();
+        pod_stats.insert(Uuid::new_v4(), PodStats {
+            cpu_percentage: 10.0,
+            cpu_percentage_relative: 15.0,
+            memory_usage: 200,
+            memory_limit: 1000,
+        });
+
+        let result = manager.evaluate(3, &pod_stats).await;
+        assert!(matches!(result, ScalingDecision::NoChange));
+    }
+
+    #[test]
+    fn test_service_config_instance_count() {
+        let config = mock_service_config();
+        assert_eq!(config.instance_count.min, 1);
+        assert_eq!(config.instance_count.max, 10);
+    }
+}
