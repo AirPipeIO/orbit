@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::config::{PodStats, ResourceThresholds, ServiceConfig};
 use crate::container::scaling::codel::CoDelMetrics;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ScalingPolicy {
     /// Duration to wait between scaling actions
     #[serde(
@@ -41,15 +41,6 @@ impl ScalingPolicy {
     pub fn get_scale_down_threshold(&self) -> f64 {
         self.scale_down_threshold_percentage
             .unwrap_or_else(default_scale_down_threshold)
-    }
-}
-
-impl Default for ScalingPolicy {
-    fn default() -> Self {
-        Self {
-            cooldown_duration: None,
-            scale_down_threshold_percentage: None,
-        }
     }
 }
 
@@ -195,7 +186,7 @@ impl UnifiedScalingManager {
 
     async fn evaluate_resources(
         &self,
-        current_instances: usize,
+        _current_instances: usize,
         pod_stats: &HashMap<Uuid, PodStats>,
     ) -> Option<ScalingDecision> {
         let thresholds = self.resource_thresholds.as_ref()?;
@@ -205,7 +196,7 @@ impl UnifiedScalingManager {
 
         for stats in pod_stats.values() {
             let memory_percentage = if stats.memory_limit > 0 {
-                (stats.memory_usage as f64 / stats.memory_limit as f64 * 100.0)
+                stats.memory_usage as f64 / stats.memory_limit as f64 * 100.0
             } else {
                 0.0
             };
@@ -258,8 +249,18 @@ impl UnifiedScalingManager {
     pub fn get_state(&self) -> String {
         match &self.state {
             ScalingState::Normal => "normal".to_string(),
-            ScalingState::CoDelScalingUp { .. } => "codel_scaling_up".to_string(),
-            ScalingState::ResourceScalingDown { .. } => "resource_scaling_down".to_string(),
+            ScalingState::CoDelScalingUp { since, last_scale } => {
+                format!(
+                    "codel_scaling_up_{}",
+                    last_scale.duration_since(*since).as_secs()
+                )
+            }
+            ScalingState::ResourceScalingDown { since } => {
+                format!(
+                    "resource_scaling_down_{}",
+                    since.duration_since(Instant::now()).as_secs()
+                )
+            }
             ScalingState::Cooldown { until } => {
                 format!(
                     "cooldown_{}",
